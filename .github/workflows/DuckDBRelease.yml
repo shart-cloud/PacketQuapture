@@ -1,0 +1,116 @@
+name: Publish New DuckDB Release
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      duckdb_version:
+        description: Optional DuckDB release tag, such as v1.5.5
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-duckdb-release
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    name: Find unpublished DuckDB release
+    runs-on: ubuntu-latest
+    outputs:
+      duckdb_version: ${{ steps.release.outputs.duckdb_version }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      should_build: ${{ steps.release.outputs.should_build }}
+    steps:
+      - id: release
+        name: Resolve release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.duckdb_version }}
+        run: |
+          version="$REQUESTED_VERSION"
+          if [[ -z "$version" ]]; then
+            version="$(gh api repos/duckdb/duckdb/releases/latest --jq .tag_name)"
+          fi
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unexpected DuckDB release tag: $version" >&2
+            exit 1
+          fi
+
+          release_tag="duckdb-$version"
+          should_build=true
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            should_build=false
+          fi
+
+          echo "duckdb_version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "DuckDB version: $version; build required: $should_build"
+
+  build:
+    name: Build release binaries
+    needs: discover
+    if: needs.discover.outputs.should_build == 'true'
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: ${{ needs.discover.outputs.duckdb_version }}
+      ci_tools_version: main
+      extension_name: packetquapture
+      exclude_archs: 'windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+      opt_in_archs: 'windows_arm64'
+      reduced_ci_mode: disabled
+
+  publish:
+    name: Publish GitHub release
+    needs: [discover, build]
+    if: needs.discover.outputs.should_build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: packetquapture-${{ needs.discover.outputs.duckdb_version }}-extension-*
+          path: artifacts
+
+      - name: Prepare release assets
+        shell: bash
+        env:
+          DUCKDB_VERSION: ${{ needs.discover.outputs.duckdb_version }}
+        run: |
+          mkdir -p release
+          count=0
+          while IFS= read -r -d '' file; do
+            artifact_name="$(basename "$(dirname "$file")")"
+            prefix="packetquapture-${DUCKDB_VERSION}-extension-"
+            platform="${artifact_name#${prefix}}"
+            target="release/packetquapture-${DUCKDB_VERSION}-${platform}.duckdb_extension"
+            cp "$file" "$target"
+            gzip -9 --keep "$target"
+            count=$((count + 1))
+          done < <(find artifacts -type f -name 'packetquapture.duckdb_extension' -print0)
+
+          if [[ "$count" -lt 5 ]]; then
+            echo "Expected at least five native platform artifacts, found $count" >&2
+            exit 1
+          fi
+          (cd release && sha256sum * > SHA256SUMS)
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DUCKDB_VERSION: ${{ needs.discover.outputs.duckdb_version }}
+          RELEASE_TAG: ${{ needs.discover.outputs.release_tag }}
+        run: |
+          gh release create "$RELEASE_TAG" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "PacketQuapture for DuckDB $DUCKDB_VERSION" \
+            --notes "Automated native builds of PacketQuapture for DuckDB $DUCKDB_VERSION. All platform builds and SQLLogicTests passed before publication. These extensions are unsigned; only load binaries obtained from this repository."

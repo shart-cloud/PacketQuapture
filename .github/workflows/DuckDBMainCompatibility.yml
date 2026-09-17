@@ -1,0 +1,25 @@
+name: DuckDB Main Compatibility
+
+on:
+  schedule:
+    - cron: '23 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: duckdb-main-compatibility
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test against DuckDB main
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: main
+      ci_tools_version: main
+      extension_name: packetquapture
+      build_duckdb_shell: false
+      exclude_archs: 'linux_arm64;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+      reduced_ci_mode: disabled

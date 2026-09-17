@@ -1,0 +1,42 @@
+# name: test/sql/read_pcap.test
+# description: query classic PCAP and PCAPNG files directly
+# group: [sql]
+
+require packetquapture
+
+query I
+SELECT count(*) FROM read_pcap('test/data/*.pcap*');
+----
+4
+
+query TIIIIIIIT rowsort
+SELECT capture_format, packet_number, captured_length, original_length,
+       link_type, interface_id, packet_offset, section_number, hex(packet_data)
+FROM read_pcap('test/data/*.pcap*');
+----
+pcap	1	14	14	1	0	40	1	FFFFFFFFFFFF0011223344550800
+pcap	2	4	10	1	0	70	1	01020304
+pcapng	1	6	6	1	0	88	1	DEADBEEF0102
+pcapng	2	4	4	1	0	116	1	7175616B
+
+query TT rowsort
+SELECT capture_format, coalesce(timestamp::VARCHAR, 'none')
+FROM read_pcap('test/data/*.pcap*');
+----
+pcap	2023-11-14 22:13:20.123456
+pcap	2023-11-14 22:13:21.5
+pcapng	2023-11-14 22:13:22.25
+pcapng	none
+
+query TI rowsort
+SELECT capture_format, count(*)
+FROM read_pcap(['test/data/sample.pcap', 'test/data/sample.pcapng'])
+GROUP BY ALL;
+----
+pcap	2
+pcapng	2
+
+statement error
+SELECT * FROM read_pcap('test/data/not-a-capture.bin');
+----
+Invalid Input Error: File 'test/data/not-a-capture.bin' is not a PCAP or PCAPNG capture

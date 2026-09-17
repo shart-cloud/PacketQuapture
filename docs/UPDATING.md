@@ -1,23 +1,29 @@
-# Extension updating 
-When cloning this template, the target version of DuckDB should be the latest stable release of DuckDB. However, there 
-will inevitably come a time when a new DuckDB is released and the extension repository needs updating. This process goes
-as follows:
+# DuckDB version support
 
-- Bump submodules
-  - `./duckdb` should be set to latest tagged release
-  - `./extension-ci-tools` should be set to updated branch corresponding to latest DuckDB release. So if you're building for DuckDB `v1.1.0` there will be a branch in `extension-ci-tools` named `v1.1.0` to which you should check out. 
-- Bump versions in `./github/workflows`
-  - `duckdb_version` input in `duckdb-stable-build` job in `MainDistributionPipeline.yml` should be set to latest tagged release
-  - `duckdb_version` input in `duckdb-stable-deploy` job in `MainDistributionPipeline.yml` should be set to latest tagged release
-  - the reusable workflow `duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml` for the `duckdb-stable-build` job should be set to latest tagged release
+PacketQuapture uses DuckDB's internal C++ extension API, so every distributed binary is tied to an exact DuckDB
+version and platform.
 
-# API changes
-DuckDB extensions built with this extension template are built against the internal C++ API of DuckDB. This API is not guaranteed to be stable.
-What this means for extension development is that when updating your extensions DuckDB target version using the above steps, you may run into the fact that your extension no longer builds properly.
+## Automatic releases
 
-Currently, DuckDB does not (yet) provide a specific change log for these API changes, but it is generally not too hard to figure out what has changed.
+The `Publish New DuckDB Release` workflow checks daily for the newest stable DuckDB release. When it finds an
+unpublished version, it builds and tests that exact tag across the complete native platform matrix. A successful run
+publishes a `duckdb-vX.Y.Z` GitHub Release with platform-labelled binaries, compressed copies, and SHA-256 checksums.
+Any build or test failure prevents publication.
 
-For figuring out how and why the C++ API changed, we recommend using the following resources:
-- DuckDB's [Release Notes](https://github.com/duckdb/duckdb/releases)
-- DuckDB's history of [Core extension patches](https://github.com/duckdb/duckdb/commits/main/.github/patches/extensions)
-- The git history of the relevant C++ Header file of the API that has changed
+The `DuckDB Main Compatibility` workflow also tests Linux weekly against DuckDB `main`, providing advance warning of
+internal API changes before they reach a stable release.
+
+## Advancing the development baseline
+
+After an automated release succeeds:
+
+1. Set `.github/duckdb-version` to the new DuckDB tag.
+2. Check out that tag in the `duckdb` submodule.
+3. Check out the corresponding release branch or tag in the `extension-ci-tools` submodule.
+4. Run a clean debug build and `test/sql/read_pcap.test` locally.
+5. Commit the version file and both submodule pointers together.
+
+If the release workflow fails, do not publish manually until the extension has been adapted and the complete matrix
+passes. Useful references are DuckDB's [release notes](https://github.com/duckdb/duckdb/releases),
+[extension distribution documentation](https://duckdb.org/docs/stable/extensions/extension_distribution), and the
+[core extension patch history](https://github.com/duckdb/duckdb/commits/main/.github/patches/extensions).
