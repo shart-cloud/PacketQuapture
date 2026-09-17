@@ -20,8 +20,9 @@ After an automated release succeeds:
 1. Set `.github/duckdb-version` to the new DuckDB tag.
 2. Check out that tag in the `duckdb` submodule.
 3. Check out the corresponding release branch or tag in the `extension-ci-tools` submodule.
-4. Run a clean debug build and `test/sql/read_pcap.test` locally.
-5. Commit the version file and both submodule pointers together.
+4. Update the reusable workflow refs in `MainDistributionPipeline.yml` to that same tag.
+5. Run a clean debug build and `test/sql/read_pcap.test` locally.
+6. Commit the version file, workflow refs, and both submodule pointers together.
 
 If the release workflow fails, do not publish manually until the extension has been adapted and the complete matrix
 passes. Useful references are DuckDB's [release notes](https://github.com/duckdb/duckdb/releases),

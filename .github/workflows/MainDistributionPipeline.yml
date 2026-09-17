@@ -28,7 +28,7 @@ jobs:
   duckdb-stable-build:
     name: Build supported release
     needs: get-duckdb-version
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
     with:
       duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
       ci_tools_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
@@ -40,7 +40,7 @@ jobs:
   code-quality-check:
     name: Code Quality Check
     needs: get-duckdb-version
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.5
     with:
       duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
       ci_tools_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
