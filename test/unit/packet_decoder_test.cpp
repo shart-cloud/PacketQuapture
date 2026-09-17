@@ -42,11 +42,11 @@ static bool Equal(const DecodedPacket &a, const DecodedPacket &b) {
 	return std::tie(a.ethernet, a.network, a.transport, a.tcp, a.udp, a.src_mac, a.dst_mac, a.ether_type, a.vlan_ids,
 	                a.ip_version, a.ip_protocol, a.ip_ttl, a.src_ip, a.dst_ip, a.ip_fragment_offset, a.ip_id,
 	                a.ip_more_fragments, a.has_ip_id, a.src_port, a.dst_port, a.tcp_flags, a.udp_length, a.tcp_seq,
-	                a.tcp_ack, a.tcp_header_length, a.payload_offset, a.payload_length) ==
+	                a.tcp_ack, a.tcp_header_length, a.payload_offset, a.payload_length, a.payload_declared_length) ==
 	       std::tie(b.ethernet, b.network, b.transport, b.tcp, b.udp, b.src_mac, b.dst_mac, b.ether_type, b.vlan_ids,
 	                b.ip_version, b.ip_protocol, b.ip_ttl, b.src_ip, b.dst_ip, b.ip_fragment_offset, b.ip_id,
 	                b.ip_more_fragments, b.has_ip_id, b.src_port, b.dst_port, b.tcp_flags, b.udp_length, b.tcp_seq,
-	                b.tcp_ack, b.tcp_header_length, b.payload_offset, b.payload_length);
+	                b.tcp_ack, b.tcp_header_length, b.payload_offset, b.payload_length, b.payload_declared_length);
 }
 
 static void Check(const std::vector<uint8_t> &bytes, uint32_t link) {
@@ -69,6 +69,7 @@ static void Check(const std::vector<uint8_t> &bytes, uint32_t link) {
 	if (transport.transport) {
 		assert(transport.network && (transport.tcp != transport.udp));
 		assert(!transport.ip_more_fragments && transport.ip_fragment_offset == 0);
+		assert(transport.payload_length <= transport.payload_declared_length);
 		assert(transport.payload_offset <= bytes.size());
 		assert(transport.payload_length <= bytes.size() - transport.payload_offset);
 	}

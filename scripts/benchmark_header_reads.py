@@ -36,9 +36,28 @@ for name, columns in [
     ("ip", "count(src_ip)"),
     ("tcp", "sum(tcp_flags), sum(payload_length)"),
     ("raw", "sum(octet_length(packet_data)), sum(payload_length)"),
+    ("reject_metadata", "sum(octet_length(packet_data))"),
+    ("reject_ip", "sum(octet_length(packet_data))"),
+    ("reject_tcp", "sum(octet_length(packet_data))"),
+    ("accept_tcp", "sum(octet_length(packet_data))"),
 ]:
     log = r / f"build/header_reads_{name}.log"
     sql = f"select {columns} from read_packets('{p}')"
+    predicates = {
+        "reject_metadata": "captured_length < 100",
+        "reject_ip": "ip_version = 6",
+        "reject_tcp": "dst_port = 53",
+        "accept_tcp": "tcp_syn AND NOT tcp_ack_flag",
+    }
+    if name in predicates:
+        sql += " WHERE " + predicates[name]
+        plan = subprocess.run(
+            [str(cli), "-c", "EXPLAIN " + sql],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+        assert "Filters:" in plan, plan
     result = subprocess.run(
         [
             "strace",
@@ -71,6 +90,10 @@ for name, columns in [
         "ip": 50024,
         "tcp": 70024,
         "raw": 60070024,
+        "reject_metadata": 16024,
+        "reject_ip": 50024,
+        "reject_tcp": 70024,
+        "accept_tcp": 60070024,
     }[name]
     assert count == expected, (name, count, expected)
 # A declared packet longer than its actual file must fail even on a metadata-only scan.

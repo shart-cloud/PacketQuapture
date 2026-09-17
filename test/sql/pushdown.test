@@ -1,0 +1,460 @@
+# name: test/sql/pushdown.test
+# description: pushed filters agree with materialized SQL and preserve flag/null semantics
+# group: [sql]
+
+require packetquapture
+
+statement ok
+CREATE TEMP TABLE packet_baseline AS SELECT * FROM read_packets('test/data/protocols/*');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE dst_port = 443
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE dst_port = 443)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE dst_port = 443
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE dst_port = 443)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE src_port IN (53, 5353, 12345)
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE src_port IN (53, 5353, 12345))
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE src_port IN (53, 5353, 12345)
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE src_port IN (53, 5353, 12345))
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE src_port NOT IN (53, 5353)
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE src_port NOT IN (53, 5353))
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE src_port NOT IN (53, 5353)
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE src_port NOT IN (53, 5353))
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE src_port IS NULL
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE src_port IS NULL)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE src_port IS NULL
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE src_port IS NULL)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE src_port IS NOT NULL
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE src_port IS NOT NULL)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE src_port IS NOT NULL
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE src_port IS NOT NULL)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE tcp_syn
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE tcp_syn)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE tcp_syn
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE tcp_syn)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE NOT tcp_syn
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE NOT tcp_syn)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE NOT tcp_syn
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE NOT tcp_syn)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE tcp_syn AND NOT tcp_ack_flag
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE tcp_syn AND NOT tcp_ack_flag)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE tcp_syn AND NOT tcp_ack_flag
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE tcp_syn AND NOT tcp_ack_flag)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE tcp_syn IS NULL
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE tcp_syn IS NULL)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE tcp_syn IS NULL
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE tcp_syn IS NULL)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE tcp_syn IS NOT DISTINCT FROM false
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE tcp_syn IS NOT DISTINCT FROM false)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE tcp_syn IS NOT DISTINCT FROM false
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE tcp_syn IS NOT DISTINCT FROM false)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE tcp_flags = 18 OR tcp_flags = 0
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE tcp_flags = 18 OR tcp_flags = 0)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE tcp_flags = 18 OR tcp_flags = 0
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE tcp_flags = 18 OR tcp_flags = 0)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE dst_port = 443 OR ip_version = 6
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE dst_port = 443 OR ip_version = 6)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE dst_port = 443 OR ip_version = 6
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE dst_port = 443 OR ip_version = 6)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE packet_number > 2 AND packet_number < 100 AND ip_version = 4 AND dst_port = 443
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE packet_number > 2 AND packet_number < 100 AND ip_version = 4 AND dst_port = 443)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE packet_number > 2 AND packet_number < 100 AND ip_version = 4 AND dst_port = 443
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE packet_number > 2 AND packet_number < 100 AND ip_version = 4 AND dst_port = 443)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE src_ip = '192.0.2.1'
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE src_ip = '192.0.2.1')
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE src_ip = '192.0.2.1'
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE src_ip = '192.0.2.1')
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE src_ip LIKE '192.%'
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE src_ip LIKE '192.%')
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE src_ip LIKE '192.%'
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE src_ip LIKE '192.%')
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE src_ip != '192.0.2.1'
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE src_ip != '192.0.2.1')
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE src_ip != '192.0.2.1'
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE src_ip != '192.0.2.1')
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE ip_version = 6 AND src_port IS NULL
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE ip_version = 6 AND src_port IS NULL)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE ip_version = 6 AND src_port IS NULL
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE ip_version = 6 AND src_port IS NULL)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE timestamp IS NULL
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE timestamp IS NULL)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE timestamp IS NULL
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE timestamp IS NULL)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE timestamp > TIMESTAMP '2023-01-01'
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE timestamp > TIMESTAMP '2023-01-01')
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE timestamp > TIMESTAMP '2023-01-01'
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE timestamp > TIMESTAMP '2023-01-01')
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE capture_format = 'pcapng'
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE capture_format = 'pcapng')
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE capture_format = 'pcapng'
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE capture_format = 'pcapng')
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE ends_with(filename, 'raw.pcap')
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE ends_with(filename, 'raw.pcap'))
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE ends_with(filename, 'raw.pcap')
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE ends_with(filename, 'raw.pcap'))
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE (tcp_flags & 2) != 0
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE (tcp_flags & 2) != 0)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE (tcp_flags & 2) != 0
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE (tcp_flags & 2) != 0)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE octet_length(packet_data) < 40
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE octet_length(packet_data) < 40)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE octet_length(packet_data) < 40
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE octet_length(packet_data) < 40)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE vlan_ids = [100, 200]
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE vlan_ids = [100, 200])
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE vlan_ids = [100, 200]
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE vlan_ids = [100, 200])
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE coalesce(src_port, 0) = 0
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE coalesce(src_port, 0) = 0)
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE coalesce(src_port, 0) = 0
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE coalesce(src_port, 0) = 0)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_packets('test/data/protocols/*') WHERE src_mac COLLATE NOCASE = '00:11:22:33:44:55'
+   EXCEPT ALL SELECT * FROM packet_baseline WHERE src_mac COLLATE NOCASE = '00:11:22:33:44:55')
+  UNION ALL
+  (SELECT * FROM packet_baseline WHERE src_mac COLLATE NOCASE = '00:11:22:33:44:55'
+   EXCEPT ALL SELECT * FROM read_packets('test/data/protocols/*') WHERE src_mac COLLATE NOCASE = '00:11:22:33:44:55')
+);
+----
+0
+
+statement ok
+CREATE TEMP TABLE dns_baseline AS SELECT * FROM read_dns('test/data/dns/messages.pcap');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_valid
+   EXCEPT ALL SELECT * FROM dns_baseline WHERE dns_valid)
+  UNION ALL
+  (SELECT * FROM dns_baseline WHERE dns_valid
+   EXCEPT ALL SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_valid)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE NOT dns_valid
+   EXCEPT ALL SELECT * FROM dns_baseline WHERE NOT dns_valid)
+  UNION ALL
+  (SELECT * FROM dns_baseline WHERE NOT dns_valid
+   EXCEPT ALL SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE NOT dns_valid)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_question_name = 'example.com'
+   EXCEPT ALL SELECT * FROM dns_baseline WHERE dns_question_name = 'example.com')
+  UNION ALL
+  (SELECT * FROM dns_baseline WHERE dns_question_name = 'example.com'
+   EXCEPT ALL SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_question_name = 'example.com')
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_rcode = 3
+   EXCEPT ALL SELECT * FROM dns_baseline WHERE dns_rcode = 3)
+  UNION ALL
+  (SELECT * FROM dns_baseline WHERE dns_rcode = 3
+   EXCEPT ALL SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_rcode = 3)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_question_name IS NULL
+   EXCEPT ALL SELECT * FROM dns_baseline WHERE dns_question_name IS NULL)
+  UNION ALL
+  (SELECT * FROM dns_baseline WHERE dns_question_name IS NULL
+   EXCEPT ALL SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_question_name IS NULL)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_response AND ip_version = 4
+   EXCEPT ALL SELECT * FROM dns_baseline WHERE dns_response AND ip_version = 4)
+  UNION ALL
+  (SELECT * FROM dns_baseline WHERE dns_response AND ip_version = 4
+   EXCEPT ALL SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_response AND ip_version = 4)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_answers[1].type = 1
+   EXCEPT ALL SELECT * FROM dns_baseline WHERE dns_answers[1].type = 1)
+  UNION ALL
+  (SELECT * FROM dns_baseline WHERE dns_answers[1].type = 1
+   EXCEPT ALL SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_answers[1].type = 1)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_error LIKE '%TCP%'
+   EXCEPT ALL SELECT * FROM dns_baseline WHERE dns_error LIKE '%TCP%')
+  UNION ALL
+  (SELECT * FROM dns_baseline WHERE dns_error LIKE '%TCP%'
+   EXCEPT ALL SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dns_error LIKE '%TCP%')
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dst_port = 53 AND dns_valid AND dns_question_type IN (1, 28)
+   EXCEPT ALL SELECT * FROM dns_baseline WHERE dst_port = 53 AND dns_valid AND dns_question_type IN (1, 28))
+  UNION ALL
+  (SELECT * FROM dns_baseline WHERE dst_port = 53 AND dns_valid AND dns_question_type IN (1, 28)
+   EXCEPT ALL SELECT * FROM read_dns('test/data/dns/messages.pcap') WHERE dst_port = 53 AND dns_valid AND dns_question_type IN (1, 28))
+);
+----
+0
+
+query IIIIIIII
+SELECT count(*) FILTER (WHERE tcp_fin), count(*) FILTER (WHERE tcp_syn),
+       count(*) FILTER (WHERE tcp_rst), count(*) FILTER (WHERE tcp_psh),
+       count(*) FILTER (WHERE tcp_ack_flag), count(*) FILTER (WHERE tcp_urg),
+       count(*) FILTER (WHERE tcp_ece), count(*) FILTER (WHERE tcp_cwr)
+FROM read_packets('test/data/flags/all_flags.pcap');
+----
+128	128	128	128	128	128	128	128
+
+query I
+SELECT count(*) FROM read_packets('test/data/flags/all_flags.pcap')
+WHERE tcp_fin IS DISTINCT FROM ((tcp_flags & 1) != 0)
+   OR tcp_syn IS DISTINCT FROM ((tcp_flags & 2) != 0)
+   OR tcp_rst IS DISTINCT FROM ((tcp_flags & 4) != 0)
+   OR tcp_psh IS DISTINCT FROM ((tcp_flags & 8) != 0)
+   OR tcp_ack_flag IS DISTINCT FROM ((tcp_flags & 16) != 0)
+   OR tcp_urg IS DISTINCT FROM ((tcp_flags & 32) != 0)
+   OR tcp_ece IS DISTINCT FROM ((tcp_flags & 64) != 0)
+   OR tcp_cwr IS DISTINCT FROM ((tcp_flags & 128) != 0);
+----
+0
+
+statement ok
+PREPARE filtered_packets AS SELECT count(*) FROM read_packets('test/data/protocols/chunks.pcap') WHERE dst_port = $1;
+
+query I
+EXECUTE filtered_packets(443);
+----
+1500
+
+query I
+EXECUTE filtered_packets(53);
+----
+1500
+
+query I
+SELECT count(*) FROM read_packets('test/data/protocols/chunks.pcap') p
+JOIN (VALUES (443), (53)) ports(port) ON p.dst_port = ports.port;
+----
+3000
+
+statement ok
+DROP TABLE packet_baseline;
+
+statement ok
+DROP TABLE dns_baseline;
+
+# Rejected packets still validate their capture framing.
+
+statement error
+SELECT packet_data FROM read_packets('test/data/malformed/payload.pcap') WHERE packet_number > 100;
+----
+Unexpected end
+
+statement error
+SELECT packet_data FROM read_packets('test/data/malformed/payload.pcapng') WHERE packet_number > 100;
+----
+Unexpected end
+
+statement error
+SELECT packet_data FROM read_packets('test/data/malformed/trailer.pcapng') WHERE packet_number > 100;
+----
+Unexpected end

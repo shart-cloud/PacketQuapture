@@ -24,6 +24,7 @@ WHERE ip_protocol = 6 AND dst_port = 443;
 | `ip_id` | `UINTEGER` | IPv4 identification or IPv6 fragment identification; otherwise null |
 | `src_port`, `dst_port` | `USMALLINT` | TCP/UDP ports |
 | `tcp_flags` | `USMALLINT` | Eight TCP control bits (FIN=1 through CWR=128); excludes reserved bits |
+| `tcp_fin`, `tcp_syn`, `tcp_rst`, `tcp_psh`, `tcp_ack_flag`, `tcp_urg`, `tcp_ece`, `tcp_cwr` | `BOOLEAN` | Individual TCP flag bits; null whenever `tcp_flags` is null |
 | `tcp_seq`, `tcp_ack` | `UINTEGER` | TCP sequence and acknowledgment numbers |
 | `tcp_header_length` | `UTINYINT` | TCP header length in bytes, including options |
 | `udp_length` | `USMALLINT` | Declared UDP datagram length, including its header |
@@ -68,8 +69,7 @@ Seekable files with a known size skip unused payloads via checked seeks; skipped
 opening size raise truncation errors. Non-seekable inputs discard unused bytes through an 8 KiB buffer,
 so they save allocation/decoding but must still consume the stream. Files are assumed immutable during a scan.
 The maximum supported header prefix is 32,914 bytes, independent of payload size. The existing 256 MiB
-captured-packet safety limit remains in effect. Scans remain sequential and SQL
-filters are evaluated by DuckDB after decoding; this change does not add filter pushdown or reassembly.
+captured-packet safety limit remains in effect. Scans remain sequential. Filter pushdown is described below; reassembly is not implemented.
 
 ## Reproduce validation
 
@@ -112,3 +112,30 @@ The script asserts bytes returned by capture-file read syscalls (including captu
 These measure application reads, not physical disk traffic or a general throughput guarantee; filesystem
 read-ahead and storage backends can differ. Both payload-length queries return 60,000,000 payload bytes.
 Standalone sanitizer tests also compare lazy-prefix and full-buffer decoding for every tested input and depth.
+
+## Filter pushdown
+
+`read_pcap`, `read_packets`, and `read_dns` accept scalar table filters from DuckDB. Supported pushed
+predicates use DuckDB's own expression evaluator, preserving comparisons and three-valued null semantics.
+Bare boolean predicates such as `tcp_syn AND NOT tcp_ack_flag` are normalized to boolean comparisons.
+DuckDB keeps expressions it cannot push (such as cross-column OR and nested-list predicates) above the scan.
+Advisory dynamic, optional, and Bloom filters may be ignored; joins/residual predicates retain correctness.
+
+Filters are applied in increasing cost order: capture metadata, Ethernet, IP, TCP/UDP, DNS, then raw bytes.
+A rejected row skips its remaining packet bytes on seekable files, even when the query selects `packet_data`.
+On non-seekable streams those bytes must still be consumed using a bounded discard buffer. Capture framing
+continues to be validated for rejected packets. This does not yet prune entire files or indexed time ranges.
+`EXPLAIN` shows pushed predicates under the scan's `Filters` entry.
+
+```sql
+SELECT timestamp, src_ip, dst_ip, packet_data
+FROM read_packets('captures/**/*.pcap*')
+WHERE tcp_syn AND NOT tcp_ack_flag AND dst_port = 443;
+```
+
+The I/O benchmark also checks queries selecting raw bytes whose rows are rejected by capture-length,
+IP-version, or port predicates. They read respectively 16,024, 50,024, and 70,024 bytes from the synthetic
+60 MB capture, while a matching TCP-flag predicate reads all 60,070,024 bytes. This is a read-volume
+measurement, not a throughput claim; per-row filter evaluation also has a CPU cost.
+
+For DNS questions and answers, see [DNS packet queries](DNS.md).

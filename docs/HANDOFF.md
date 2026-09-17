@@ -48,7 +48,7 @@ I/O APIs.
 
 - Experimental `read_packets` now decodes Ethernet/VLAN, IPv4/IPv6, TCP, and UDP. See `docs/PROTOCOL_DECODING.md` for the schema and limits.
 - The table function has one global reader and processes files sequentially.
-- Projection pushdown exists, but SQL filters are not pushed into the scanner.
+- Projection and scalar filter pushdown are implemented; file-statistics pruning and indexed range scans remain future work.
 - There is no persistent file-statistics catalog or packet index.
 - PCAPNG support is intentionally focused on packet-bearing and interface metadata blocks.
 - Native release builds exclude WebAssembly until the browser file-access contract is defined.
@@ -151,7 +151,9 @@ The protocol-decoding prototype was implemented ahead of the broader framing ref
 independent of DuckDB and uses projection-driven layer selection. Generated SQL fixtures and standalone sanitizer
 checks cover malformed headers, fragmentation, truncation, alternate link types, and output-chunk boundaries.
 On-demand header prefixes and checked payload seeks are implemented. The broader framing byte-source extraction,
-parallel scanning, and filter pushdown remain future work.
+and parallel scanning remain future work. Scalar filters now run in stages before raw materialization; TCP flag
+booleans and the experimental `read_dns` function are implemented. The separate `read_dns_messages` function
+uses a DNS framer over the shared protocol-independent TCP core. `read_tcp_streams` exposes the same core on all TCP ports; see `docs/DNS_REASSEMBLY.md` for scope and limits. See `docs/DNS.md` for DNS coverage and limits.
 The decoded schema is experimental; details and validation commands are in `docs/PROTOCOL_DECODING.md`.
 
 ## Delivery roadmap

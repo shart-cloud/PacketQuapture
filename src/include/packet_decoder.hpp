@@ -32,7 +32,7 @@ struct DecodedPacket {
 	uint16_t src_port = 0, dst_port = 0, tcp_flags = 0, udp_length = 0;
 	uint32_t tcp_seq = 0, tcp_ack = 0;
 	uint8_t tcp_header_length = 0;
-	uint32_t payload_offset = 0, payload_length = 0;
+	uint32_t payload_offset = 0, payload_length = 0, payload_declared_length = 0;
 };
 
 // Prefix access lets a decoder request headers without reading payload bytes.

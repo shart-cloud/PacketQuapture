@@ -191,6 +191,7 @@ DecodedPacket DecodePacket(PacketSource &source, uint32_t link_type, DecodeDepth
 	result.src_port = U16(data + offset);
 	result.dst_port = U16(data + offset + 2);
 	result.payload_offset = static_cast<uint32_t>(offset + header_length);
+	result.payload_declared_length = static_cast<uint32_t>(end - offset - header_length);
 	result.payload_length = static_cast<uint32_t>(std::min(end, size) - offset - header_length);
 	return result;
 }

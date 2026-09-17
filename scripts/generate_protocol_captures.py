@@ -140,6 +140,14 @@ def main():
     complete = (DATA / "ethernet.pcapng").read_bytes()
     (malformed / "payload.pcapng").write_bytes(complete[:-8])
     (malformed / "trailer.pcapng").write_bytes(complete[:-1])
+    flags = ROOT / "test/data/flags"
+    flags.mkdir(parents=True, exist_ok=True)
+    flag_packets = []
+    for bits in range(256):
+        segment = bytearray(tcp())
+        segment[13] = bits
+        flag_packets.append(eth(ip4(bytes(segment))))
+    pcap(flags / "all_flags.pcap", flag_packets)
     # More than two DuckDB vectors, alternating valid and invalid values.
     pcap(DATA / "chunks.pcap", [tcp_packet, b"\x00", v6_packet] * 1500)
 

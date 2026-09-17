@@ -42,11 +42,22 @@ capture columns. Unsupported or malformed protocols retain their raw rows with n
 ```sql
 SELECT src_ip, src_port, dst_ip, dst_port, tcp_flags
 FROM read_packets('captures/**/*.pcap*')
-WHERE dst_port = 443;
+WHERE tcp_syn AND NOT tcp_ack_flag AND dst_port = 443;
 ```
 
 See [the decoded schema and supported protocols](docs/PROTOCOL_DECODING.md) for column types, truncation and
 fragmentation behavior, projection-driven decoding, current limitations, and reproducible tests.
+
+`read_dns(...)` adds DNS question names, response codes, and structured answer records, with diagnostics
+for malformed messages. See [DNS packet queries](docs/DNS.md) for examples and supported transports.
+Scalar filters run inside the reader before later decoding and raw payload reads when DuckDB can push them down.
+
+`read_dns_messages(...)` reconstructs TCP DNS messages split across packets, with retransmission handling
+and explicit gap/conflict diagnostics. See [DNS reassembly](docs/DNS_REASSEMBLY.md) for SYN requirements,
+file scope, and memory bounds.
+
+`read_tcp_streams(...)` exposes reconstructed bytes for every TCP port, including explicit chunks and gaps.
+DNS framing uses this same transport engine. See [TCP streams and the shared architecture](docs/TCP_STREAMS.md).
 
 ## Build and test
 
@@ -56,6 +67,9 @@ The repository includes DuckDB and its extension build tooling as submodules.
 GEN=ninja make debug
 python3 scripts/generate_test_captures.py
 python3 scripts/generate_protocol_captures.py
+python3 scripts/generate_dns_captures.py
+python3 scripts/generate_reassembly_captures.py
+python3 scripts/generate_tcp_stream_captures.py
 make test_debug
 ```
 

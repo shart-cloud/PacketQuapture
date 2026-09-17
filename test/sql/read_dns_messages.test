@@ -1,0 +1,130 @@
+# name: test/sql/read_dns_messages.test
+# description: bounded TCP DNS reassembly, provenance, isolation, and diagnostics
+# group: [sql]
+
+require packetquapture
+
+query II
+SELECT count(*), count(*) FILTER (WHERE dns_valid)
+FROM read_dns_messages('test/data/reassembly/streams.pcap');
+----
+26	17
+
+query ITI
+SELECT src_port, reassembly_status, count(*)
+FROM read_dns_messages('test/data/reassembly/streams.pcap') GROUP BY ALL ORDER BY src_port, reassembly_status;
+----
+53	complete	1
+40000	complete	1
+40001	complete	1
+40002	complete	3
+40003	complete	1
+40004	conflict	1
+40005	incomplete	1
+40006	incomplete	1
+40007	unanchored	1
+40008	complete	1
+40009	complete	1
+40010	complete	2
+40011	incomplete	1
+40012	complete	1
+40013	complete	1
+40013	incomplete	1
+40014	incomplete	1
+40015	invalid	1
+40016	limit	1
+40017	complete	1
+40018	complete	1
+40019	complete	2
+
+query IIIII
+SELECT src_port, first_packet_number, last_packet_number, tcp_sequence, octet_length(message_data)
+FROM read_dns_messages('test/data/reassembly/streams.pcap')
+WHERE src_port IN (40000, 40001, 40008, 40009, 40017, 40018) ORDER BY src_port;
+----
+40000	2	4	101	29
+40001	6	7	201	29
+40008	25	26	4294967289	29
+40009	27	27	901	29
+40017	50	52	101	29
+40018	54	55	101	29
+
+query IIT
+SELECT message_number, dns_response::INTEGER, dns_question_name
+FROM read_dns_messages('test/data/reassembly/streams.pcap') WHERE src_port = 40002
+ORDER BY message_number;
+----
+1	0	example.com
+2	1	example.com
+3	0	example.com
+
+query III
+SELECT count(*), count(DISTINCT stream_id), count(DISTINCT message_number)
+FROM read_dns_messages('test/data/reassembly/streams.pcap') WHERE src_port = 40010;
+----
+2	2	1
+
+query TI rowsort
+SELECT vlan_ids::VARCHAR, dns_response::INTEGER
+FROM read_dns_messages('test/data/reassembly/streams.pcap') WHERE src_port = 40019;
+----
+[100]	0
+[200]	1
+
+query IIII
+SELECT count(*), count(message_data), count(dns_id), count(reassembly_error)
+FROM read_dns_messages('test/data/reassembly/streams.pcap') WHERE reassembly_status <> 'complete';
+----
+9	0	0	9
+
+query IT
+SELECT interface_id, reassembly_status
+FROM read_dns_messages('test/data/reassembly/interfaces.pcapng') ORDER BY interface_id;
+----
+0	incomplete
+1	incomplete
+
+query TI rowsort
+SELECT reassembly_status, count(*)
+FROM read_dns_messages(['test/data/reassembly/part_a.pcap', 'test/data/reassembly/part_b.pcap']) GROUP BY ALL;
+----
+incomplete	1
+unanchored	1
+
+query IIIII
+SELECT count(*), count(dns_id), min(message_number), max(message_number), count(DISTINCT stream_id)
+FROM read_dns_messages('test/data/reassembly/chunks.pcap');
+----
+2500	2500	1	2500	1
+
+# Predicates apply to reconstructed messages, so earlier segments cannot be dropped.
+query II
+SELECT first_packet_number, last_packet_number
+FROM read_dns_messages('test/data/reassembly/streams.pcap')
+WHERE last_packet_number = 4 AND dns_question_name = 'example.com';
+----
+2	4
+
+query TIII
+SELECT transport, dns_valid::INTEGER, dns_answers[1].type, stream_id
+FROM read_dns_messages('test/data/dns/response.pcapng');
+----
+udp	1	1	NULL
+
+query TTI
+SELECT first_timestamp::VARCHAR, last_timestamp::VARCHAR, count(*) OVER ()
+FROM read_dns_messages('test/data/reassembly/streams.pcap') WHERE src_port = 40000;
+----
+2023-11-14 22:13:20	2023-11-14 22:13:20	1
+
+# Successful reconstruction is separate from successful DNS parsing.
+query TII
+SELECT reassembly_status, dns_valid::INTEGER, octet_length(message_data)
+FROM read_dns_messages('test/data/reassembly/malformed_dns.pcap');
+----
+complete	0	12
+
+statement error
+SELECT * FROM read_dns_messages('test/data/malformed/payload.pcap');
+----
+Unexpected end
