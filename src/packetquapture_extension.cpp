@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "packetquapture_extension.hpp"
+#include "packet_decoder.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -12,6 +13,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 
 namespace duckdb {
@@ -39,6 +41,7 @@ struct PacketRecord {
 	CaptureFormat format = CaptureFormat::PCAP;
 	vector<uint8_t> packet_data;
 	uint32_t section_number = 0;
+	packetquapture::DecodedPacket decoded;
 };
 
 struct PcapNgInterface {
@@ -69,9 +72,18 @@ static idx_t AlignTo32Bits(idx_t size) {
 
 class CaptureReader {
 public:
-	CaptureReader(ClientContext &context, const OpenFileInfo &file_p, bool materialize_packet_data_p)
-	    : file(file_p), fs(FileSystem::GetFileSystem(context)), materialize_packet_data(materialize_packet_data_p) {
+	CaptureReader(ClientContext &context, const OpenFileInfo &file_p, bool materialize_packet_data_p,
+	              packetquapture::DecodeDepth decode_depth_p)
+	    : file(file_p), fs(FileSystem::GetFileSystem(context)), materialize_packet_data(materialize_packet_data_p),
+	      decode_depth(decode_depth_p) {
 		handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ);
+		if (handle->CanSeek() && !handle->IsPipe()) {
+			const auto size = fs.GetFileSize(*handle);
+			if (size >= 0) {
+				seekable_size = static_cast<uint64_t>(size);
+				can_skip_by_seek = true;
+			}
+		}
 		Initialize();
 	}
 
@@ -317,12 +329,44 @@ private:
 	}
 
 	void ReadPacketData(PacketRecord &record, idx_t length) {
-		if (!materialize_packet_data) {
-			Skip(length, "packet data");
+		if (materialize_packet_data) {
+			record.packet_data.resize(length);
+			ReadExact(record.packet_data.data(), length, "packet data");
+			if (decode_depth != packetquapture::DecodeDepth::NONE) {
+				record.decoded =
+				    packetquapture::DecodePacket({record.packet_data.data(), length, record.link_type}, decode_depth);
+			}
 			return;
 		}
-		record.packet_data.resize(length);
-		ReadExact(record.packet_data.data(), length, "packet data");
+		class HeaderSource : public packetquapture::PacketSource {
+		public:
+			HeaderSource(CaptureReader &reader_p, idx_t length_p) : reader(reader_p), length(length_p) {
+			}
+			size_t Size() const override {
+				return length;
+			}
+			const uint8_t *ReadPrefix(size_t requested) override {
+				const auto previous = bytes.size();
+				if (requested > previous) {
+					bytes.resize(requested);
+					reader.ReadExact(bytes.data() + previous, requested - previous, "packet header");
+				}
+				return bytes.data();
+			}
+			idx_t Consumed() const {
+				return bytes.size();
+			}
+
+		private:
+			CaptureReader &reader;
+			idx_t length;
+			vector<uint8_t> bytes;
+		};
+		HeaderSource source(*this, length);
+		if (decode_depth != packetquapture::DecodeDepth::NONE) {
+			record.decoded = packetquapture::DecodePacket(source, record.link_type, decode_depth);
+		}
+		Skip(length - source.Consumed(), "packet data");
 	}
 
 	timestamp_t TimestampFromParts(uint64_t seconds, uint64_t fraction, long double ticks_per_second) const {
@@ -393,6 +437,17 @@ private:
 	}
 
 	void Skip(idx_t length, const char *description) {
+		if (length == 0) {
+			return;
+		}
+		if (can_skip_by_seek) {
+			if (position > seekable_size || length > seekable_size - position) {
+				throw IOException("Unexpected end of '%s' while reading %s", file.path, description);
+			}
+			handle->Seek(position + length);
+			position += length;
+			return;
+		}
 		std::array<uint8_t, 8192> buffer {};
 		while (length > 0) {
 			const auto chunk_size = MinValue<idx_t>(length, buffer.size());
@@ -406,6 +461,9 @@ private:
 	FileSystem &fs;
 	unique_ptr<FileHandle> handle;
 	bool materialize_packet_data;
+	packetquapture::DecodeDepth decode_depth;
+	bool can_skip_by_seek = false;
+	uint64_t seekable_size = 0;
 	CaptureFormat format = CaptureFormat::PCAP;
 	ByteOrder order = ByteOrder::LITTLE;
 	bool nanosecond_timestamps = false;
@@ -444,6 +502,7 @@ struct PcapGlobalState : public GlobalTableFunctionState {
 	idx_t file_index = 0;
 	unique_ptr<CaptureReader> reader;
 	bool materialize_packet_data = false;
+	packetquapture::DecodeDepth decode_depth = packetquapture::DecodeDepth::NONE;
 };
 
 static unique_ptr<FunctionData> PcapBind(ClientContext &context, TableFunctionBindInput &input,
@@ -460,13 +519,60 @@ static unique_ptr<FunctionData> PcapBind(ClientContext &context, TableFunctionBi
 	return std::move(result);
 }
 
+static unique_ptr<FunctionData> PacketsBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = PcapBind(context, input, return_types, names);
+	const vector<string> decoded_names = {"src_mac",
+	                                      "dst_mac",
+	                                      "ether_type",
+	                                      "vlan_ids",
+	                                      "ip_version",
+	                                      "src_ip",
+	                                      "dst_ip",
+	                                      "ip_protocol",
+	                                      "ip_ttl",
+	                                      "ip_fragment_offset",
+	                                      "ip_more_fragments",
+	                                      "ip_id",
+	                                      "src_port",
+	                                      "dst_port",
+	                                      "tcp_flags",
+	                                      "tcp_seq",
+	                                      "tcp_ack",
+	                                      "tcp_header_length",
+	                                      "udp_length",
+	                                      "payload_offset",
+	                                      "payload_length"};
+	const vector<LogicalType> decoded_types = {LogicalType::VARCHAR,   LogicalType::VARCHAR,
+	                                           LogicalType::USMALLINT, LogicalType::LIST(LogicalType::USMALLINT),
+	                                           LogicalType::UTINYINT,  LogicalType::VARCHAR,
+	                                           LogicalType::VARCHAR,   LogicalType::UTINYINT,
+	                                           LogicalType::UTINYINT,  LogicalType::UINTEGER,
+	                                           LogicalType::BOOLEAN,   LogicalType::UINTEGER,
+	                                           LogicalType::USMALLINT, LogicalType::USMALLINT,
+	                                           LogicalType::USMALLINT, LogicalType::UINTEGER,
+	                                           LogicalType::UINTEGER,  LogicalType::UTINYINT,
+	                                           LogicalType::USMALLINT, LogicalType::UINTEGER,
+	                                           LogicalType::UINTEGER};
+	names.insert(names.end(), decoded_names.begin(), decoded_names.end());
+	return_types.insert(return_types.end(), decoded_types.begin(), decoded_types.end());
+	return result;
+}
+
 static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto result = make_uniq<PcapGlobalState>();
 	result->column_ids = input.column_ids;
 	for (const auto column_id : result->column_ids) {
 		if (column_id == 9) {
 			result->materialize_packet_data = true;
-			break;
+		}
+		if (column_id >= 11 && column_id <= 31) {
+			const auto depth = column_id >= 23   ? packetquapture::DecodeDepth::TRANSPORT
+			                   : column_id >= 15 ? packetquapture::DecodeDepth::NETWORK
+			                                     : packetquapture::DecodeDepth::LINK;
+			if (depth > result->decode_depth) {
+				result->decode_depth = depth;
+			}
 		}
 	}
 	return std::move(result);
@@ -520,6 +626,119 @@ static void SetOutputValue(Vector &vector, idx_t row, column_t column_id, const 
 	}
 }
 
+template <class T>
+static void SetDecodedScalar(Vector &vector, idx_t row, T value) {
+	FlatVector::SetNull(vector, row, false);
+	FlatVector::GetData<T>(vector)[row] = value;
+}
+
+static string MacString(const std::array<uint8_t, 6> &address) {
+	char buffer[18];
+	std::snprintf(buffer, sizeof(buffer), "%02x:%02x:%02x:%02x:%02x:%02x", address[0], address[1], address[2],
+	              address[3], address[4], address[5]);
+	return buffer;
+}
+
+static string IpString(const std::array<uint8_t, 16> &address, uint8_t version) {
+	char buffer[40];
+	if (version == 4) {
+		std::snprintf(buffer, sizeof(buffer), "%u.%u.%u.%u", address[0], address[1], address[2], address[3]);
+	} else {
+		std::snprintf(buffer, sizeof(buffer), "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+		              address[0], address[1], address[2], address[3], address[4], address[5], address[6], address[7],
+		              address[8], address[9], address[10], address[11], address[12], address[13], address[14],
+		              address[15]);
+	}
+	return buffer;
+}
+
+static void SetDecodedValue(Vector &vector, idx_t row, column_t column, const packetquapture::DecodedPacket &packet) {
+	bool valid = column < 15 ? packet.ethernet : column < 23 ? packet.network : packet.transport;
+	if (column == 22) {
+		valid = valid && packet.has_ip_id;
+	} else if (column >= 25 && column <= 28) {
+		valid = packet.tcp;
+	} else if (column == 29) {
+		valid = packet.udp;
+	}
+	if (!valid) {
+		FlatVector::SetNull(vector, row, true);
+		return;
+	}
+	switch (column) {
+	case 11:
+		vector.SetValue(row, MacString(packet.src_mac));
+		break;
+	case 12:
+		vector.SetValue(row, MacString(packet.dst_mac));
+		break;
+	case 13:
+		SetDecodedScalar(vector, row, packet.ether_type);
+		break;
+	case 14: {
+		duckdb::vector<Value> tags;
+		for (const auto tag : packet.vlan_ids) {
+			tags.push_back(Value::USMALLINT(tag));
+		}
+		vector.SetValue(row, Value::LIST(LogicalType::USMALLINT, tags));
+		break;
+	}
+	case 15:
+		SetDecodedScalar(vector, row, packet.ip_version);
+		break;
+	case 16:
+		vector.SetValue(row, IpString(packet.src_ip, packet.ip_version));
+		break;
+	case 17:
+		vector.SetValue(row, IpString(packet.dst_ip, packet.ip_version));
+		break;
+	case 18:
+		SetDecodedScalar(vector, row, packet.ip_protocol);
+		break;
+	case 19:
+		SetDecodedScalar(vector, row, packet.ip_ttl);
+		break;
+	case 20:
+		SetDecodedScalar(vector, row, packet.ip_fragment_offset);
+		break;
+	case 21:
+		SetDecodedScalar(vector, row, packet.ip_more_fragments);
+		break;
+	case 22:
+		SetDecodedScalar(vector, row, packet.ip_id);
+		break;
+	case 23:
+		SetDecodedScalar(vector, row, packet.src_port);
+		break;
+	case 24:
+		SetDecodedScalar(vector, row, packet.dst_port);
+		break;
+	case 25:
+		SetDecodedScalar(vector, row, packet.tcp_flags);
+		break;
+	case 26:
+		SetDecodedScalar(vector, row, packet.tcp_seq);
+		break;
+	case 27:
+		SetDecodedScalar(vector, row, packet.tcp_ack);
+		break;
+	case 28:
+		SetDecodedScalar(vector, row, packet.tcp_header_length);
+		break;
+	case 29:
+		SetDecodedScalar(vector, row, packet.udp_length);
+		break;
+	case 30:
+		SetDecodedScalar(vector, row, packet.payload_offset);
+		break;
+	case 31:
+		SetDecodedScalar(vector, row, packet.payload_length);
+		break;
+	default:
+		throw InternalException("Unexpected read_packets column id %d", column);
+	}
+}
+
 static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind_data = input.bind_data->Cast<PcapBindData>();
 	auto &state = input.global_state->Cast<PcapGlobalState>();
@@ -529,8 +748,8 @@ static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChun
 			if (state.file_index >= bind_data.files.size()) {
 				break;
 			}
-			state.reader =
-			    make_uniq<CaptureReader>(context, bind_data.files[state.file_index++], state.materialize_packet_data);
+			state.reader = make_uniq<CaptureReader>(context, bind_data.files[state.file_index++],
+			                                        state.materialize_packet_data, state.decode_depth);
 		}
 		PacketRecord record;
 		if (!state.reader->Next(record)) {
@@ -538,7 +757,12 @@ static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChun
 			continue;
 		}
 		for (idx_t output_column = 0; output_column < state.column_ids.size(); output_column++) {
-			SetOutputValue(output.data[output_column], output_count, state.column_ids[output_column], record);
+			const auto column = state.column_ids[output_column];
+			if (column >= 11 && column <= 31) {
+				SetDecodedValue(output.data[output_column], output_count, column, record.decoded);
+			} else {
+				SetOutputValue(output.data[output_column], output_count, column, record);
+			}
 		}
 		output_count++;
 	}
@@ -554,6 +778,9 @@ static TableFunction ReadPcapFunction() {
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.SetDescription("Query PCAP and PCAPNG packet captures directly from DuckDB");
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(ReadPcapFunction()));
+	TableFunction packets("read_packets", {LogicalType::VARCHAR}, PcapScan, PacketsBind, PcapInit);
+	packets.projection_pushdown = true;
+	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(packets));
 }
 
 } // namespace

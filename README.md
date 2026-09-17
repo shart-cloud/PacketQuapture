@@ -34,6 +34,20 @@ resolution, Enhanced Packet Blocks, Simple Packet Blocks, and projection pushdow
 If `packet_data` is not selected, PacketQuapture does not materialize packet blobs. This keeps metadata queries such as
 `count(*)` cheap while retaining zero-preprocessing access to packet payloads when needed.
 
+## Protocol decoding
+
+The experimental `read_packets(...)` function adds Ethernet/VLAN, IPv4/IPv6, and TCP/UDP fields to the raw
+capture columns. Unsupported or malformed protocols retain their raw rows with nullable decoded fields.
+
+```sql
+SELECT src_ip, src_port, dst_ip, dst_port, tcp_flags
+FROM read_packets('captures/**/*.pcap*')
+WHERE dst_port = 443;
+```
+
+See [the decoded schema and supported protocols](docs/PROTOCOL_DECODING.md) for column types, truncation and
+fragmentation behavior, projection-driven decoding, current limitations, and reproducible tests.
+
 ## Build and test
 
 The repository includes DuckDB and its extension build tooling as submodules.
@@ -41,6 +55,7 @@ The repository includes DuckDB and its extension build tooling as submodules.
 ```sh
 GEN=ninja make debug
 python3 scripts/generate_test_captures.py
+python3 scripts/generate_protocol_captures.py
 make test_debug
 ```
 
@@ -62,8 +77,11 @@ defined and tested.
 ## Direction
 
 This is the storage foundation for a PCAP lake rather than a Wireshark replacement on day one. Natural next layers
-are Ethernet/IP/TCP/UDP columns, protocol-specific table functions, filter pushdown, file-level statistics and indexes,
+are deeper protocol-specific table functions, filter pushdown, file-level statistics and indexes,
 parallel file scans, and a WebAssembly-friendly build. Keeping raw framing separate from protocol dissection lets those
 features evolve without requiring captures to be rewritten.
+
+The implementation roadmap, architectural boundaries, acceptance criteria, and licensing notes are in
+[`docs/HANDOFF.md`](docs/HANDOFF.md).
 
 PacketQuapture is licensed under the MIT License.

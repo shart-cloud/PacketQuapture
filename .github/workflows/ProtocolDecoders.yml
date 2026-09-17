@@ -1,0 +1,27 @@
+name: Protocol decoder sanitizers
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  decoder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Regenerate deterministic protocol fixtures
+        run: |
+          python3 scripts/generate_protocol_captures.py
+          git diff --exit-code -- test/data/protocols
+      - name: Build standalone decoder with sanitizers
+        run: |
+          mkdir -p build
+          c++ -std=c++17 -Wall -Wextra -Werror -g -O1 \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Isrc/include src/packet_decoder.cpp test/unit/packet_decoder_test.cpp \
+            -o build/packet_decoder_test
+      - name: Run prefix, mutation, and random-input tests
+        run: ./build/packet_decoder_test
