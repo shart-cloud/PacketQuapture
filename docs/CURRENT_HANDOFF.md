@@ -197,9 +197,9 @@ reports for reproduction options. Do not expose the service publicly just to ben
    Their TCP state must remain worker-local and preserve per-file finalization semantics.
 4. Cardinality estimates, single-file parallelism, and file/range pruning remain separate
    follow-ups. Scan progress does not implement any of them.
-5. Local review and packaging are complete. Explicit approval to push the source, benchmark
-   evidence, and documentation to the public origin is pending after automatic approval review
-   blocked the first attempt. Run hosted CI on the review branch before calling CI verified.
+5. Local review and packaging are complete. The user explicitly approved publication to the
+   public origin, and review/parallel-cache-progress has been pushed. Check hosted CI for
+   the latest branch commit before merging; no merge or release is authorized by this task.
 
 ## In-cluster follow-up completed — September 17, 2026
 
@@ -254,8 +254,10 @@ Three cohesive commits are on review/parallel-cache-progress: reader implementat
 regressions; benchmark tooling/evidence; documentation and CI. The working tree is clean.
 The first two are 941a491 and bd61870; use git log for the documentation commit.
 
-The first push attempt was rejected by automatic approval review because explicit approval
-to export the source, benchmark data, and documentation to the public
-shart-cloud/PacketQuapture repository was not established. Nothing was pushed and hosted CI
-has not run for this branch. Ask for that exact publication approval, then push the review
-branch and monitor the hosted workflows. Do not merge or publish a release as part of this task.
+The user explicitly approved publication after the initial automatic approval-review block.
+The review branch is now pushed to the public shart-cloud/PacketQuapture repository.
+Hosted workflows were triggered: Parallel capture scans, Protocol decoder sanitizers,
+and Main Extension Distribution Pipeline (including native platforms and code quality).
+Check [branch CI runs](https://github.com/shart-cloud/PacketQuapture/actions?query=branch%3Areview%2Fparallel-cache-progress)
+for the latest commit's results; a push or running workflow alone does not establish success.
+No merge or release has been performed.
