@@ -38,6 +38,7 @@ jobs:
           fi
           cmake -S duckdb -B build/release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-O1 -g1 -DNDEBUG" \
+            -DOVERRIDE_GIT_DESCRIBE="$(cat .github/duckdb-version)" \
             -DENABLE_UNITTEST_CPP_TESTS=OFF -DSKIP_EXTENSIONS=parquet -DUNITTEST_ROOT_DIRECTORY="$PWD" \
             -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config.cmake" "${flags[@]}"
       - name: Build
@@ -48,6 +49,8 @@ jobs:
         run: |
           runner=()
           if [ "$SANITIZER" = thread ]; then runner=(setarch "$(uname -m)" -R); fi
+          actual=$("${runner[@]}" ./build/release/duckdb -noheader -csv -c "SELECT version()")
+          test "$actual" = "$(cat .github/duckdb-version)"
           timeout 600s "${runner[@]}" ./build/release/test/unittest 'test/sql/*'
           timeout 600s "${runner[@]}" python3 scripts/benchmark_parallel_scans.py --verify-only --verify-mixes 10
       - name: Native reader overlap, cancellation, and cleanup

@@ -261,3 +261,12 @@ and Main Extension Distribution Pipeline (including native platforms and code qu
 Check [branch CI runs](https://github.com/shart-cloud/PacketQuapture/actions?query=branch%3Areview%2Fparallel-cache-progress)
 for the latest commit's results; a push or running workflow alone does not establish success.
 No merge or release has been performed.
+
+### First hosted results and version fix
+
+At commit 4dc51d6, decoder sanitizers and the full Linux/macOS/Windows distribution pipeline
+passed. The dedicated scan workflow passed SQL/randomized, native concurrency/progress, and
+selective-I/O checks, then failed installing httpfs because the shallow checkout caused
+DuckDB to identify itself as v0.0.1. Its CMake configuration now takes OVERRIDE_GIT_DESCRIBE
+from .github/duckdb-version and checks the built version before tests. Check the latest
+branch CI run for verification of this workflow-only fix; no production reader change was needed.
