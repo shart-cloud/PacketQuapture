@@ -1,0 +1,99 @@
+# name: test/sql/parallel_streams.test
+# description: parallel stream identity, reconstruction parity, duplicates and admission
+# group: [sql]
+
+require packetquapture
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE baseline_read_tcp_streams AS SELECT * FROM read_tcp_streams(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']);
+
+statement ok
+CREATE TEMP TABLE baseline_read_dns_messages AS SELECT * FROM read_dns_messages(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']);
+
+foreach workers 1 2 4 8
+
+statement ok
+SET threads=${workers};
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_tcp_streams(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']) WHERE true EXCEPT ALL SELECT * FROM baseline_read_tcp_streams WHERE true) UNION ALL (SELECT * FROM baseline_read_tcp_streams WHERE true EXCEPT ALL SELECT * FROM read_tcp_streams(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']) WHERE true));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_tcp_streams(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']) WHERE reassembly_status IN ('contiguous','complete','limit','conflict') EXCEPT ALL SELECT * FROM baseline_read_tcp_streams WHERE reassembly_status IN ('contiguous','complete','limit','conflict')) UNION ALL (SELECT * FROM baseline_read_tcp_streams WHERE reassembly_status IN ('contiguous','complete','limit','conflict') EXCEPT ALL SELECT * FROM read_tcp_streams(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']) WHERE reassembly_status IN ('contiguous','complete','limit','conflict')));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_tcp_streams(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']) WHERE first_packet_number > 2 AND dst_port = 53 EXCEPT ALL SELECT * FROM baseline_read_tcp_streams WHERE first_packet_number > 2 AND dst_port = 53) UNION ALL (SELECT * FROM baseline_read_tcp_streams WHERE first_packet_number > 2 AND dst_port = 53 EXCEPT ALL SELECT * FROM read_tcp_streams(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']) WHERE first_packet_number > 2 AND dst_port = 53));
+----
+0
+
+query I
+SELECT count(*) FROM read_tcp_streams(['test/data/parallel/empty.pcap', 'test/data/parallel/empty.pcap']);
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns_messages(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']) WHERE true EXCEPT ALL SELECT * FROM baseline_read_dns_messages WHERE true) UNION ALL (SELECT * FROM baseline_read_dns_messages WHERE true EXCEPT ALL SELECT * FROM read_dns_messages(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']) WHERE true));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns_messages(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']) WHERE reassembly_status IN ('contiguous','complete','limit','conflict') EXCEPT ALL SELECT * FROM baseline_read_dns_messages WHERE reassembly_status IN ('contiguous','complete','limit','conflict')) UNION ALL (SELECT * FROM baseline_read_dns_messages WHERE reassembly_status IN ('contiguous','complete','limit','conflict') EXCEPT ALL SELECT * FROM read_dns_messages(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']) WHERE reassembly_status IN ('contiguous','complete','limit','conflict')));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns_messages(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']) WHERE first_packet_number > 2 AND dst_port = 53 EXCEPT ALL SELECT * FROM baseline_read_dns_messages WHERE first_packet_number > 2 AND dst_port = 53) UNION ALL (SELECT * FROM baseline_read_dns_messages WHERE first_packet_number > 2 AND dst_port = 53 EXCEPT ALL SELECT * FROM read_dns_messages(['test/data/reassembly/*.pcap*', 'test/data/tcp_streams/*.pcap*', 'test/data/dns/*.pcap*', 'test/data/reassembly/streams.pcap', 'test/data/reassembly/streams.pcap']) WHERE first_packet_number > 2 AND dst_port = 53));
+----
+0
+
+query I
+SELECT count(*) FROM read_dns_messages(['test/data/parallel/empty.pcap', 'test/data/parallel/empty.pcap']);
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT stream_id) FROM read_tcp_streams(['test/data/tcp_streams/chunks.pcap', 'test/data/tcp_streams/chunks.pcap']);
+----
+5000	5000
+
+endloop
+
+statement ok
+SET packetquapture_stream_memory_mb=0;
+
+statement error
+SELECT count(*) FROM read_tcp_streams('test/data/tcp_streams/protocols.pcap');
+----
+cannot reserve 128 MiB
+
+statement ok
+SET packetquapture_stream_memory_mb=127;
+
+statement error
+SELECT count(*) FROM read_tcp_streams('test/data/tcp_streams/protocols.pcap');
+----
+cannot reserve 128 MiB
+
+statement ok
+SET packetquapture_stream_memory_mb=512;
+
+statement ok
+SET memory_limit='128MB';
+
+statement error
+SELECT count(*) FROM read_dns_messages('test/data/reassembly/streams.pcap');
+----
+cannot reserve 128 MiB
+
+statement ok
+SET memory_limit='1GB';
+
+statement ok
+SET threads=1;

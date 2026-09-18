@@ -2,6 +2,7 @@
 
 #include "packetquapture_extension.hpp"
 #include "capture_progress.hpp"
+#include "stream_scan_budget.hpp"
 #include "packet_decoder.hpp"
 #include "dns_decoder.hpp"
 #include "tcp_reassembly.hpp"
@@ -298,10 +299,11 @@ private:
 
 	void FinishSectionHeader(uint32_t block_length) {
 		ValidateBlockLength(block_length, 28, "section header");
-		vector<uint8_t> remainder(block_length - 12);
-		ReadExact(remainder.data(), remainder.size(), "PCAPNG section header");
-		ValidateTrailer(remainder.data() + remainder.size() - 4, block_length);
-		const auto major_version = ReadU16(remainder.data(), order);
+		std::array<uint8_t, 12> fixed {};
+		ReadExact(fixed.data(), fixed.size(), "PCAPNG section header");
+		Skip(block_length - 28, "PCAPNG section options");
+		ReadAndValidateTrailer(block_length);
+		const auto major_version = ReadU16(fixed.data(), order);
 		if (major_version != 1) {
 			throw InvalidInputException("Unsupported PCAPNG version %d in '%s'", major_version, file.path);
 		}
@@ -398,6 +400,10 @@ private:
 				}
 			}
 			offset += padded_length;
+		}
+		// Bound stream-worker metadata independently of capture size.
+		if ((options.reassemble_tcp || options.reassemble_dns) && interfaces.size() >= 65536) {
+			throw InvalidInputException("Stream scan exceeds 65536 PCAPNG interfaces per section in '%s'", file.path);
 		}
 		interfaces.push_back(interface);
 	}
@@ -705,12 +711,17 @@ struct PcapBindData : public TableFunctionData {
 	vector<OpenFileInfo> files;
 	vector<LogicalType> types;
 	bool dns_scan = false;
+	shared_ptr<StreamPlanCount> stream_plan;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<PcapBindData>();
 		result->files = files;
 		result->types = types;
 		result->dns_scan = dns_scan;
+		result->stream_plan = stream_plan;
+		if (stream_plan) {
+			stream_plan->scans.fetch_add(1);
+		}
 		return std::move(result);
 	}
 
@@ -1258,21 +1269,75 @@ static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChun
 	output.SetCardinality(output_count);
 }
 
-struct StreamScanState : public CaptureGlobalState {
+struct StreamGlobalState : public CaptureGlobalState {
+	StreamGlobalState(ClientContext &context, const PcapBindData &bind)
+	    : scheduler(bind.files.size()), file_count(bind.files.size()) {
+		budget = context.registered_state->GetOrCreate<StreamQueryBudget>("packetquapture_stream_budget", context);
+		if (bind.stream_plan) {
+			bind.stream_plan->sealed.store(true);
+			max_workers = MaxValue<idx_t>(1, budget->Slots() / bind.stream_plan->scans.load());
+		}
+		max_workers = MinValue<idx_t>(max_workers, MaxValue<idx_t>(1, file_count));
+		if (file_count) {
+			initial = make_uniq<StreamReservation>(budget);
+			if (!initial->Acquired()) {
+				throw OutOfMemoryException("PacketQuapture cannot reserve 128 MiB for a stream worker. "
+				                           "Increase packetquapture_stream_memory_mb or memory_limit; "
+				                           "all stream scans in this query share the budget.");
+			}
+		}
+	}
+	idx_t MaxThreads() const override {
+		return max_workers;
+	}
+	unique_ptr<StreamReservation> Admit() {
+		lock_guard<mutex> guard(lock);
+		if (admitted >= max_workers) {
+			return nullptr;
+		}
+		++admitted;
+		if (initial) {
+			return std::move(initial);
+		}
+		auto result = make_uniq<StreamReservation>(budget);
+		return result->Acquired() ? std::move(result) : nullptr;
+	}
+	void Drained() {
+		if (drained.fetch_add(1, std::memory_order_relaxed) + 1 == file_count) {
+			progress.Finish();
+		}
+	}
+	FileScheduler scheduler;
+	const idx_t file_count;
+	shared_ptr<StreamQueryBudget> budget;
+	unique_ptr<StreamReservation> initial;
+	mutex lock;
+	std::atomic<idx_t> drained {0};
+	idx_t max_workers = 1, admitted = 0;
 	vector<column_t> columns;
-	idx_t file_index = 0, stream_index = 0;
-	bool file_finished = false;
-	string filename;
 	ScanOptions options;
+	bool decode_dns = false;
+};
+
+struct StreamScanState : public LocalTableFunctionState {
+	// Destroy all worker buffers before releasing the reservation.
+	unique_ptr<StreamReservation> reservation;
+	idx_t file_index = 0, stream_index = 0;
+	bool file_finished = false, initialized = false;
+	string filename;
 	unique_ptr<CaptureReader> reader;
 	packetquapture::TcpReassembler reassembler;
 	std::vector<packetquapture::TcpStream> streams;
-};
-struct DnsMessagesState : public StreamScanState {
-	bool decode_dns = false;
 	idx_t pending_index = 0;
 	std::vector<packetquapture::TcpDnsMessage> pending;
 };
+
+static unique_ptr<LocalTableFunctionState> StreamInitLocal(ExecutionContext &, TableFunctionInitInput &,
+                                                           GlobalTableFunctionState *) {
+	// Defer optional admission to execution. Pipeline initialization may interleave;
+	// the plan-wide worker ceiling also leaves capacity for later scans.
+	return make_uniq<StreamScanState>();
+}
 
 static packetquapture::TcpFlowKey FlowKey(const PacketRecord &record) {
 	packetquapture::TcpFlowKey key;
@@ -1300,12 +1365,16 @@ struct StreamEvent {
 };
 
 // Shared capture iteration and transport lifecycle for every stream-level consumer.
-static bool NextStreamEvent(ClientContext &context, const PcapBindData &bind, StreamScanState &state,
-                            StreamEvent &event) {
+static bool NextStreamEvent(ClientContext &context, const PcapBindData &bind, StreamGlobalState &global,
+                            StreamScanState &state, StreamEvent &event) {
 	while (true) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
 		if (state.stream_index < state.streams.size()) {
 			event.tcp = true;
 			event.stream = std::move(state.streams[state.stream_index++]);
+			event.stream.stream_id = StreamScanId(event.stream.stream_id, state.file_index, bind.files.size());
 			return true;
 		}
 		state.streams.clear();
@@ -1317,16 +1386,16 @@ static bool NextStreamEvent(ClientContext &context, const PcapBindData &bind, St
 			}
 			state.reader.reset();
 			state.file_finished = false;
+			global.Drained();
 		}
 		if (!state.reader) {
-			if (state.file_index >= bind.files.size()) {
-				state.progress.Finish();
+			if (!global.scheduler.Claim(state.file_index)) {
 				return false;
 			}
-			const auto &file = bind.files[state.file_index++];
+			const auto &file = bind.files[state.file_index];
 			state.filename = file.path;
-			state.reader =
-			    make_uniq<CaptureReader>(context, file, state.options, &state.progress, state.file_index - 1);
+			state.reassembler = packetquapture::TcpReassembler();
+			state.reader = make_uniq<CaptureReader>(context, file, global.options, &global.progress, state.file_index);
 		}
 		PacketRecord record;
 		if (!state.reader->Next(record)) {
@@ -1387,11 +1456,13 @@ static unique_ptr<FunctionData> DnsMessagesBind(ClientContext &context, TableFun
 	names.insert(names.end(), dns_names.begin(), dns_names.end());
 	types.insert(types.end(), dns_types.begin(), dns_types.end());
 	result->Cast<PcapBindData>().types = types;
+	result->Cast<PcapBindData>().stream_plan =
+	    context.registered_state->GetOrCreate<StreamPlanRegistry>("packetquapture_stream_plans")->Register();
 	return result;
 }
 
 static unique_ptr<GlobalTableFunctionState> DnsMessagesInit(ClientContext &context, TableFunctionInitInput &input) {
-	auto state = make_uniq<DnsMessagesState>();
+	auto state = make_uniq<StreamGlobalState>(context, input.bind_data->Cast<PcapBindData>());
 	state->progress.Initialize(context, input.bind_data->Cast<PcapBindData>().files, true);
 	state->columns = input.column_ids;
 	state->options.reassemble_dns = true;
@@ -1511,29 +1582,46 @@ static void SetMessageValue(Vector &vector, idx_t row, column_t column, const st
 
 static void DnsMessagesScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind = input.bind_data->Cast<PcapBindData>();
-	auto &state = input.global_state->Cast<DnsMessagesState>();
-	idx_t count = 0;
-	while (count < STANDARD_VECTOR_SIZE) {
+	auto &global = input.global_state->Cast<StreamGlobalState>();
+	auto &state = input.local_state->Cast<StreamScanState>();
+	if (!state.initialized) {
+		state.initialized = true;
+		if (global.file_count) {
+			state.reservation = global.Admit();
+		}
+	}
+	if (!state.reservation) {
+		return;
+	}
+	idx_t count = 0, output_bytes = 0;
+	while (count < STANDARD_VECTOR_SIZE && output_bytes < STREAM_OUTPUT_BATCH_BYTES) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
 		if (state.pending_index < state.pending.size()) {
 			const auto &message = state.pending[state.pending_index++];
 			PacketRecord dns_record;
-			if (state.decode_dns) {
+			if (global.decode_dns) {
 				if (message.status == "complete") {
 					dns_record.dns = packetquapture::DecodeDns(message.data.data(), message.data.size());
 				} else {
 					dns_record.dns.error = message.error;
 				}
 			}
-			for (idx_t i = 0; i < state.columns.size(); ++i) {
-				SetMessageValue(output.data[i], count, state.columns[i], state.filename, message, dns_record);
+			for (idx_t i = 0; i < global.columns.size(); ++i) {
+				SetMessageValue(output.data[i], count, global.columns[i], state.filename, message, dns_record);
 			}
+			output_bytes += 1024 + state.filename.size() + message.data.size() * 4;
+			output_bytes += (dns_record.dns.questions.size() + dns_record.dns.answers.size() +
+			                 dns_record.dns.authorities.size() + dns_record.dns.additionals.size()) *
+			                4096;
 			++count;
 			continue;
 		}
 		state.pending.clear();
 		state.pending_index = 0;
 		StreamEvent event;
-		if (!NextStreamEvent(context, bind, state, event)) {
+		if (!NextStreamEvent(context, bind, global, state, event)) {
 			break;
 		}
 		if (event.tcp) {
@@ -1558,6 +1646,12 @@ static void DnsMessagesScan(ClientContext &context, TableFunctionInput &input, D
 		}
 	}
 	output.SetCardinality(count);
+	if (!count) {
+		std::vector<packetquapture::TcpStream>().swap(state.streams);
+		std::vector<packetquapture::TcpDnsMessage>().swap(state.pending);
+		state.reassembler = packetquapture::TcpReassembler();
+		state.reservation.reset();
+	}
 }
 
 static LogicalType TcpChunkType() {
@@ -1628,10 +1722,12 @@ static unique_ptr<FunctionData> TcpStreamsBind(ClientContext &context, TableFunc
 	         LogicalType::LIST(TcpGapType()),
 	         LogicalType::LIST(LogicalType::USMALLINT)};
 	result->Cast<PcapBindData>().types = types;
+	result->Cast<PcapBindData>().stream_plan =
+	    context.registered_state->GetOrCreate<StreamPlanRegistry>("packetquapture_stream_plans")->Register();
 	return result;
 }
 static unique_ptr<GlobalTableFunctionState> TcpStreamsInit(ClientContext &context, TableFunctionInitInput &input) {
-	auto state = make_uniq<StreamScanState>();
+	auto state = make_uniq<StreamGlobalState>(context, input.bind_data->Cast<PcapBindData>());
 	state->progress.Initialize(context, input.bind_data->Cast<PcapBindData>().files, true);
 	state->columns = input.column_ids;
 	state->options.reassemble_tcp = true;
@@ -1766,19 +1862,40 @@ static void SetStreamValue(Vector &vector, idx_t row, column_t column, const str
 }
 static void TcpStreamsScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind = input.bind_data->Cast<PcapBindData>();
-	auto &state = input.global_state->Cast<StreamScanState>();
-	idx_t count = 0;
-	while (count < STANDARD_VECTOR_SIZE) {
+	auto &global = input.global_state->Cast<StreamGlobalState>();
+	auto &state = input.local_state->Cast<StreamScanState>();
+	if (!state.initialized) {
+		state.initialized = true;
+		if (global.file_count) {
+			state.reservation = global.Admit();
+		}
+	}
+	if (!state.reservation) {
+		return;
+	}
+	idx_t count = 0, output_bytes = 0;
+	while (count < STANDARD_VECTOR_SIZE && output_bytes < STREAM_OUTPUT_BATCH_BYTES) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
 		StreamEvent event;
-		if (!NextStreamEvent(context, bind, state, event)) {
+		if (!NextStreamEvent(context, bind, global, state, event)) {
 			break;
 		}
-		for (idx_t i = 0; i < state.columns.size(); ++i) {
-			SetStreamValue(output.data[i], count, state.columns[i], state.filename, event.stream);
+		for (idx_t i = 0; i < global.columns.size(); ++i) {
+			SetStreamValue(output.data[i], count, global.columns[i], state.filename, event.stream);
 		}
+		output_bytes += 1024 + state.filename.size() + event.stream.captured_bytes * 4ULL +
+		                (event.stream.chunks.size() + event.stream.gaps.size()) * 1024ULL;
 		++count;
 	}
 	output.SetCardinality(count);
+	if (!count) {
+		std::vector<packetquapture::TcpStream>().swap(state.streams);
+		std::vector<packetquapture::TcpDnsMessage>().swap(state.pending);
+		state.reassembler = packetquapture::TcpReassembler();
+		state.reservation.reset();
+	}
 }
 
 static TableFunction ReadPcapFunction() {
@@ -1793,6 +1910,10 @@ static TableFunction ReadPcapFunction() {
 
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.SetDescription("Query PCAP and PCAPNG packet captures directly from DuckDB");
+	DBConfig::GetConfig(loader.GetDatabaseInstance())
+	    .AddExtensionOption("packetquapture_stream_memory_mb",
+	                        "Query-wide stream-worker admission budget in MiB, capped at half memory_limit",
+	                        LogicalType::UBIGINT, Value::UBIGINT(512));
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(ReadPcapFunction()));
 	TableFunction packets("read_packets", {LogicalType::VARCHAR}, PcapScan, PacketsBind, PcapInit, PcapInitLocal);
 	packets.projection_pushdown = true;
@@ -1809,12 +1930,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	dns.pushdown_complex_filter = NormalizePacketFilters;
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(dns));
 	TableFunction messages("read_dns_messages", {LogicalType::VARCHAR}, DnsMessagesScan, DnsMessagesBind,
-	                       DnsMessagesInit);
+	                       DnsMessagesInit, StreamInitLocal);
 	messages.projection_pushdown = true;
 	messages.table_scan_progress = CaptureScanProgress;
 	// Segment-level predicates could remove bytes required to reconstruct a matching message.
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(messages));
-	TableFunction streams("read_tcp_streams", {LogicalType::VARCHAR}, TcpStreamsScan, TcpStreamsBind, TcpStreamsInit);
+	TableFunction streams("read_tcp_streams", {LogicalType::VARCHAR}, TcpStreamsScan, TcpStreamsBind, TcpStreamsInit,
+	                      StreamInitLocal);
 	streams.projection_pushdown = true;
 	streams.table_scan_progress = CaptureScanProgress;
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(streams));

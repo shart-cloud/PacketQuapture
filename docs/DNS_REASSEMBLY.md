@@ -91,9 +91,9 @@ ambiguous message rows. Diagnostic rows have `dns_valid = false`, null DNS field
 Defaults are fixed for this experimental release:
 
 - 1,024 tracked TCP directions per file, including completed directions retained for overlap checking.
-- 32 MiB of buffered captured TCP payload globally.
+- 32 MiB of buffered captured TCP payload per file.
 - 1 MiB of captured payload and a 1 MiB sequence span per direction.
-- 4,096 retained segments per direction and 65,536 retained segments globally.
+- 4,096 retained segments per direction and 65,536 retained segments per file.
 - 4,096 DNS messages per finalized direction.
 
 Identical whole-segment retransmissions do not consume additional storage. Partial overlaps count toward
@@ -126,3 +126,10 @@ c++ -std=c++17 -Wall -Wextra -Werror -g -O1 \
   -o build/dns_tcp_framer_test
 ./build/dns_tcp_framer_test
 ```
+
+## Whole-file parallel execution
+
+See [parallel stream scans](PARALLEL_STREAMS.md) for deterministic scan-local IDs,
+query-wide memory admission, worker limits, and bounded output batches. The 32 MiB
+stored-payload limit above applies per active input occurrence; aggregate admission
+is separately bounded across all stream readers in a query.

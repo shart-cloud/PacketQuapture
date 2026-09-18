@@ -123,12 +123,14 @@ def verify(cli, trials):
     pool = sorted((ROOT / "test/data/protocols").glob("*.pcap*"))
     pool += sorted((ROOT / "test/data/dns").glob("*.pcap*"))
     pool += sorted((ROOT / "test/data/parallel").glob("*.pcap*"))
+    pool += sorted((ROOT / "test/data/reassembly").glob("*.pcap*"))
+    pool += sorted((ROOT / "test/data/tcp_streams").glob("*.pcap*"))
     for trial in range(trials):
         paths = rng.choices(pool, k=12)
         paths += paths[
             :2
         ]  # Exercise multiplicity even if random choices happen to be unique.
-        for function in ("read_pcap", "read_packets", "read_dns"):
+        for function in ("read_pcap", "read_packets", "read_dns", "read_tcp_streams", "read_dns_messages"):
             source = f"{function}({inputs(paths)})"
             predicate = "packet_number > 1 AND captured_length > 30"
             if function != "read_pcap":
@@ -137,6 +139,8 @@ def verify(cli, trials):
                 )
             if function == "read_dns":
                 predicate += " AND (dns_valid OR dns_id IS NULL)"
+            if function in ("read_tcp_streams", "read_dns_messages"):
+                predicate = "first_packet_number > 1 AND (src_port > 0 OR dst_port = 53)"
             sql = (
                 f"SET threads=1; CREATE TEMP TABLE expected AS SELECT * FROM {source};"
             )
@@ -156,7 +160,7 @@ def verify(cli, trials):
                 row["differences"] == 0 for row in results
             ), (trial, function, results)
     print(
-        f"Randomized multiset parity passed: {trials} mixes x 3 functions x 4 thread settings",
+        f"Randomized multiset parity passed: {trials} mixes x 5 functions x 4 thread settings",
         flush=True,
     )
 
