@@ -59,6 +59,32 @@ file scope, and memory bounds.
 `read_tcp_streams(...)` exposes reconstructed bytes for every TCP port, including explicit chunks and gaps.
 DNS framing uses this same transport engine. See [TCP streams and the shared architecture](docs/TCP_STREAMS.md).
 
+## Parallel capture collections
+
+`read_pcap`, `read_packets`, and `read_dns` scan independent files on DuckDB workers.
+Use `SET threads=8` to allow up to eight workers; one file remains sequential.
+Input lists retain repeated paths, and packet numbers and offsets remain file-relative.
+Results have no global ordering guarantee; use `ORDER BY` when needed.
+
+`read_tcp_streams` and `read_dns_messages` remain sequential pending the stream identifier
+and aggregate-memory work. See [parallel scans and validation](docs/PARALLEL_SCANS.md).
+
+## Scan progress
+
+Use `SET enable_progress_bar=true` to report bytes processed across capture inputs, including
+parallel and cached scans. See [progress reporting](docs/SCAN_PROGRESS.md) for client settings,
+metadata-request costs, and behavior for pipes and stream reassembly.
+
+## Remote capture reads
+
+Remote captures use [shared 4 MiB read windows](docs/REMOTE_CACHE.md) through DuckDB's
+external file cache. Repeated queries on the same database can reuse packet bytes, while
+local files retain selective seeks. HTTP and MinIO benchmarks verify request counts,
+transferred bytes, cache controls, and repeated-query reuse. The
+[original benchmark](docs/REMOTE_IO_BENCHMARK.md) records the uncached baseline. The
+[1 GiB scale check](docs/REMOTE_CACHE_SCALE.md) shows how reuse changes under memory pressure.
+The [in-cluster follow-up](docs/REMOTE_CACHE_INCLUSTER.md) compares direct access with the counting proxy.
+
 ## Build and test
 
 The repository includes DuckDB and its extension build tooling as submodules.
@@ -92,7 +118,7 @@ defined and tested.
 
 This is the storage foundation for a PCAP lake rather than a Wireshark replacement on day one. Natural next layers
 are deeper protocol-specific table functions, filter pushdown, file-level statistics and indexes,
-parallel file scans, and a WebAssembly-friendly build. Keeping raw framing separate from protocol dissection lets those
+parallel stream scans, and a WebAssembly-friendly build. Keeping raw framing separate from protocol dissection lets those
 features evolve without requiring captures to be rewritten.
 
 The implementation roadmap, architectural boundaries, acceptance criteria, and licensing notes are in

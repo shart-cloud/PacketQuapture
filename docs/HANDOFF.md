@@ -1,5 +1,13 @@
 # PacketQuapture Handoff
 
+## Active next-work handoff (2026-09-18)
+
+Start with [Current implementation and next steps](CURRENT_HANDOFF.md). It records the
+packet parallelism, shared remote cache, scan progress, validation, benchmark
+results, and operational cleanup. Packaging and hosted CI status are recorded there. The [original multicore plan](MULTICORE_HANDOFF.md)
+remains useful for the pending stream-reader work. The broader roadmap below includes
+historical phases; consult the current handoff before selecting unfinished work.
+
 ## Mission
 
 PacketQuapture is the storage and query foundation for a PCAP lake. Its job is to let DuckDB scan capture files where
@@ -25,8 +33,11 @@ or taking ownership of the source captures.
 
 ## Current state
 
-The native C++ extension currently provides `read_pcap(VARCHAR)` and `read_pcap(LIST<VARCHAR>)`. DuckDB's
-`MultiFileReader` expands exact paths, lists, and globs, and DuckDB's filesystem abstraction opens each file.
+The native C++ extension provides `read_pcap`, `read_packets`, `read_dns`, `read_tcp_streams`, and
+`read_dns_messages`, accepting a path or list of paths. DuckDB's `MultiFileReader` expands exact paths, lists,
+and globs, and DuckDB's filesystem abstraction opens each file. The three packet readers scan
+whole files in parallel; the two stream readers remain sequential. All five support shared
+remote caching and optional byte-based scan progress.
 
 Supported capture framing:
 
@@ -47,7 +58,8 @@ I/O APIs.
 ### Known limitations
 
 - Experimental `read_packets` now decodes Ethernet/VLAN, IPv4/IPv6, TCP, and UDP. See `docs/PROTOCOL_DECODING.md` for the schema and limits.
-- The table function has one global reader and processes files sequentially.
+- Single-file scans and the two stream readers remain sequential; the three packet readers
+  distribute input files across workers.
 - Projection and scalar filter pushdown are implemented; file-statistics pruning and indexed range scans remain future work.
 - There is no persistent file-statistics catalog or packet index.
 - PCAPNG support is intentionally focused on packet-bearing and interface metadata blocks.
@@ -264,13 +276,15 @@ Exit criteria:
 - Peak memory is bounded independently of total capture size.
 - The native release workflow remains independent from the WASM preview until the browser contract is stable.
 
-## Recommended first three pull requests
+## Recommended next pull requests
 
-1. Extract `PacketView` and the byte-source/framing core, then add malformed-input and fuzz coverage.
-2. Add per-file parallel scan state and a checked-in benchmark harness.
-3. Introduce a projection-driven `read_packets` prototype for Ethernet, IPv4/IPv6, TCP, and UDP.
+1. Review the packaged packet-scan, cache, and progress changes and complete hosted CI.
+2. Put both stream functions on the existing whole-file scheduler, preserving per-file reassembly semantics
+   and explicitly handling query-unique IDs and aggregate memory bounds.
+3. Use profiling to select vector/filter allocation improvements or framing/byte-source extraction; tackle
+   indexed single-file parallelism only after defining safe record checkpoints and transport ownership.
 
-These establish the architectural boundary before a large decoded schema or index format becomes difficult to change.
+Implementation details and acceptance criteria are in [MULTICORE_HANDOFF.md](MULTICORE_HANDOFF.md).
 
 ## Testing strategy
 
@@ -287,7 +301,7 @@ Before merging a change:
 ```sh
 make format-check
 GEN=ninja make release
-./build/release/test/unittest test/sql/read_pcap.test
+./build/release/test/unittest 'test/sql/*'
 ```
 
 The formatter dependencies are listed in the code-quality workflow. GitHub Actions installs its own formatter and
