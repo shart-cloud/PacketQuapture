@@ -1,0 +1,317 @@
+# name: test/sql/parallel_scans.test
+# description: whole-file workers preserve row multiplicity, projections, and staged filters
+# group: [sql]
+
+require packetquapture
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE baseline_read_pcap AS SELECT * FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']);
+
+statement ok
+CREATE TEMP TABLE baseline_read_packets AS SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']);
+
+statement ok
+CREATE TEMP TABLE baseline_read_dns AS SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']);
+
+foreach workers 1 2 4 8
+
+statement ok
+SET threads=${workers};
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE true EXCEPT ALL SELECT * FROM baseline_read_pcap WHERE true) UNION ALL (SELECT * FROM baseline_read_pcap WHERE true EXCEPT ALL SELECT * FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE true));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE true EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_pcap WHERE true) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_pcap WHERE true EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE true));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 2 AND captured_length > 30 EXCEPT ALL SELECT * FROM baseline_read_pcap WHERE packet_number > 2 AND captured_length > 30) UNION ALL (SELECT * FROM baseline_read_pcap WHERE packet_number > 2 AND captured_length > 30 EXCEPT ALL SELECT * FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 2 AND captured_length > 30));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 2 AND captured_length > 30 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_pcap WHERE packet_number > 2 AND captured_length > 30) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_pcap WHERE packet_number > 2 AND captured_length > 30 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 2 AND captured_length > 30));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE filename LIKE '%messages.pcap' EXCEPT ALL SELECT * FROM baseline_read_pcap WHERE filename LIKE '%messages.pcap') UNION ALL (SELECT * FROM baseline_read_pcap WHERE filename LIKE '%messages.pcap' EXCEPT ALL SELECT * FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE filename LIKE '%messages.pcap'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE filename LIKE '%messages.pcap' EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_pcap WHERE filename LIKE '%messages.pcap') UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_pcap WHERE filename LIKE '%messages.pcap' EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE filename LIKE '%messages.pcap'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM baseline_read_pcap WHERE timestamp IS NULL) UNION ALL (SELECT * FROM baseline_read_pcap WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_pcap WHERE timestamp IS NULL) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_pcap WHERE timestamp IS NULL EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 999999 EXCEPT ALL SELECT * FROM baseline_read_pcap WHERE packet_number > 999999) UNION ALL (SELECT * FROM baseline_read_pcap WHERE packet_number > 999999 EXCEPT ALL SELECT * FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 999999));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 999999 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_pcap WHERE packet_number > 999999) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_pcap WHERE packet_number > 999999 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_pcap(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 999999));
+----
+0
+
+query I
+SELECT count(*) FROM read_pcap('test/data/parallel/*.pcap*');
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE true EXCEPT ALL SELECT * FROM baseline_read_packets WHERE true) UNION ALL (SELECT * FROM baseline_read_packets WHERE true EXCEPT ALL SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE true));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE true EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE true) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE true EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE true));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 2 AND captured_length > 30 EXCEPT ALL SELECT * FROM baseline_read_packets WHERE packet_number > 2 AND captured_length > 30) UNION ALL (SELECT * FROM baseline_read_packets WHERE packet_number > 2 AND captured_length > 30 EXCEPT ALL SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 2 AND captured_length > 30));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 2 AND captured_length > 30 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE packet_number > 2 AND captured_length > 30) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE packet_number > 2 AND captured_length > 30 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 2 AND captured_length > 30));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE filename LIKE '%messages.pcap' EXCEPT ALL SELECT * FROM baseline_read_packets WHERE filename LIKE '%messages.pcap') UNION ALL (SELECT * FROM baseline_read_packets WHERE filename LIKE '%messages.pcap' EXCEPT ALL SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE filename LIKE '%messages.pcap'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE filename LIKE '%messages.pcap' EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE filename LIKE '%messages.pcap') UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE filename LIKE '%messages.pcap' EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE filename LIKE '%messages.pcap'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM baseline_read_packets WHERE timestamp IS NULL) UNION ALL (SELECT * FROM baseline_read_packets WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE timestamp IS NULL) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE timestamp IS NULL EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 999999 EXCEPT ALL SELECT * FROM baseline_read_packets WHERE packet_number > 999999) UNION ALL (SELECT * FROM baseline_read_packets WHERE packet_number > 999999 EXCEPT ALL SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 999999));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 999999 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE packet_number > 999999) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE packet_number > 999999 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 999999));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE tcp_syn AND NOT tcp_ack_flag EXCEPT ALL SELECT * FROM baseline_read_packets WHERE tcp_syn AND NOT tcp_ack_flag) UNION ALL (SELECT * FROM baseline_read_packets WHERE tcp_syn AND NOT tcp_ack_flag EXCEPT ALL SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE tcp_syn AND NOT tcp_ack_flag));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE tcp_syn AND NOT tcp_ack_flag EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE tcp_syn AND NOT tcp_ack_flag) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE tcp_syn AND NOT tcp_ack_flag EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE tcp_syn AND NOT tcp_ack_flag));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE src_port IS NULL OR dst_port IN (53, 443) EXCEPT ALL SELECT * FROM baseline_read_packets WHERE src_port IS NULL OR dst_port IN (53, 443)) UNION ALL (SELECT * FROM baseline_read_packets WHERE src_port IS NULL OR dst_port IN (53, 443) EXCEPT ALL SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE src_port IS NULL OR dst_port IN (53, 443)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE src_port IS NULL OR dst_port IN (53, 443) EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE src_port IS NULL OR dst_port IN (53, 443)) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE src_port IS NULL OR dst_port IN (53, 443) EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE src_port IS NULL OR dst_port IN (53, 443)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53 EXCEPT ALL SELECT * FROM baseline_read_packets WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53) UNION ALL (SELECT * FROM baseline_read_packets WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53 EXCEPT ALL SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE NOT tcp_syn OR tcp_ack_flag IS NULL EXCEPT ALL SELECT * FROM baseline_read_packets WHERE NOT tcp_syn OR tcp_ack_flag IS NULL) UNION ALL (SELECT * FROM baseline_read_packets WHERE NOT tcp_syn OR tcp_ack_flag IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE NOT tcp_syn OR tcp_ack_flag IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE NOT tcp_syn OR tcp_ack_flag IS NULL EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE NOT tcp_syn OR tcp_ack_flag IS NULL) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_packets WHERE NOT tcp_syn OR tcp_ack_flag IS NULL EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_packets(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE NOT tcp_syn OR tcp_ack_flag IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM read_packets('test/data/parallel/*.pcap*');
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE true EXCEPT ALL SELECT * FROM baseline_read_dns WHERE true) UNION ALL (SELECT * FROM baseline_read_dns WHERE true EXCEPT ALL SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE true));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE true EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE true) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE true EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE true));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 2 AND captured_length > 30 EXCEPT ALL SELECT * FROM baseline_read_dns WHERE packet_number > 2 AND captured_length > 30) UNION ALL (SELECT * FROM baseline_read_dns WHERE packet_number > 2 AND captured_length > 30 EXCEPT ALL SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 2 AND captured_length > 30));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 2 AND captured_length > 30 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE packet_number > 2 AND captured_length > 30) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE packet_number > 2 AND captured_length > 30 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 2 AND captured_length > 30));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE filename LIKE '%messages.pcap' EXCEPT ALL SELECT * FROM baseline_read_dns WHERE filename LIKE '%messages.pcap') UNION ALL (SELECT * FROM baseline_read_dns WHERE filename LIKE '%messages.pcap' EXCEPT ALL SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE filename LIKE '%messages.pcap'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE filename LIKE '%messages.pcap' EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE filename LIKE '%messages.pcap') UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE filename LIKE '%messages.pcap' EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE filename LIKE '%messages.pcap'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM baseline_read_dns WHERE timestamp IS NULL) UNION ALL (SELECT * FROM baseline_read_dns WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE timestamp IS NULL) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE timestamp IS NULL EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 999999 EXCEPT ALL SELECT * FROM baseline_read_dns WHERE packet_number > 999999) UNION ALL (SELECT * FROM baseline_read_dns WHERE packet_number > 999999 EXCEPT ALL SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 999999));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 999999 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE packet_number > 999999) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE packet_number > 999999 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE packet_number > 999999));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE tcp_syn AND NOT tcp_ack_flag EXCEPT ALL SELECT * FROM baseline_read_dns WHERE tcp_syn AND NOT tcp_ack_flag) UNION ALL (SELECT * FROM baseline_read_dns WHERE tcp_syn AND NOT tcp_ack_flag EXCEPT ALL SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE tcp_syn AND NOT tcp_ack_flag));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE tcp_syn AND NOT tcp_ack_flag EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE tcp_syn AND NOT tcp_ack_flag) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE tcp_syn AND NOT tcp_ack_flag EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE tcp_syn AND NOT tcp_ack_flag));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE src_port IS NULL OR dst_port IN (53, 443) EXCEPT ALL SELECT * FROM baseline_read_dns WHERE src_port IS NULL OR dst_port IN (53, 443)) UNION ALL (SELECT * FROM baseline_read_dns WHERE src_port IS NULL OR dst_port IN (53, 443) EXCEPT ALL SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE src_port IS NULL OR dst_port IN (53, 443)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE src_port IS NULL OR dst_port IN (53, 443) EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE src_port IS NULL OR dst_port IN (53, 443)) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE src_port IS NULL OR dst_port IN (53, 443) EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE src_port IS NULL OR dst_port IN (53, 443)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53 EXCEPT ALL SELECT * FROM baseline_read_dns WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53) UNION ALL (SELECT * FROM baseline_read_dns WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53 EXCEPT ALL SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53 EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE ip_version = 4 AND src_ip = '192.0.2.1' AND dst_port = 53));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE NOT tcp_syn OR tcp_ack_flag IS NULL EXCEPT ALL SELECT * FROM baseline_read_dns WHERE NOT tcp_syn OR tcp_ack_flag IS NULL) UNION ALL (SELECT * FROM baseline_read_dns WHERE NOT tcp_syn OR tcp_ack_flag IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE NOT tcp_syn OR tcp_ack_flag IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE NOT tcp_syn OR tcp_ack_flag IS NULL EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE NOT tcp_syn OR tcp_ack_flag IS NULL) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE NOT tcp_syn OR tcp_ack_flag IS NULL EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE NOT tcp_syn OR tcp_ack_flag IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE dns_valid AND NOT dns_response EXCEPT ALL SELECT * FROM baseline_read_dns WHERE dns_valid AND NOT dns_response) UNION ALL (SELECT * FROM baseline_read_dns WHERE dns_valid AND NOT dns_response EXCEPT ALL SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE dns_valid AND NOT dns_response));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE dns_valid AND NOT dns_response EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE dns_valid AND NOT dns_response) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE dns_valid AND NOT dns_response EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE dns_valid AND NOT dns_response));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE dns_question_name = 'example.com' EXCEPT ALL SELECT * FROM baseline_read_dns WHERE dns_question_name = 'example.com') UNION ALL (SELECT * FROM baseline_read_dns WHERE dns_question_name = 'example.com' EXCEPT ALL SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE dns_question_name = 'example.com'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE dns_question_name = 'example.com' EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE dns_question_name = 'example.com') UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE dns_question_name = 'example.com' EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE dns_question_name = 'example.com'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE dns_id IS NULL EXCEPT ALL SELECT * FROM baseline_read_dns WHERE dns_id IS NULL) UNION ALL (SELECT * FROM baseline_read_dns WHERE dns_id IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE dns_id IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE dns_id IS NULL EXCEPT ALL SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE dns_id IS NULL) UNION ALL (SELECT filename, packet_number, packet_offset FROM baseline_read_dns WHERE dns_id IS NULL EXCEPT ALL SELECT filename, packet_number, packet_offset FROM read_dns(['test/data/parallel/*.pcap*', 'test/data/sample.pcapng', 'test/data/protocols/*', 'test/data/dns/*.pcap*', 'test/data/protocols/ethernet.pcap', 'test/data/dns/messages.pcap']) WHERE dns_id IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM read_dns('test/data/parallel/*.pcap*');
+----
+0
+
+statement error
+SELECT count(*) FROM read_packets(['test/data/protocols/chunks.pcap', 'test/data/not-a-capture.bin']);
+----
+not-a-capture.bin
+
+statement error
+SELECT count(*) FROM read_pcap(['test/data/protocols/chunks.pcap', 'test/data/malformed/payload.pcap']);
+----
+byte cursor
+
+query I
+SELECT 42;
+----
+42
+
+endloop
+
+statement ok
+SET threads=1;

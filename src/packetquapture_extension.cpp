@@ -1,11 +1,15 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "packetquapture_extension.hpp"
+#include "capture_progress.hpp"
 #include "packet_decoder.hpp"
 #include "dns_decoder.hpp"
 #include "tcp_reassembly.hpp"
 #include "dns_tcp_framer.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/execution/execution_context.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -16,13 +20,18 @@
 #include <functional>
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/storage/caching_file_system.hpp"
+#include "duckdb/storage/buffer/buffer_handle.hpp"
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -31,6 +40,8 @@
 namespace duckdb {
 namespace {
 
+// Bound each remote reader pin; the remaining windows are evictable in DuckDB's shared cache.
+constexpr idx_t REMOTE_READ_WINDOW_SIZE = 4ULL * 1024ULL * 1024ULL;
 constexpr idx_t MAX_CAPTURED_PACKET_SIZE = 256ULL * 1024ULL * 1024ULL;
 constexpr idx_t MAX_INTERFACE_BLOCK_SIZE = 16ULL * 1024ULL * 1024ULL;
 constexpr uint32_t PCAPNG_INTERFACE_DESCRIPTION = 0x00000001;
@@ -140,26 +151,91 @@ private:
 	DataChunk input;
 };
 
+struct CaptureGlobalState : public GlobalTableFunctionState {
+	CaptureProgress progress;
+};
+
+static double CaptureScanProgress(ClientContext &, const FunctionData *, const GlobalTableFunctionState *state) {
+	return state ? static_cast<const CaptureGlobalState &>(*state).progress.Percentage() : -1;
+}
+
 class CaptureReader {
 public:
-	CaptureReader(ClientContext &context, const OpenFileInfo &file_p, const ScanOptions &options_p)
-	    : file(file_p), fs(FileSystem::GetFileSystem(context)), options(options_p) {
-		handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ);
-		if (handle->CanSeek() && !handle->IsPipe()) {
-			const auto size = fs.GetFileSize(*handle);
+	CaptureReader(ClientContext &context, const OpenFileInfo &file_p, const ScanOptions &options_p,
+	              CaptureProgress *progress_p = nullptr, idx_t file_index = 0)
+	    : file(file_p), context(context), fs(FileSystem::GetFileSystem(context)), options(options_p),
+	      progress(progress_p && progress_p->Enabled() ? progress_p : nullptr) {
+		if (FileSystem::IsRemoteFile(file.path)) {
+			caching_fs = make_uniq<CachingFileSystem>(fs, *context.db);
+			// The window already supplies read-ahead; avoid a second HTTP read buffer.
+			cached_handle =
+			    caching_fs->OpenFile(context, file, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+		} else {
+			handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ);
+		}
+		auto &raw_handle = RawHandle();
+		if (raw_handle.CanSeek() && !raw_handle.IsPipe()) {
+			const auto size = fs.GetFileSize(raw_handle);
 			if (size >= 0) {
 				seekable_size = static_cast<uint64_t>(size);
 				can_skip_by_seek = true;
 			}
 		}
+		if (progress) {
+			progress->CheckSize(file_index, can_skip_by_seek, seekable_size);
+		}
 		Initialize();
 	}
 
 	bool Next(PacketRecord &record) {
-		return format == CaptureFormat::PCAP ? NextPcap(record) : NextPcapNg(record);
+		try {
+			const bool found = format == CaptureFormat::PCAP ? NextPcap(record) : NextPcapNg(record);
+			if (!found && progress && progress->Enabled()) {
+				PublishProgress(true);
+				progress->CompleteFile();
+			}
+			return found;
+		} catch (const std::exception &exception) {
+			ErrorData error(exception);
+			if (error.Type() == ExceptionType::INTERRUPT) {
+				throw;
+			}
+			error.Throw(StringUtil::Format("Capture '%s', packet cursor %llu, byte cursor %llu: ", file.path,
+			                               packet_number, position));
+		}
 	}
 
 private:
+	void PublishProgress(bool force = false) {
+		if (progress && progress->Enabled() && (force || position - published_position >= 64 * 1024)) {
+			progress->Advance(position - published_position);
+			published_position = position;
+		}
+	}
+
+	FileHandle &RawHandle() {
+		return cached_handle ? cached_handle->GetFileHandle() : *handle;
+	}
+
+	// Explicit offsets keep parser skips independent of the underlying handle cursor.
+	// Hold the pin until copying is complete, and release it before allocating another.
+	idx_t ReadRemoteWindow(void *buffer, idx_t length, uint64_t offset) {
+		if (offset >= seekable_size) {
+			return 0;
+		}
+		if (!window.IsValid() || offset < window_start || offset - window_start >= window_length) {
+			window.Destroy();
+			window_data = nullptr;
+			window_start = offset - offset % REMOTE_READ_WINDOW_SIZE;
+			window_length = MinValue<idx_t>(REMOTE_READ_WINDOW_SIZE, seekable_size - window_start);
+			window = cached_handle->Read(window_data, window_length, window_start);
+		}
+		const auto within_window = offset - window_start;
+		const auto count = MinValue<idx_t>(length, window_length - within_window);
+		memcpy(buffer, window_data + within_window, count);
+		return count;
+	}
+
 	void Initialize() {
 		std::array<uint8_t, 4> magic {};
 		if (!ReadMaybe(magic.data(), magic.size())) {
@@ -551,7 +627,13 @@ private:
 	bool ReadMaybe(void *buffer, idx_t length) {
 		idx_t total = 0;
 		while (total < length) {
-			const auto bytes_read = handle->Read(static_cast<uint8_t *>(buffer) + total, length - total);
+			if (context.IsInterrupted()) {
+				throw InterruptException();
+			}
+			auto destination = static_cast<uint8_t *>(buffer) + total;
+			const auto bytes_read = cached_handle && can_skip_by_seek
+			                            ? ReadRemoteWindow(destination, length - total, position + total)
+			                            : NumericCast<idx_t>(RawHandle().Read(destination, length - total));
 			if (bytes_read == 0) {
 				if (total == 0) {
 					return false;
@@ -561,6 +643,7 @@ private:
 			total += NumericCast<idx_t>(bytes_read);
 		}
 		position += length;
+		PublishProgress();
 		return true;
 	}
 
@@ -578,8 +661,11 @@ private:
 			if (position > seekable_size || length > seekable_size - position) {
 				throw IOException("Unexpected end of '%s' while reading %s", file.path, description);
 			}
-			handle->Seek(position + length);
+			if (!cached_handle) {
+				handle->Seek(position + length);
+			}
 			position += length;
+			PublishProgress();
 			return;
 		}
 		std::array<uint8_t, 8192> buffer {};
@@ -592,9 +678,17 @@ private:
 
 private:
 	OpenFileInfo file;
+	ClientContext &context;
 	FileSystem &fs;
 	unique_ptr<FileHandle> handle;
+	unique_ptr<CachingFileSystem> caching_fs;
+	unique_ptr<CachingFileHandle> cached_handle;
+	BufferHandle window;
+	data_ptr_t window_data = nullptr;
+	idx_t window_start = 0, window_length = 0;
 	const ScanOptions &options;
+	CaptureProgress *progress;
+	uint64_t published_position = 0;
 	bool can_skip_by_seek = false;
 	uint64_t seekable_size = 0;
 	CaptureFormat format = CaptureFormat::PCAP;
@@ -634,12 +728,51 @@ struct PcapBindData : public TableFunctionData {
 	}
 };
 
-struct PcapGlobalState : public GlobalTableFunctionState {
+// Every input occurrence is work, including duplicate paths. Bind data owns the
+// immutable file list for the lifetime of the global and local scan states.
+class FileScheduler {
+public:
+	explicit FileScheduler(idx_t file_count_p) : file_count(file_count_p) {
+	}
+
+	bool Claim(idx_t &index) {
+		index = next_file.fetch_add(1, std::memory_order_relaxed);
+		return index < file_count;
+	}
+
+	idx_t MaxThreads() const {
+		// DuckDB still creates one local state for an empty scan.
+		return MaxValue<idx_t>(1, file_count);
+	}
+
+private:
+	const idx_t file_count;
+	std::atomic<idx_t> next_file {0};
+};
+
+struct PacketFilterDefinition {
+	column_t column;
+	unique_ptr<TableFilter> filter;
+};
+
+struct PcapGlobalState : public CaptureGlobalState {
+	explicit PcapGlobalState(idx_t file_count) : scheduler(file_count) {
+	}
+
+	idx_t MaxThreads() const override {
+		return scheduler.MaxThreads();
+	}
+
+	FileScheduler scheduler;
 	vector<column_t> column_ids;
-	idx_t file_index = 0;
-	unique_ptr<CaptureReader> reader;
+	ScanOptions options;
+	vector<PacketFilterDefinition> filters;
+};
+
+struct PcapLocalState : public LocalTableFunctionState {
 	ScanOptions options;
 	vector<unique_ptr<PacketFilter>> filters;
+	unique_ptr<CaptureReader> reader;
 };
 
 static unique_ptr<FunctionData> PcapBind(ClientContext &context, TableFunctionBindInput &input,
@@ -744,8 +877,9 @@ static unique_ptr<FunctionData> DnsBind(ClientContext &context, TableFunctionBin
 }
 
 static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, TableFunctionInitInput &input) {
-	auto result = make_uniq<PcapGlobalState>();
 	auto &bind = input.bind_data->Cast<PcapBindData>();
+	auto result = make_uniq<PcapGlobalState>(bind.files.size());
+	result->progress.Initialize(context, bind.files);
 	result->column_ids = input.column_ids;
 	auto &options = result->options;
 	options.dns_scan = bind.dns_scan;
@@ -776,12 +910,25 @@ static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, Tab
 				continue;
 			}
 			const auto column = input.column_ids[entry.first];
-			result->filters.push_back(make_uniq<PacketFilter>(context, column, bind.types[column], filter));
+			result->filters.push_back({column, filter.Copy()});
 			options.filter_stages[ColumnStage(column)] = true;
 		}
 	}
+	return std::move(result);
+}
+
+static unique_ptr<LocalTableFunctionState> PcapInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                         GlobalTableFunctionState *global_state) {
+	auto &global = global_state->Cast<PcapGlobalState>();
+	auto &bind = input.bind_data->Cast<PcapBindData>();
+	auto result = make_uniq<PcapLocalState>();
+	result->options = global.options;
+	for (const auto &definition : global.filters) {
+		result->filters.push_back(make_uniq<PacketFilter>(context.client, definition.column,
+		                                                  bind.types[definition.column], *definition.filter));
+	}
 	auto *state = result.get();
-	options.matches = [state](const PacketRecord &record, unsigned stage) {
+	result->options.matches = [state](const PacketRecord &record, unsigned stage) {
 		for (auto &filter : state->filters) {
 			if (filter->stage == stage && !filter->Matches(record)) {
 				return false;
@@ -1080,14 +1227,20 @@ static bool SupportsPacketFilter(const FunctionData &data, idx_t column) {
 
 static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind_data = input.bind_data->Cast<PcapBindData>();
-	auto &state = input.global_state->Cast<PcapGlobalState>();
+	auto &global = input.global_state->Cast<PcapGlobalState>();
+	auto &state = input.local_state->Cast<PcapLocalState>();
 	idx_t output_count = 0;
 	while (output_count < STANDARD_VECTOR_SIZE) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
 		if (!state.reader) {
-			if (state.file_index >= bind_data.files.size()) {
+			idx_t file_index;
+			if (!global.scheduler.Claim(file_index)) {
 				break;
 			}
-			state.reader = make_uniq<CaptureReader>(context, bind_data.files[state.file_index++], state.options);
+			state.reader = make_uniq<CaptureReader>(context, bind_data.files[file_index], state.options,
+			                                        &global.progress, file_index);
 		}
 		PacketRecord record;
 		if (!state.reader->Next(record)) {
@@ -1097,15 +1250,15 @@ static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChun
 		if (!record.selected) {
 			continue;
 		}
-		for (idx_t output_column = 0; output_column < state.column_ids.size(); output_column++) {
-			SetRecordValue(output.data[output_column], output_count, state.column_ids[output_column], record);
+		for (idx_t output_column = 0; output_column < global.column_ids.size(); output_column++) {
+			SetRecordValue(output.data[output_column], output_count, global.column_ids[output_column], record);
 		}
 		output_count++;
 	}
 	output.SetCardinality(output_count);
 }
 
-struct StreamScanState : public GlobalTableFunctionState {
+struct StreamScanState : public CaptureGlobalState {
 	vector<column_t> columns;
 	idx_t file_index = 0, stream_index = 0;
 	bool file_finished = false;
@@ -1167,11 +1320,13 @@ static bool NextStreamEvent(ClientContext &context, const PcapBindData &bind, St
 		}
 		if (!state.reader) {
 			if (state.file_index >= bind.files.size()) {
+				state.progress.Finish();
 				return false;
 			}
 			const auto &file = bind.files[state.file_index++];
 			state.filename = file.path;
-			state.reader = make_uniq<CaptureReader>(context, file, state.options);
+			state.reader =
+			    make_uniq<CaptureReader>(context, file, state.options, &state.progress, state.file_index - 1);
 		}
 		PacketRecord record;
 		if (!state.reader->Next(record)) {
@@ -1235,8 +1390,9 @@ static unique_ptr<FunctionData> DnsMessagesBind(ClientContext &context, TableFun
 	return result;
 }
 
-static unique_ptr<GlobalTableFunctionState> DnsMessagesInit(ClientContext &, TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> DnsMessagesInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto state = make_uniq<DnsMessagesState>();
+	state->progress.Initialize(context, input.bind_data->Cast<PcapBindData>().files, true);
 	state->columns = input.column_ids;
 	state->options.reassemble_dns = true;
 	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
@@ -1474,8 +1630,9 @@ static unique_ptr<FunctionData> TcpStreamsBind(ClientContext &context, TableFunc
 	result->Cast<PcapBindData>().types = types;
 	return result;
 }
-static unique_ptr<GlobalTableFunctionState> TcpStreamsInit(ClientContext &, TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> TcpStreamsInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto state = make_uniq<StreamScanState>();
+	state->progress.Initialize(context, input.bind_data->Cast<PcapBindData>().files, true);
 	state->columns = input.column_ids;
 	state->options.reassemble_tcp = true;
 	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
@@ -1625,8 +1782,9 @@ static void TcpStreamsScan(ClientContext &context, TableFunctionInput &input, Da
 }
 
 static TableFunction ReadPcapFunction() {
-	TableFunction function("read_pcap", {LogicalType::VARCHAR}, PcapScan, PcapBind, PcapInit);
+	TableFunction function("read_pcap", {LogicalType::VARCHAR}, PcapScan, PcapBind, PcapInit, PcapInitLocal);
 	function.projection_pushdown = true;
+	function.table_scan_progress = CaptureScanProgress;
 	function.filter_pushdown = true;
 	function.supports_pushdown_type = SupportsPacketFilter;
 	function.pushdown_complex_filter = NormalizePacketFilters;
@@ -1636,14 +1794,16 @@ static TableFunction ReadPcapFunction() {
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.SetDescription("Query PCAP and PCAPNG packet captures directly from DuckDB");
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(ReadPcapFunction()));
-	TableFunction packets("read_packets", {LogicalType::VARCHAR}, PcapScan, PacketsBind, PcapInit);
+	TableFunction packets("read_packets", {LogicalType::VARCHAR}, PcapScan, PacketsBind, PcapInit, PcapInitLocal);
 	packets.projection_pushdown = true;
+	packets.table_scan_progress = CaptureScanProgress;
 	packets.filter_pushdown = true;
 	packets.supports_pushdown_type = SupportsPacketFilter;
 	packets.pushdown_complex_filter = NormalizePacketFilters;
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(packets));
-	TableFunction dns("read_dns", {LogicalType::VARCHAR}, PcapScan, DnsBind, PcapInit);
+	TableFunction dns("read_dns", {LogicalType::VARCHAR}, PcapScan, DnsBind, PcapInit, PcapInitLocal);
 	dns.projection_pushdown = true;
+	dns.table_scan_progress = CaptureScanProgress;
 	dns.filter_pushdown = true;
 	dns.supports_pushdown_type = SupportsPacketFilter;
 	dns.pushdown_complex_filter = NormalizePacketFilters;
@@ -1651,10 +1811,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction messages("read_dns_messages", {LogicalType::VARCHAR}, DnsMessagesScan, DnsMessagesBind,
 	                       DnsMessagesInit);
 	messages.projection_pushdown = true;
+	messages.table_scan_progress = CaptureScanProgress;
 	// Segment-level predicates could remove bytes required to reconstruct a matching message.
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(messages));
 	TableFunction streams("read_tcp_streams", {LogicalType::VARCHAR}, TcpStreamsScan, TcpStreamsBind, TcpStreamsInit);
 	streams.projection_pushdown = true;
+	streams.table_scan_progress = CaptureScanProgress;
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(streams));
 }
 
