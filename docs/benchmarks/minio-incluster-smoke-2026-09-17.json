@@ -1,0 +1,612 @@
+{
+  "status": "passed",
+  "bucket": "packetquapture-bench-bded9900fbcd44cb",
+  "parameters": {
+    "size_mib": 8,
+    "trials": 1,
+    "memory_limits_mib": [
+      32
+    ],
+    "modes": [
+      "direct",
+      "proxy"
+    ],
+    "output": "/work/smoke.json"
+  },
+  "runs": [
+    {
+      "mode": "direct",
+      "files": 1,
+      "memory_limit_mib": 32,
+      "cache_profile": "default",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 0.04996559675782919,
+      "source_bytes": 8387624,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 2,
+      "head_requests": 1,
+      "response_body_bytes": 8387624,
+      "statuses": [
+        "OK_200",
+        "PartialContent_206"
+      ],
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "2",
+        "bytes": "8387624",
+        "resident_bytes": "8387624"
+      },
+      "sampled_peak_rss_bytes": 109547520,
+      "validation_passed": true
+    },
+    {
+      "mode": "direct",
+      "files": 1,
+      "memory_limit_mib": 32,
+      "cache_profile": "default",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 0.01251356303691864,
+      "source_bytes": 8387624,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 0,
+      "head_requests": 1,
+      "response_body_bytes": 0,
+      "statuses": [
+        "OK_200"
+      ],
+      "cache_before": {
+        "entries": "2",
+        "bytes": "8387624",
+        "resident_bytes": "8387624"
+      },
+      "cache_after": {
+        "entries": "2",
+        "bytes": "8387624",
+        "resident_bytes": "8387624"
+      },
+      "sampled_peak_rss_bytes": 109506560,
+      "validation_passed": true
+    },
+    {
+      "mode": "direct",
+      "files": 1,
+      "memory_limit_mib": 32,
+      "cache_profile": "external_off",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 0.04798300610855222,
+      "source_bytes": 8387624,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 2,
+      "head_requests": 1,
+      "response_body_bytes": 8387624,
+      "statuses": [
+        "OK_200",
+        "PartialContent_206"
+      ],
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "sampled_peak_rss_bytes": 117723136,
+      "validation_passed": true
+    },
+    {
+      "mode": "direct",
+      "files": 1,
+      "memory_limit_mib": 32,
+      "cache_profile": "external_off",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 0.03926453599706292,
+      "source_bytes": 8387624,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 2,
+      "head_requests": 1,
+      "response_body_bytes": 8387624,
+      "statuses": [
+        "OK_200",
+        "PartialContent_206"
+      ],
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "sampled_peak_rss_bytes": 118689792,
+      "validation_passed": true
+    },
+    {
+      "mode": "proxy",
+      "files": 1,
+      "memory_limit_mib": 32,
+      "cache_profile": "default",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 0.05038860300555825,
+      "source_bytes": 8387624,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 2,
+      "head_requests": 1,
+      "response_body_bytes": 8387624,
+      "statuses": [
+        "OK_200",
+        "PartialContent_206"
+      ],
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "2",
+        "bytes": "8387624",
+        "resident_bytes": "8387624"
+      },
+      "sampled_peak_rss_bytes": 123461632,
+      "proxy_get_requests": 2,
+      "proxy_body_bytes": 8387624,
+      "validation_passed": true
+    },
+    {
+      "mode": "proxy",
+      "files": 1,
+      "memory_limit_mib": 32,
+      "cache_profile": "default",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 0.01579125691205263,
+      "source_bytes": 8387624,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 0,
+      "head_requests": 1,
+      "response_body_bytes": 0,
+      "statuses": [
+        "OK_200"
+      ],
+      "cache_before": {
+        "entries": "2",
+        "bytes": "8387624",
+        "resident_bytes": "8387624"
+      },
+      "cache_after": {
+        "entries": "2",
+        "bytes": "8387624",
+        "resident_bytes": "8387624"
+      },
+      "sampled_peak_rss_bytes": 118050816,
+      "proxy_get_requests": 0,
+      "proxy_body_bytes": 0,
+      "validation_passed": true
+    },
+    {
+      "mode": "proxy",
+      "files": 1,
+      "memory_limit_mib": 32,
+      "cache_profile": "external_off",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 0.05024390993639827,
+      "source_bytes": 8387624,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 2,
+      "head_requests": 1,
+      "response_body_bytes": 8387624,
+      "statuses": [
+        "OK_200",
+        "PartialContent_206"
+      ],
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "sampled_peak_rss_bytes": 124219392,
+      "proxy_get_requests": 2,
+      "proxy_body_bytes": 8387624,
+      "validation_passed": true
+    },
+    {
+      "mode": "proxy",
+      "files": 1,
+      "memory_limit_mib": 32,
+      "cache_profile": "external_off",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 0.04244154179468751,
+      "source_bytes": 8387624,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 2,
+      "head_requests": 1,
+      "response_body_bytes": 8387624,
+      "statuses": [
+        "OK_200",
+        "PartialContent_206"
+      ],
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "sampled_peak_rss_bytes": 124809216,
+      "proxy_get_requests": 2,
+      "proxy_body_bytes": 8387624,
+      "validation_passed": true
+    },
+    {
+      "mode": "direct",
+      "files": 8,
+      "memory_limit_mib": 32,
+      "cache_profile": "default",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 0.028493540827184916,
+      "source_bytes": 8387792,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 8,
+      "head_requests": 8,
+      "response_body_bytes": 8387792,
+      "statuses": [
+        "OK_200",
+        "PartialContent_206"
+      ],
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "8",
+        "bytes": "8387792",
+        "resident_bytes": "8387792"
+      },
+      "sampled_peak_rss_bytes": 123523072,
+      "validation_passed": true
+    },
+    {
+      "mode": "direct",
+      "files": 8,
+      "memory_limit_mib": 32,
+      "cache_profile": "default",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 0.01732861902564764,
+      "source_bytes": 8387792,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 0,
+      "head_requests": 8,
+      "response_body_bytes": 0,
+      "statuses": [
+        "OK_200"
+      ],
+      "cache_before": {
+        "entries": "8",
+        "bytes": "8387792",
+        "resident_bytes": "8387792"
+      },
+      "cache_after": {
+        "entries": "8",
+        "bytes": "8387792",
+        "resident_bytes": "8387792"
+      },
+      "sampled_peak_rss_bytes": 134926336,
+      "validation_passed": true
+    },
+    {
+      "mode": "direct",
+      "files": 8,
+      "memory_limit_mib": 32,
+      "cache_profile": "external_off",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 0.03848280804231763,
+      "source_bytes": 8387792,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 8,
+      "head_requests": 8,
+      "response_body_bytes": 8387792,
+      "statuses": [
+        "OK_200",
+        "PartialContent_206"
+      ],
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "sampled_peak_rss_bytes": 144031744,
+      "validation_passed": true
+    },
+    {
+      "mode": "direct",
+      "files": 8,
+      "memory_limit_mib": 32,
+      "cache_profile": "external_off",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 0.020551627036184072,
+      "source_bytes": 8387792,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 8,
+      "head_requests": 8,
+      "response_body_bytes": 8387792,
+      "statuses": [
+        "OK_200",
+        "PartialContent_206"
+      ],
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "sampled_peak_rss_bytes": 156770304,
+      "validation_passed": true
+    },
+    {
+      "mode": "proxy",
+      "files": 8,
+      "memory_limit_mib": 32,
+      "cache_profile": "default",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 0.057737234979867935,
+      "source_bytes": 8387792,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 8,
+      "head_requests": 8,
+      "response_body_bytes": 8387792,
+      "statuses": [
+        "OK_200",
+        "PartialContent_206"
+      ],
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "8",
+        "bytes": "8387792",
+        "resident_bytes": "8387792"
+      },
+      "sampled_peak_rss_bytes": 157540352,
+      "proxy_get_requests": 8,
+      "proxy_body_bytes": 8387792,
+      "validation_passed": true
+    },
+    {
+      "mode": "proxy",
+      "files": 8,
+      "memory_limit_mib": 32,
+      "cache_profile": "default",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 0.012451269198209047,
+      "source_bytes": 8387792,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 0,
+      "head_requests": 8,
+      "response_body_bytes": 0,
+      "statuses": [
+        "OK_200"
+      ],
+      "cache_before": {
+        "entries": "8",
+        "bytes": "8387792",
+        "resident_bytes": "8387792"
+      },
+      "cache_after": {
+        "entries": "8",
+        "bytes": "8387792",
+        "resident_bytes": "8387792"
+      },
+      "sampled_peak_rss_bytes": 160849920,
+      "proxy_get_requests": 0,
+      "proxy_body_bytes": 0,
+      "validation_passed": true
+    },
+    {
+      "mode": "proxy",
+      "files": 8,
+      "memory_limit_mib": 32,
+      "cache_profile": "external_off",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 0.02850659005343914,
+      "source_bytes": 8387792,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 8,
+      "head_requests": 8,
+      "response_body_bytes": 8387792,
+      "statuses": [
+        "OK_200",
+        "PartialContent_206"
+      ],
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "sampled_peak_rss_bytes": 138915840,
+      "proxy_get_requests": 8,
+      "proxy_body_bytes": 8387792,
+      "validation_passed": true
+    },
+    {
+      "mode": "proxy",
+      "files": 8,
+      "memory_limit_mib": 32,
+      "cache_profile": "external_off",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 0.040885415859520435,
+      "source_bytes": 8387792,
+      "result": [
+        {
+          "packets": "8065"
+        }
+      ],
+      "get_requests": 8,
+      "head_requests": 8,
+      "response_body_bytes": 8387792,
+      "statuses": [
+        "OK_200",
+        "PartialContent_206"
+      ],
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "sampled_peak_rss_bytes": 157892608,
+      "proxy_get_requests": 8,
+      "proxy_body_bytes": 8387792,
+      "validation_passed": true
+    }
+  ],
+  "method": {
+    "path": "private ClusterIP within same Kubernetes node as MinIO",
+    "requests": "DuckDB in-memory HTTP logs, only method/status/response Content-Length exported",
+    "bytes": "sum successful GET response Content-Length; excludes HTTP overhead, not independent wire measurement",
+    "timing": "HTTP logging enabled; direct has no proxy or Kubernetes tunnel; proxy mode adds local counting proxy",
+    "threads": 8,
+    "pod_cpu_limit": 4,
+    "pod_memory_limit": "4Gi",
+    "first": "fresh DuckDB database, not cold storage or OS cache"
+  },
+  "library_sha256": "49d0d25b3d50cae6af2441362a94b8c7707a81c5d56d5e5a9e68b127f2ed1a98",
+  "cleanup": {
+    "bucket_deleted": true,
+    "object_count": 9
+  },
+  "version": [
+    {
+      "version": "v1.5.5"
+    }
+  ],
+  "extensions": [
+    {
+      "extension_name": "core_functions",
+      "extension_version": "v1.5.5"
+    },
+    {
+      "extension_name": "httpfs",
+      "extension_version": "827222f"
+    },
+    {
+      "extension_name": "packetquapture",
+      "extension_version": "dd038c6"
+    },
+    {
+      "extension_name": "parquet",
+      "extension_version": "v1.5.5"
+    }
+  ]
+}
