@@ -1,0 +1,205 @@
+# name: test/sql/read_packets.test
+# description: bounded protocol decoding with lossless raw packet rows
+# group: [sql]
+
+require packetquapture
+
+query I
+SELECT count(*) FROM read_packets('test/data/protocols/ethernet.pcap');
+----
+34
+
+query ITTTTIIIIIIIIII
+SELECT packet_number, src_mac, dst_mac, src_ip, dst_ip, ether_type, ip_version,
+       ip_protocol, ip_ttl, src_port, dst_port, tcp_flags, tcp_seq, tcp_ack, payload_length
+FROM read_packets('test/data/protocols/ethernet.pcap') WHERE packet_number = 1;
+----
+1	00:11:22:33:44:55	aa:bb:cc:dd:ee:ff	192.0.2.1	198.51.100.2	2048	4	6	64	12345	443	18	16909060	84281096	5
+
+query ITIIII
+SELECT packet_number, vlan_ids::VARCHAR, ether_type, udp_length, payload_offset, payload_length
+FROM read_packets('test/data/protocols/ethernet.pcap') WHERE packet_number = 2;
+----
+2	[100, 200]	2048	11	50	3
+
+query TTTII
+SELECT src_ip, dst_ip, vlan_ids::VARCHAR, payload_offset, ip_id
+FROM read_packets('test/data/protocols/ethernet.pcap') WHERE packet_number = 3;
+----
+2001:0db8:0000:0000:0000:0000:0000:0001	2001:0db8:0000:0000:0000:0000:0000:0002	[]	62	NULL
+
+query IIIIIIIIIII
+SELECT packet_number, ip_version, ip_protocol, ip_fragment_offset, ip_more_fragments::INTEGER,
+       ip_id, src_port, tcp_header_length, udp_length, payload_offset, payload_length
+FROM read_packets('test/data/protocols/ethernet.pcap');
+----
+1	4	6	0	0	42	12345	20	NULL	54	5
+2	4	17	0	0	42	5353	NULL	11	50	3
+3	6	17	0	0	NULL	5353	NULL	11	62	3
+4	6	17	0	0	NULL	5353	NULL	11	70	3
+5	4	6	0	1	42	NULL	NULL	NULL	NULL	NULL
+6	4	6	8	0	42	NULL	NULL	NULL	NULL	NULL
+7	6	17	0	1	99	NULL	NULL	NULL	NULL	NULL
+8	6	17	8	0	99	NULL	NULL	NULL	NULL	NULL
+9	6	17	0	0	99	5353	NULL	11	70	3
+10	4	6	0	0	42	12345	20	NULL	58	0
+11	4	6	0	0	42	12345	24	NULL	58	0
+12	4	6	0	0	42	12345	20	NULL	54	2
+13	4	17	0	0	42	5353	NULL	8	42	0
+14	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+15	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+16	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+17	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+18	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+19	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+20	4	6	0	0	42	NULL	NULL	NULL	NULL	NULL
+21	4	6	0	0	42	NULL	NULL	NULL	NULL	NULL
+22	4	17	0	0	42	NULL	NULL	NULL	NULL	NULL
+23	4	17	0	0	42	NULL	NULL	NULL	NULL	NULL
+24	4	17	0	0	42	NULL	NULL	NULL	NULL	NULL
+25	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+26	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+27	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+28	6	50	0	0	NULL	NULL	NULL	NULL	NULL	NULL
+29	6	59	0	0	NULL	NULL	NULL	NULL	NULL	NULL
+30	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+31	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+32	4	1	0	0	42	NULL	NULL	NULL	NULL	NULL
+33	6	17	0	0	NULL	5353	NULL	11	74	3
+34	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+
+query III rowsort
+SELECT link_type, src_port, payload_offset
+FROM read_packets(['test/data/protocols/raw.pcap', 'test/data/protocols/ipv4.pcap',
+                   'test/data/protocols/ipv6.pcap', 'test/data/protocols/sll.pcap',
+                   'test/data/protocols/sll2.pcap', 'test/data/protocols/unknown.pcap']);
+----
+101	5353	28
+113	5353	44
+228	5353	28
+229	5353	48
+276	5353	68
+999	NULL	NULL
+
+query III
+SELECT count(*), count(src_mac), count(vlan_ids)
+FROM read_packets('test/data/protocols/raw.pcap');
+----
+1	0	0
+
+query TIII
+SELECT capture_format, src_port, payload_offset, payload_length
+FROM read_packets('test/data/protocols/ethernet.pcapng');
+----
+pcapng	12345	54	5
+
+# Preserve raw schema, bytes, and metadata on every malformed/unsupported row.
+query I
+SELECT count(*) FROM (
+  (SELECT filename, packet_number, timestamp, captured_length, original_length, link_type,
+          interface_id, packet_offset, capture_format, packet_data, section_number
+   FROM read_packets('test/data/protocols/*'))
+  EXCEPT ALL (SELECT * FROM read_pcap('test/data/protocols/*'))
+);
+----
+0
+
+# Filters retain SQL null semantics; validity must reset between output chunks.
+query IIII
+SELECT count(*), count(src_port), count(tcp_flags), sum(payload_length)
+FROM read_packets('test/data/protocols/chunks.pcap');
+----
+4500	3000	1500	12000
+
+query I
+SELECT count(*) FROM read_packets('test/data/protocols/chunks.pcap') WHERE dst_port = 443;
+----
+1500
+
+# Link-only and network-only projections retain valid lower layers.
+query II
+SELECT count(src_mac), count(ip_version) FROM read_packets('test/data/protocols/ethernet.pcap');
+----
+31	22
+
+query I
+SELECT count(src_mac) FROM read_packets('test/data/protocols/ethernet.pcap');
+----
+31
+
+# Checked seeks must not hide physically truncated packet bytes or block trailers.
+
+statement error
+SELECT count(*) FROM read_packets('test/data/malformed/payload.pcap');
+----
+Unexpected end
+
+statement error
+SELECT count(src_mac) FROM read_packets('test/data/malformed/payload.pcap');
+----
+Unexpected end
+
+statement error
+SELECT count(src_ip) FROM read_packets('test/data/malformed/payload.pcap');
+----
+Unexpected end
+
+statement error
+SELECT count(tcp_flags) FROM read_packets('test/data/malformed/payload.pcap');
+----
+Unexpected end
+
+statement error
+SELECT sum(octet_length(packet_data)) FROM read_packets('test/data/malformed/payload.pcap');
+----
+Unexpected end
+
+statement error
+SELECT count(*) FROM read_packets('test/data/malformed/payload.pcapng');
+----
+Unexpected end
+
+statement error
+SELECT count(src_mac) FROM read_packets('test/data/malformed/payload.pcapng');
+----
+Unexpected end
+
+statement error
+SELECT count(src_ip) FROM read_packets('test/data/malformed/payload.pcapng');
+----
+Unexpected end
+
+statement error
+SELECT count(tcp_flags) FROM read_packets('test/data/malformed/payload.pcapng');
+----
+Unexpected end
+
+statement error
+SELECT sum(octet_length(packet_data)) FROM read_packets('test/data/malformed/payload.pcapng');
+----
+Unexpected end
+
+statement error
+SELECT count(*) FROM read_packets('test/data/malformed/trailer.pcapng');
+----
+Unexpected end
+
+statement error
+SELECT count(src_mac) FROM read_packets('test/data/malformed/trailer.pcapng');
+----
+Unexpected end
+
+statement error
+SELECT count(src_ip) FROM read_packets('test/data/malformed/trailer.pcapng');
+----
+Unexpected end
+
+statement error
+SELECT count(tcp_flags) FROM read_packets('test/data/malformed/trailer.pcapng');
+----
+Unexpected end
+
+statement error
+SELECT sum(octet_length(packet_data)) FROM read_packets('test/data/malformed/trailer.pcapng');
+----
+Unexpected end

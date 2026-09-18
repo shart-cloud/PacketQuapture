@@ -1,0 +1,87 @@
+# name: test/sql/read_tcp_streams.test
+# description: protocol-independent TCP ranges, gaps, opaque bytes, and lifecycle
+# group: [sql]
+
+require packetquapture
+
+query IITIIIII
+SELECT src_port, dst_port, reassembly_status, expected_bytes, captured_bytes,
+       has_gaps::INTEGER, syn_seen::INTEGER, octet_length(stream_data)
+FROM read_tcp_streams('test/data/tcp_streams/protocols.pcap') ORDER BY src_port;
+----
+50000	80	contiguous	37	37	0	1	37
+50001	443	contiguous	10	10	0	1	10
+50002	8080	unanchored	6	6	0	0	6
+50003	22	gapped	6	4	1	1	NULL
+50004	12345	conflict	NULL	NULL	NULL	1	NULL
+50005	80	contiguous	3	3	0	1	3
+50006	80	contiguous	3	3	0	1	3
+
+query T
+SELECT hex(stream_data) FROM read_tcp_streams('test/data/tcp_streams/protocols.pcap') WHERE dst_port = 443;
+----
+1603030005FF00018042
+
+query TII
+SELECT hex(stream_data), tcp_sequence, len(chunks)
+FROM read_tcp_streams('test/data/tcp_streams/protocols.pcap') WHERE src_port = 50002;
+----
+414243444546	101	1
+
+query IITII
+SELECT part.offset, part.tcp_sequence, hex(part.data), part.first_packet_number, part.last_packet_number
+FROM (SELECT unnest(chunks) AS part FROM read_tcp_streams('test/data/tcp_streams/protocols.pcap') WHERE src_port = 50003);
+----
+0	101	4142	10	10
+4	105	4546	11	11
+
+query II
+SELECT gaps[1].offset, gaps[1].length FROM read_tcp_streams('test/data/tcp_streams/protocols.pcap') WHERE src_port = 50003;
+----
+2	2
+
+query IIIT
+SELECT src_port, fin_seen::INTEGER, reset_seen::INTEGER, finalized_by
+FROM read_tcp_streams('test/data/tcp_streams/protocols.pcap') WHERE src_port >= 50005 ORDER BY src_port;
+----
+50005	1	0	eof
+50006	0	1	reset
+
+query III
+SELECT count(*), count(DISTINCT stream_id), sum(octet_length(stream_data))
+FROM read_tcp_streams('test/data/tcp_streams/chunks.pcap');
+----
+2500	2500	7500
+
+query I
+SELECT count(*) FROM read_dns_messages('test/data/tcp_streams/protocols.pcap');
+----
+0
+
+# DNS framing is a consumer of the same generic bytes: three 29-byte messages plus length prefixes.
+query I
+SELECT octet_length(stream_data) FROM read_tcp_streams('test/data/reassembly/streams.pcap') WHERE src_port = 40002;
+----
+93
+
+query I
+SELECT sum(octet_length(message_data) + 2) FROM read_dns_messages('test/data/reassembly/streams.pcap') WHERE src_port = 40002;
+----
+93
+
+query II
+SELECT count(*), count(stream_data) FROM read_tcp_streams('test/data/reassembly/interfaces.pcapng');
+----
+2	1
+
+query TI rowsort
+SELECT reassembly_status, count(*)
+FROM read_tcp_streams(['test/data/reassembly/part_a.pcap', 'test/data/reassembly/part_b.pcap']) GROUP BY ALL;
+----
+contiguous	1
+unanchored	1
+
+statement error
+SELECT * FROM read_tcp_streams('test/data/malformed/payload.pcap');
+----
+Unexpected end

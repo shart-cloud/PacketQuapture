@@ -1,0 +1,1424 @@
+{
+  "status": "passed",
+  "metadata": {
+    "duckdb": [
+      {
+        "version": "v1.5.5"
+      }
+    ],
+    "extensions": [
+      {
+        "extension_name": "core_functions",
+        "extension_version": "v1.5.5"
+      },
+      {
+        "extension_name": "httpfs",
+        "extension_version": "827222f"
+      },
+      {
+        "extension_name": "packetquapture",
+        "extension_version": "dd038c6"
+      },
+      {
+        "extension_name": "parquet",
+        "extension_version": "v1.5.5"
+      }
+    ]
+  },
+  "parameters": {
+    "library": "/home/jg/git/packetquapture/build/release/src/libduckdb.so",
+    "size_mib": 1024,
+    "frame_sizes": [
+      1024
+    ],
+    "files": [
+      1,
+      8
+    ],
+    "trials": 1,
+    "threads": 8,
+    "memory_limits_mib": [
+      128,
+      2048
+    ],
+    "query_timeout": 300,
+    "upload_timeout": 600,
+    "cases": [
+      "metadata"
+    ],
+    "cache_profiles": [
+      "default",
+      "external_off"
+    ],
+    "output": "/home/jg/git/packetquapture/build/remote-reads/minio-1gib.json"
+  },
+  "method": {
+    "backend": "real MinIO via a Kubernetes port-forward and non-caching counting proxy",
+    "scope": "literal S3 object lists, signed requests; no listing, production data, AWS S3, R2, or cost claims",
+    "bytes": "MinIO response payload bytes forwarded to DuckDB, excludes headers/tunnel overhead",
+    "timing": "includes local proxy and port-forward overhead; not direct-endpoint throughput",
+    "cache": "first=new database; repeat=identical SQL on same connection; hit rate unavailable",
+    "credentials": "environment and ephemeral database secret only; never included in reports",
+    "control_requests": "bucket creation, upload, and cleanup are excluded from query counters"
+  },
+  "os": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "logical_cpus": 8,
+  "revision": "dd038c6138a14f7bb08e5cb080debd6d28720050",
+  "benchmark_sha256": "76804cbc2dae0c9b2edd7be445fb5b7cc340d0770813f6bbb0e743e5f55aa9ac",
+  "shared_harness_sha256": "90abcca3ed07a2155122d7a125394314a22269f8076208f080398721fda9bb38",
+  "cleanup": {
+    "bucket_deleted": true,
+    "object_count": 9
+  },
+  "baselines": [
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "case": "metadata",
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ]
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "case": "metadata",
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ]
+    }
+  ],
+  "summaries": [
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "case": "metadata",
+      "cache_profile": "default",
+      "memory_limit_mib": 128,
+      "phase": "first",
+      "wall_s": {
+        "median": 113.94736013600777,
+        "min": 113.94736013600777,
+        "max": 113.94736013600777
+      },
+      "requests": {
+        "median": 257,
+        "min": 257,
+        "max": 257
+      },
+      "head_requests": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073741784,
+        "min": 1073741784,
+        "max": 1073741784
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "case": "metadata",
+      "cache_profile": "default",
+      "memory_limit_mib": 128,
+      "phase": "repeat",
+      "wall_s": {
+        "median": 95.79369882401079,
+        "min": 95.79369882401079,
+        "max": 95.79369882401079
+      },
+      "requests": {
+        "median": 242,
+        "min": 242,
+        "max": 242
+      },
+      "head_requests": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "get_requests": {
+        "median": 241,
+        "min": 241,
+        "max": 241
+      },
+      "response_body_bytes": {
+        "median": 1010827264,
+        "min": 1010827264,
+        "max": 1010827264
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "case": "metadata",
+      "cache_profile": "external_off",
+      "memory_limit_mib": 128,
+      "phase": "first",
+      "wall_s": {
+        "median": 100.27546910599631,
+        "min": 100.27546910599631,
+        "max": 100.27546910599631
+      },
+      "requests": {
+        "median": 257,
+        "min": 257,
+        "max": 257
+      },
+      "head_requests": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073741784,
+        "min": 1073741784,
+        "max": 1073741784
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "case": "metadata",
+      "cache_profile": "external_off",
+      "memory_limit_mib": 128,
+      "phase": "repeat",
+      "wall_s": {
+        "median": 99.94799432699801,
+        "min": 99.94799432699801,
+        "max": 99.94799432699801
+      },
+      "requests": {
+        "median": 257,
+        "min": 257,
+        "max": 257
+      },
+      "head_requests": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073741784,
+        "min": 1073741784,
+        "max": 1073741784
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "case": "metadata",
+      "cache_profile": "default",
+      "memory_limit_mib": 2048,
+      "phase": "first",
+      "wall_s": {
+        "median": 104.29207267799939,
+        "min": 104.29207267799939,
+        "max": 104.29207267799939
+      },
+      "requests": {
+        "median": 257,
+        "min": 257,
+        "max": 257
+      },
+      "head_requests": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073741784,
+        "min": 1073741784,
+        "max": 1073741784
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "case": "metadata",
+      "cache_profile": "default",
+      "memory_limit_mib": 2048,
+      "phase": "repeat",
+      "wall_s": {
+        "median": 0.3378355390013894,
+        "min": 0.3378355390013894,
+        "max": 0.3378355390013894
+      },
+      "requests": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "head_requests": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "get_requests": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      },
+      "response_body_bytes": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "case": "metadata",
+      "cache_profile": "external_off",
+      "memory_limit_mib": 2048,
+      "phase": "first",
+      "wall_s": {
+        "median": 110.14097977199708,
+        "min": 110.14097977199708,
+        "max": 110.14097977199708
+      },
+      "requests": {
+        "median": 257,
+        "min": 257,
+        "max": 257
+      },
+      "head_requests": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073741784,
+        "min": 1073741784,
+        "max": 1073741784
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "case": "metadata",
+      "cache_profile": "external_off",
+      "memory_limit_mib": 2048,
+      "phase": "repeat",
+      "wall_s": {
+        "median": 103.93424593000964,
+        "min": 103.93424593000964,
+        "max": 103.93424593000964
+      },
+      "requests": {
+        "median": 257,
+        "min": 257,
+        "max": 257
+      },
+      "head_requests": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073741784,
+        "min": 1073741784,
+        "max": 1073741784
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "case": "metadata",
+      "cache_profile": "default",
+      "memory_limit_mib": 128,
+      "phase": "first",
+      "wall_s": {
+        "median": 97.66543653000554,
+        "min": 97.66543653000554,
+        "max": 97.66543653000554
+      },
+      "requests": {
+        "median": 264,
+        "min": 264,
+        "max": 264
+      },
+      "head_requests": {
+        "median": 8,
+        "min": 8,
+        "max": 8
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073739808,
+        "min": 1073739808,
+        "max": 1073739808
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "case": "metadata",
+      "cache_profile": "default",
+      "memory_limit_mib": 128,
+      "phase": "repeat",
+      "wall_s": {
+        "median": 97.96147955999186,
+        "min": 97.96147955999186,
+        "max": 97.96147955999186
+      },
+      "requests": {
+        "median": 264,
+        "min": 264,
+        "max": 264
+      },
+      "head_requests": {
+        "median": 8,
+        "min": 8,
+        "max": 8
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073739808,
+        "min": 1073739808,
+        "max": 1073739808
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "case": "metadata",
+      "cache_profile": "external_off",
+      "memory_limit_mib": 128,
+      "phase": "first",
+      "wall_s": {
+        "median": 106.21108417700452,
+        "min": 106.21108417700452,
+        "max": 106.21108417700452
+      },
+      "requests": {
+        "median": 264,
+        "min": 264,
+        "max": 264
+      },
+      "head_requests": {
+        "median": 8,
+        "min": 8,
+        "max": 8
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073739808,
+        "min": 1073739808,
+        "max": 1073739808
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "case": "metadata",
+      "cache_profile": "external_off",
+      "memory_limit_mib": 128,
+      "phase": "repeat",
+      "wall_s": {
+        "median": 97.67465498798992,
+        "min": 97.67465498798992,
+        "max": 97.67465498798992
+      },
+      "requests": {
+        "median": 264,
+        "min": 264,
+        "max": 264
+      },
+      "head_requests": {
+        "median": 8,
+        "min": 8,
+        "max": 8
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073739808,
+        "min": 1073739808,
+        "max": 1073739808
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "case": "metadata",
+      "cache_profile": "default",
+      "memory_limit_mib": 2048,
+      "phase": "first",
+      "wall_s": {
+        "median": 98.86575011900277,
+        "min": 98.86575011900277,
+        "max": 98.86575011900277
+      },
+      "requests": {
+        "median": 264,
+        "min": 264,
+        "max": 264
+      },
+      "head_requests": {
+        "median": 8,
+        "min": 8,
+        "max": 8
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073739808,
+        "min": 1073739808,
+        "max": 1073739808
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "case": "metadata",
+      "cache_profile": "default",
+      "memory_limit_mib": 2048,
+      "phase": "repeat",
+      "wall_s": {
+        "median": 0.0903139299916802,
+        "min": 0.0903139299916802,
+        "max": 0.0903139299916802
+      },
+      "requests": {
+        "median": 8,
+        "min": 8,
+        "max": 8
+      },
+      "head_requests": {
+        "median": 8,
+        "min": 8,
+        "max": 8
+      },
+      "get_requests": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      },
+      "response_body_bytes": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "case": "metadata",
+      "cache_profile": "external_off",
+      "memory_limit_mib": 2048,
+      "phase": "first",
+      "wall_s": {
+        "median": 99.03223954500572,
+        "min": 99.03223954500572,
+        "max": 99.03223954500572
+      },
+      "requests": {
+        "median": 264,
+        "min": 264,
+        "max": 264
+      },
+      "head_requests": {
+        "median": 8,
+        "min": 8,
+        "max": 8
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073739808,
+        "min": 1073739808,
+        "max": 1073739808
+      }
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "case": "metadata",
+      "cache_profile": "external_off",
+      "memory_limit_mib": 2048,
+      "phase": "repeat",
+      "wall_s": {
+        "median": 97.53064517400344,
+        "min": 97.53064517400344,
+        "max": 97.53064517400344
+      },
+      "requests": {
+        "median": 264,
+        "min": 264,
+        "max": 264
+      },
+      "head_requests": {
+        "median": 8,
+        "min": 8,
+        "max": 8
+      },
+      "get_requests": {
+        "median": 256,
+        "min": 256,
+        "max": 256
+      },
+      "response_body_bytes": {
+        "median": 1073739808,
+        "min": 1073739808,
+        "max": 1073739808
+      }
+    }
+  ],
+  "date": "2026-09-17",
+  "source_sha256": "c92f633476710e00983459576a6a985265f8b851cbf69d0a462f538189d69f01",
+  "scope": "single-trial 1 GiB metadata scans; no direct-endpoint, payload-decoding, AWS S3 or R2 claim",
+  "local_cleanup": {
+    "synthetic_files_deleted": 9,
+    "names": [
+      "frame-1024-files-1-0.pcap",
+      "frame-1024-files-8-0.pcap",
+      "frame-1024-files-8-1.pcap",
+      "frame-1024-files-8-2.pcap",
+      "frame-1024-files-8-3.pcap",
+      "frame-1024-files-8-4.pcap",
+      "frame-1024-files-8-5.pcap",
+      "frame-1024-files-8-6.pcap",
+      "frame-1024-files-8-7.pcap"
+    ]
+  },
+  "memory_sampling": {
+    "method": "Linux /proc VmRSS sampled every 2 seconds for the Python benchmark process; includes DuckDB/proxy, excludes AWS CLI, kubectl and MinIO; not a DuckDB memory-limit accounting metric",
+    "sample_count": 777,
+    "peak_sampled_rss_kib": 1153600
+  },
+  "runs": [
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "records": 1032444,
+      "source_bytes": 1073741784,
+      "cache_profile": "default",
+      "memory_limit_mib": 128,
+      "effective_memory_limit": "128.0 MiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 113.94736013600777,
+      "process_cpu_s": 114.84490008899999,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "256",
+        "bytes": "1073741784",
+        "resident_bytes": "130023384"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 257,
+      "head_requests": 1,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073741784,
+      "body_to_source_ratio": 1.0,
+      "statuses": {
+        "200": 1,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 255,
+        "4194264": 1
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 203628,
+      "process_rss_sample_count": 57
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "records": 1032444,
+      "source_bytes": 1073741784,
+      "cache_profile": "default",
+      "memory_limit_mib": 128,
+      "effective_memory_limit": "128.0 MiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 95.79369882401079,
+      "process_cpu_s": 96.770927994,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "256",
+        "bytes": "1073741784",
+        "resident_bytes": "130023384"
+      },
+      "cache_after": {
+        "entries": "256",
+        "bytes": "1073741784",
+        "resident_bytes": "125829080"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 242,
+      "head_requests": 1,
+      "get_requests": 241,
+      "range_requests": 241,
+      "response_body_bytes": 1010827264,
+      "body_to_source_ratio": 0.941406285070117,
+      "statuses": {
+        "200": 1,
+        "206": 241
+      },
+      "get_body_size_counts": {
+        "4194304": 241
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 270348,
+      "process_rss_sample_count": 48
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "records": 1032444,
+      "source_bytes": 1073741784,
+      "cache_profile": "external_off",
+      "memory_limit_mib": 128,
+      "effective_memory_limit": "128.0 MiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 100.27546910599631,
+      "process_cpu_s": 101.30952171899997,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 257,
+      "head_requests": 1,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073741784,
+      "body_to_source_ratio": 1.0,
+      "statuses": {
+        "200": 1,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 255,
+        "4194264": 1
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 83104,
+      "process_rss_sample_count": 50
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "records": 1032444,
+      "source_bytes": 1073741784,
+      "cache_profile": "external_off",
+      "memory_limit_mib": 128,
+      "effective_memory_limit": "128.0 MiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 99.94799432699801,
+      "process_cpu_s": 100.91874726399999,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 257,
+      "head_requests": 1,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073741784,
+      "body_to_source_ratio": 1.0,
+      "statuses": {
+        "200": 1,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 255,
+        "4194264": 1
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 88560,
+      "process_rss_sample_count": 50
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "records": 1032444,
+      "source_bytes": 1073741784,
+      "cache_profile": "default",
+      "memory_limit_mib": 2048,
+      "effective_memory_limit": "2.0 GiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 104.29207267799939,
+      "process_cpu_s": 7.852542964999998,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "256",
+        "bytes": "1073741784",
+        "resident_bytes": "1073741784"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 257,
+      "head_requests": 1,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073741784,
+      "body_to_source_ratio": 1.0,
+      "statuses": {
+        "200": 1,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 255,
+        "4194264": 1
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 1117728,
+      "process_rss_sample_count": 52
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "records": 1032444,
+      "source_bytes": 1073741784,
+      "cache_profile": "default",
+      "memory_limit_mib": 2048,
+      "effective_memory_limit": "2.0 GiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 0.3378355390013894,
+      "process_cpu_s": 0.6463062530000343,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "256",
+        "bytes": "1073741784",
+        "resident_bytes": "1073741784"
+      },
+      "cache_after": {
+        "entries": "256",
+        "bytes": "1073741784",
+        "resident_bytes": "1073741784"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 1,
+      "head_requests": 1,
+      "get_requests": 0,
+      "range_requests": 0,
+      "response_body_bytes": 0,
+      "body_to_source_ratio": 0.0,
+      "statuses": {
+        "200": 1
+      },
+      "get_body_size_counts": {},
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": null,
+      "process_rss_sample_count": 0
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "records": 1032444,
+      "source_bytes": 1073741784,
+      "cache_profile": "external_off",
+      "memory_limit_mib": 2048,
+      "effective_memory_limit": "2.0 GiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 110.14097977199708,
+      "process_cpu_s": 111.06646832199999,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 257,
+      "head_requests": 1,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073741784,
+      "body_to_source_ratio": 1.0,
+      "statuses": {
+        "200": 1,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 255,
+        "4194264": 1
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 86752,
+      "process_rss_sample_count": 55
+    },
+    {
+      "frame_size": 1024,
+      "files": 1,
+      "records": 1032444,
+      "source_bytes": 1073741784,
+      "cache_profile": "external_off",
+      "memory_limit_mib": 2048,
+      "effective_memory_limit": "2.0 GiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 103.93424593000964,
+      "process_cpu_s": 104.73966447399994,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 257,
+      "head_requests": 1,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073741784,
+      "body_to_source_ratio": 1.0,
+      "statuses": {
+        "200": 1,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 255,
+        "4194264": 1
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 99680,
+      "process_rss_sample_count": 52
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "records": 1032444,
+      "source_bytes": 1073741952,
+      "cache_profile": "default",
+      "memory_limit_mib": 128,
+      "effective_memory_limit": "128.0 MiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 97.66543653000554,
+      "process_cpu_s": 10.00049917299998,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "256",
+        "bytes": "1073739808",
+        "resident_bytes": "130021408"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 264,
+      "head_requests": 8,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073739808,
+      "body_to_source_ratio": 0.9999980032446381,
+      "statuses": {
+        "200": 8,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 252,
+        "4193800": 4
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 300512,
+      "process_rss_sample_count": 48
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "records": 1032444,
+      "source_bytes": 1073741952,
+      "cache_profile": "default",
+      "memory_limit_mib": 128,
+      "effective_memory_limit": "128.0 MiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 97.96147955999186,
+      "process_cpu_s": 9.616617477999966,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "256",
+        "bytes": "1073739808",
+        "resident_bytes": "130021408"
+      },
+      "cache_after": {
+        "entries": "256",
+        "bytes": "1073739808",
+        "resident_bytes": "125828112"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 264,
+      "head_requests": 8,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073739808,
+      "body_to_source_ratio": 0.9999980032446381,
+      "statuses": {
+        "200": 8,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 252,
+        "4193800": 4
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 405604,
+      "process_rss_sample_count": 49
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "records": 1032444,
+      "source_bytes": 1073741952,
+      "cache_profile": "external_off",
+      "memory_limit_mib": 128,
+      "effective_memory_limit": "128.0 MiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 106.21108417700452,
+      "process_cpu_s": 9.724397380000028,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 264,
+      "head_requests": 8,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073739808,
+      "body_to_source_ratio": 0.9999980032446381,
+      "statuses": {
+        "200": 8,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 252,
+        "4193800": 4
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 206452,
+      "process_rss_sample_count": 53
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "records": 1032444,
+      "source_bytes": 1073741952,
+      "cache_profile": "external_off",
+      "memory_limit_mib": 128,
+      "effective_memory_limit": "128.0 MiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 97.67465498798992,
+      "process_cpu_s": 9.532678400999998,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 264,
+      "head_requests": 8,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073739808,
+      "body_to_source_ratio": 0.9999980032446381,
+      "statuses": {
+        "200": 8,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 252,
+        "4193800": 4
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 206512,
+      "process_rss_sample_count": 49
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "records": 1032444,
+      "source_bytes": 1073741952,
+      "cache_profile": "default",
+      "memory_limit_mib": 2048,
+      "effective_memory_limit": "2.0 GiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 98.86575011900277,
+      "process_cpu_s": 8.853679462999935,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "256",
+        "bytes": "1073739808",
+        "resident_bytes": "1073739808"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 264,
+      "head_requests": 8,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073739808,
+      "body_to_source_ratio": 0.9999980032446381,
+      "statuses": {
+        "200": 8,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 252,
+        "4193800": 4
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 1153600,
+      "process_rss_sample_count": 49
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "records": 1032444,
+      "source_bytes": 1073741952,
+      "cache_profile": "default",
+      "memory_limit_mib": 2048,
+      "effective_memory_limit": "2.0 GiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 0.0903139299916802,
+      "process_cpu_s": 0.438974974999951,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "256",
+        "bytes": "1073739808",
+        "resident_bytes": "1073739808"
+      },
+      "cache_after": {
+        "entries": "256",
+        "bytes": "1073739808",
+        "resident_bytes": "1073739808"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 8,
+      "head_requests": 8,
+      "get_requests": 0,
+      "range_requests": 0,
+      "response_body_bytes": 0,
+      "body_to_source_ratio": 0.0,
+      "statuses": {
+        "200": 8
+      },
+      "get_body_size_counts": {},
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": null,
+      "process_rss_sample_count": 0
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "records": 1032444,
+      "source_bytes": 1073741952,
+      "cache_profile": "external_off",
+      "memory_limit_mib": 2048,
+      "effective_memory_limit": "2.0 GiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "first",
+      "wall_s": 99.03223954500572,
+      "process_cpu_s": 7.453324093999981,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 264,
+      "head_requests": 8,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073739808,
+      "body_to_source_ratio": 0.9999980032446381,
+      "statuses": {
+        "200": 8,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 252,
+        "4193800": 4
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 208048,
+      "process_rss_sample_count": 50
+    },
+    {
+      "frame_size": 1024,
+      "files": 8,
+      "records": 1032444,
+      "source_bytes": 1073741952,
+      "cache_profile": "external_off",
+      "memory_limit_mib": 2048,
+      "effective_memory_limit": "2.0 GiB",
+      "case": "metadata",
+      "trial": 0,
+      "phase": "repeat",
+      "wall_s": 97.53064517400344,
+      "process_cpu_s": 8.677507249999962,
+      "result": [
+        {
+          "packets": "1032444"
+        }
+      ],
+      "error": null,
+      "cache_before": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "cache_after": {
+        "entries": "0",
+        "bytes": "0",
+        "resident_bytes": "0"
+      },
+      "external_cache_hit_rate": null,
+      "requests": 264,
+      "head_requests": 8,
+      "get_requests": 256,
+      "range_requests": 256,
+      "response_body_bytes": 1073739808,
+      "body_to_source_ratio": 0.9999980032446381,
+      "statuses": {
+        "200": 8,
+        "206": 256
+      },
+      "get_body_size_counts": {
+        "4194304": 252,
+        "4193800": 4
+      },
+      "incomplete_responses": 0,
+      "validation_passed": true,
+      "sampled_peak_process_rss_kib": 196960,
+      "process_rss_sample_count": 48
+    }
+  ]
+}

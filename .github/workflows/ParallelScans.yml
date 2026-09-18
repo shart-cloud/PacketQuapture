@@ -1,0 +1,91 @@
+name: Parallel capture scans
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      sanitizer:
+        description: Optional full DuckDB and extension sanitizer build
+        type: choice
+        default: none
+        options: [none, thread, address]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build and I/O check dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build strace
+      - name: Configure
+        env:
+          SANITIZER: ${{ inputs.sanitizer || 'none' }}
+        run: |
+          flags=()
+          if [ "$SANITIZER" = thread ]; then
+            flags+=(-DENABLE_THREAD_SANITIZER=ON -DENABLE_SANITIZER=OFF -DENABLE_UBSAN=OFF)
+          elif [ "$SANITIZER" = address ]; then
+            flags+=(-DFORCE_ASSERT=ON -DRELEASE_SANITIZER=ON -DENABLE_SANITIZER=ON -DENABLE_UBSAN=ON)
+          fi
+          cmake -S duckdb -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-O1 -g1 -DNDEBUG" \
+            -DOVERRIDE_GIT_DESCRIBE="$(cat .github/duckdb-version)" \
+            -DENABLE_UNITTEST_CPP_TESTS=OFF -DSKIP_EXTENSIONS=parquet -DUNITTEST_ROOT_DIRECTORY="$PWD" \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config.cmake" "${flags[@]}"
+      - name: Build
+        run: cmake --build build/release --target libduckdb.so shell unittest -j 2
+      - name: SQL regressions and randomized duplicate-preserving comparisons
+        env:
+          SANITIZER: ${{ inputs.sanitizer || 'none' }}
+        run: |
+          runner=()
+          if [ "$SANITIZER" = thread ]; then runner=(setarch "$(uname -m)" -R); fi
+          actual=$("${runner[@]}" ./build/release/duckdb -noheader -csv -c "SELECT version()")
+          test "$actual" = "$(cat .github/duckdb-version)"
+          timeout 600s "${runner[@]}" ./build/release/test/unittest 'test/sql/*'
+          timeout 600s "${runner[@]}" python3 scripts/benchmark_parallel_scans.py --verify-only --verify-mixes 10
+      - name: Native reader overlap, cancellation, and cleanup
+        env:
+          SANITIZER: ${{ inputs.sanitizer || 'none' }}
+        run: |
+          flags=()
+          if [ "$SANITIZER" = thread ]; then flags+=(-fsanitize=thread); fi
+          if [ "$SANITIZER" = address ]; then flags+=(-fsanitize=address,undefined); fi
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -g -pthread "${flags[@]}" \
+            -isystem duckdb/src/include test/unit/parallel_scan_test.cpp \
+            -Lbuild/release/src -Wl,-rpath,"$PWD/build/release/src" -lduckdb -o build/parallel_scan_test
+          runner=()
+          if [ "$SANITIZER" = thread ]; then runner=(setarch "$(uname -m)" -R); fi
+          timeout 120s "${runner[@]}" ./build/parallel_scan_test
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -g -pthread "${flags[@]}" \
+            -Isrc/include -isystem duckdb/src/include test/unit/scan_progress_test.cpp \
+            -Lbuild/release/src -Wl,-rpath,"$PWD/build/release/src" -lduckdb -o build/scan_progress_test
+          timeout 120s "${runner[@]}" ./build/scan_progress_test
+      - name: Selective I/O regression
+        if: ${{ inputs.sanitizer != 'thread' && inputs.sanitizer != 'address' }}
+        run: timeout 120s python3 scripts/benchmark_header_reads.py
+      - name: Remote range accounting and query smoke test
+        if: ${{ inputs.sanitizer != 'thread' && inputs.sanitizer != 'address' }}
+        run: |
+          ./build/release/duckdb -c "INSTALL httpfs; LOAD httpfs;"
+          timeout 60s python3 test/unit/remote_reads_test.py
+          timeout 120s python3 test/unit/remote_cache_test.py
+          timeout 180s python3 scripts/benchmark_remote_reads.py \
+            --size-mib 1 --frame-sizes 1024 60000 --files 1 8 --latency-ms 0 \
+            --trials 1 --output build/remote-reads/ci.json
+      - name: Upload remote request traces
+        if: ${{ always() && inputs.sanitizer != 'thread' && inputs.sanitizer != 'address' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-read-traces
+          path: build/remote-reads/ci.json
+          if-no-files-found: ignore

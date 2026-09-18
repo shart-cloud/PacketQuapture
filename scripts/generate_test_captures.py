@@ -4,7 +4,6 @@
 from pathlib import Path
 import struct
 
-
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "test" / "data"
 
@@ -12,15 +11,24 @@ DATA = ROOT / "test" / "data"
 def block(block_type: int, body: bytes) -> bytes:
     total_length = 12 + len(body)
     assert total_length % 4 == 0
-    return struct.pack("<II", block_type, total_length) + body + struct.pack("<I", total_length)
+    return (
+        struct.pack("<II", block_type, total_length)
+        + body
+        + struct.pack("<I", total_length)
+    )
 
 
 def write_pcap() -> None:
     ethernet = bytes.fromhex("ffffffffffff0011223344550800")
     truncated = bytes.fromhex("01020304")
     content = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
-    content += struct.pack("<IIII", 1_700_000_000, 123_456, len(ethernet), len(ethernet)) + ethernet
-    content += struct.pack("<IIII", 1_700_000_001, 500_000, len(truncated), 10) + truncated
+    content += (
+        struct.pack("<IIII", 1_700_000_000, 123_456, len(ethernet), len(ethernet))
+        + ethernet
+    )
+    content += (
+        struct.pack("<IIII", 1_700_000_001, 500_000, len(truncated), 10) + truncated
+    )
     (DATA / "sample.pcap").write_bytes(content)
 
 
@@ -47,6 +55,11 @@ def main() -> None:
     DATA.mkdir(parents=True, exist_ok=True)
     write_pcap()
     write_pcapng()
+    parallel = DATA / "parallel"
+    parallel.mkdir(exist_ok=True)
+    (parallel / "empty.pcap").write_bytes((DATA / "sample.pcap").read_bytes()[:24])
+    section = block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+    (parallel / "empty.pcapng").write_bytes(section)
     (DATA / "not-a-capture.bin").write_bytes(b"not a capture")
 
 
