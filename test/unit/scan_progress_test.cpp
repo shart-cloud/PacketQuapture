@@ -80,6 +80,15 @@ int main() {
 	Require(stream.Percentage() < 100, "Stream draining must not report completion at input EOF");
 	stream.Finish();
 	Require(stream.Percentage() == 100, "Drained streams must finish");
+	CaptureProgress deferred_parallel;
+	deferred_parallel.Initialize(*connection.context, {OpenFileInfo(small.string()), OpenFileInfo(small.string())},
+	                             true);
+	deferred_parallel.Advance(20);
+	deferred_parallel.CompleteFile();
+	deferred_parallel.CompleteFile();
+	Require(deferred_parallel.Percentage() < 100, "All readers at EOF must still await stream output");
+	deferred_parallel.Finish();
+	Require(deferred_parallel.Percentage() == 100, "Parallel output draining did not finish");
 	CaptureProgress unknown;
 	unknown.Initialize(*connection.context, {OpenFileInfo(pipe.string())});
 	Require(unknown.Percentage() < 0, "Pipe size must remain unknown without opening it");

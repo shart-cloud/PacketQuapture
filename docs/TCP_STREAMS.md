@@ -102,9 +102,9 @@ of each byte, so retransmissions do not move its packet range.
 
 ## Resource policy and validation
 
-The core retains the existing limits: 1,024 tracked directions per file, 32 MiB stored payload globally,
+The core retains the existing limits: 1,024 tracked directions per file, 32 MiB stored payload per file,
 1 MiB stored payload and sequence span per direction, 4,096 segments per direction, and 65,536 segments
-globally. Metadata, reconstruction, and output use additional bounded memory. Quarantined directions emit
+per file. Metadata, reconstruction, and output use additional bounded memory. Quarantined directions emit
 explicit diagnostics rather than silent eviction. Long-lived or high-flow-count captures may hit these limits.
 The DNS framer independently limits messages per direction to 4,096.
 
@@ -125,3 +125,10 @@ c++ -std=c++17 -Wall -Wextra -Werror -g -O1 \
   -o build/tcp_reassembly_test
 ./build/tcp_reassembly_test
 ```
+
+## Whole-file parallel execution
+
+See [parallel stream scans](PARALLEL_STREAMS.md) for deterministic scan-local IDs,
+query-wide memory admission, worker limits, and bounded output batches. The 32 MiB
+stored-payload limit above applies per active input occurrence; aggregate admission
+is separately bounded across all stream readers in a query.

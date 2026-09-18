@@ -4,6 +4,7 @@
 #include <iterator>
 #include <limits>
 #include <tuple>
+#include <stdexcept>
 
 namespace packetquapture {
 
@@ -90,6 +91,9 @@ std::vector<TcpStream> TcpReassembler::Add(const TcpFlowKey &key, uint32_t seque
 				Remove(key.Reverse(), output, "reset");
 			}
 			return output;
+		}
+		if (next_id == std::numeric_limits<uint64_t>::max()) {
+			throw std::overflow_error("TCP stream identifier space exhausted");
 		}
 		if (flows.size() >= limits.max_flows) {
 			Flow overflow;

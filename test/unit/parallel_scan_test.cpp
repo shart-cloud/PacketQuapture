@@ -1,6 +1,7 @@
 // Linux integration test against the built DuckDB library (including this extension).
 // Observe live capture descriptors, interrupt actual queries, and reuse the connection.
 #include "duckdb.hpp"
+#include "stream_scan_budget.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -48,6 +49,7 @@ static std::string Inputs(const fs::path &path, size_t count) {
 }
 
 int main() {
+	std::cout << std::unitbuf;
 	const auto directory = fs::absolute("build/parallel-scan-test-" + std::to_string(getpid()));
 	fs::create_directories(directory);
 	const auto capture = directory / "large.pcap";
@@ -69,12 +71,15 @@ int main() {
 	}
 	duckdb::DuckDB database(nullptr);
 	duckdb::Connection connection(database);
-	for (const auto *function : {"read_pcap", "read_packets", "read_dns"}) {
+	for (const auto *function : {"read_pcap", "read_packets", "read_dns", "read_tcp_streams", "read_dns_messages"}) {
 		for (const size_t threads : {1, 2, 4, 8}) {
 			Execute(connection, "SET threads=" + std::to_string(threads));
 			for (const size_t files : {1, 8}) {
-				const auto sql = "SELECT count(*) FROM " + std::string(function) + "(" + Inputs(capture, files) +
-				                 ") WHERE captured_length = 4294967295";
+				const auto sql =
+				    "SELECT count(*) FROM " + std::string(function) + "(" + Inputs(capture, files) + ") WHERE " +
+				    (std::string(function) == "read_tcp_streams" || std::string(function) == "read_dns_messages"
+				         ? "first_packet_number = 0"
+				         : "captured_length = 4294967295");
 				auto query = std::async(std::launch::async, [&] {
 					auto result = connection.Query(sql);
 					return result->HasError() ? result->GetError() : std::string();
@@ -121,10 +126,86 @@ int main() {
 			const auto small = fs::absolute("test/data/dns/messages.pcap");
 			Execute(connection, "SELECT count(*) FROM " + std::string(function) + "(" + Inputs(small, 8) + ")");
 			Require(Readers(small) == 0, "EOF leaked capture handles");
-			Execute(connection, "SELECT * FROM " + std::string(function) + "(" + Inputs(capture, 8) + ") LIMIT 1");
-			Require(Readers(capture) == 0, "Early LIMIT leaked capture handles");
+			// A 2,500-message direction leaves pending DNS output when LIMIT stops.
+			const auto early =
+			    std::string(function) == "read_tcp_streams" || std::string(function) == "read_dns_messages"
+			        ? fs::absolute("test/data/reassembly/chunks.pcap")
+			        : capture;
+			Execute(connection, "SELECT * FROM " + std::string(function) + "(" + Inputs(early, 8) + ") LIMIT 1");
+			Require(Readers(early) == 0, "Early LIMIT leaked capture handles");
 		}
 	}
+	// Actual descriptor counts verify that the admission budget limits workers,
+	// independently of the DuckDB thread setting. Both readers must release slots.
+	Execute(connection, "SET threads=8");
+	for (const auto *function : {"read_tcp_streams", "read_dns_messages"}) {
+		for (const size_t budget : {128, 256, 512}) {
+			Execute(connection, "SET packetquapture_stream_memory_mb=" + std::to_string(budget));
+			auto query = std::async(std::launch::async, [&] {
+				return connection.Query("SELECT count(*) FROM " + std::string(function) + "(" + Inputs(capture, 8) +
+				                        ") WHERE first_packet_number = 0");
+			});
+			size_t peak = 0;
+			const auto deadline = std::chrono::steady_clock::now() + 10s;
+			while (std::chrono::steady_clock::now() < deadline && peak < budget / 128) {
+				peak = std::max(peak, Readers(capture));
+				if (query.wait_for(0ms) == std::future_status::ready) {
+					break;
+				}
+				std::this_thread::sleep_for(1ms);
+			}
+			for (size_t i = 0; i < 20; ++i) {
+				peak = std::max(peak, Readers(capture));
+				std::this_thread::sleep_for(1ms);
+			}
+			connection.Interrupt();
+			Require(query.wait_for(5s) == std::future_status::ready, "Memory-limited scan did not cancel");
+			auto result = query.get();
+			Require(result->HasError(), "Expected cancellation");
+			Require(peak == budget / 128, "Memory budget did not bound live readers");
+			Require(Readers(capture) == 0, "Memory-limited scan leaked descriptors");
+			auto usage = connection.Query("SELECT memory_usage_bytes FROM duckdb_memory() WHERE tag='EXTENSION'");
+			Require(!usage->HasError() && usage->GetValue(0, 0).GetValue<uint64_t>() == 0,
+			        "Cancellation leaked extension reservations");
+			std::cout << function << " budget=" << budget << " MiB readers=" << peak << " passed\n";
+		}
+	}
+	Execute(connection, "SET packetquapture_stream_memory_mb=128");
+	auto insufficient =
+	    connection.Query("SELECT a.stream_id FROM read_tcp_streams('test/data/tcp_streams/protocols.pcap') a "
+	                     "CROSS JOIN read_dns_messages('test/data/reassembly/streams.pcap') b");
+	// Pipeline dependencies can let the second scan reuse the first slot. If
+	// both initialize together, admission must fail explicitly rather than hang.
+	Require(!insufficient->HasError() || insufficient->GetError().find("cannot reserve") != std::string::npos,
+	        "Unexpected shared-budget failure");
+	{
+		auto budget = duckdb::make_shared_ptr<duckdb::StreamQueryBudget>(*connection.context);
+		auto first = duckdb::make_uniq<duckdb::StreamReservation>(budget);
+		auto second = duckdb::make_uniq<duckdb::StreamReservation>(budget);
+		Require(first->Acquired() && !second->Acquired(), "Shared budget admitted too many reservations");
+		first.reset();
+		auto replacement = duckdb::make_uniq<duckdb::StreamReservation>(budget);
+		Require(replacement->Acquired(), "Released reservation was not reusable");
+	}
+	Execute(connection, "SET packetquapture_stream_memory_mb=256");
+	Execute(connection, "SELECT count(*) FROM read_tcp_streams('test/data/tcp_streams/protocols.pcap') a "
+	                    "CROSS JOIN read_dns_messages('test/data/reassembly/streams.pcap') b");
+	Execute(connection,
+	        "PREPARE streams AS SELECT count(*) FROM read_tcp_streams('test/data/tcp_streams/protocols.pcap')");
+	for (size_t i = 0; i < 3; ++i) {
+		Execute(connection, "EXECUTE streams");
+	}
+	Execute(connection, "SET packetquapture_stream_memory_mb=512");
+	Require(duckdb::StreamScanId(1, 0, 3) == 1 && duckdb::StreamScanId(2, 2, 3) == 6,
+	        "Stream occurrence mapping failed");
+	Require(duckdb::StreamScanId(UINT64_MAX, 0, 1) == UINT64_MAX, "Single-file ID boundary failed");
+	bool overflow = false;
+	try {
+		duckdb::StreamScanId(UINT64_MAX, 1, 2);
+	} catch (const duckdb::InvalidInputException &) {
+		overflow = true;
+	}
+	Require(overflow, "ID overflow was not detected");
 	fs::remove(capture);
 	fs::remove(broken);
 	fs::remove(directory);

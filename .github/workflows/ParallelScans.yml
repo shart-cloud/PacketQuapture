@@ -61,7 +61,7 @@ jobs:
           if [ "$SANITIZER" = thread ]; then flags+=(-fsanitize=thread); fi
           if [ "$SANITIZER" = address ]; then flags+=(-fsanitize=address,undefined); fi
           c++ -std=c++17 -Wall -Wextra -Werror -O1 -g -pthread "${flags[@]}" \
-            -isystem duckdb/src/include test/unit/parallel_scan_test.cpp \
+            -Isrc/include -isystem duckdb/src/include test/unit/parallel_scan_test.cpp \
             -Lbuild/release/src -Wl,-rpath,"$PWD/build/release/src" -lduckdb -o build/parallel_scan_test
           runner=()
           if [ "$SANITIZER" = thread ]; then runner=(setarch "$(uname -m)" -R); fi
@@ -70,6 +70,9 @@ jobs:
             -Isrc/include -isystem duckdb/src/include test/unit/scan_progress_test.cpp \
             -Lbuild/release/src -Wl,-rpath,"$PWD/build/release/src" -lduckdb -o build/scan_progress_test
           timeout 120s "${runner[@]}" ./build/scan_progress_test
+      - name: Stream memory admission and reconstruction under pressure
+        if: ${{ inputs.sanitizer != 'thread' && inputs.sanitizer != 'address' }}
+        run: timeout 300s python3 test/unit/stream_memory_test.py
       - name: Selective I/O regression
         if: ${{ inputs.sanitizer != 'thread' && inputs.sanitizer != 'address' }}
         run: timeout 120s python3 scripts/benchmark_header_reads.py
