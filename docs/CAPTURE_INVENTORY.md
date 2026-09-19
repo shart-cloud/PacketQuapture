@@ -1,9 +1,9 @@
 # Capture inventory and explicit refresh
 
-`capture_inventory` returns file-level metadata for PCAP and PCAPNG sources. This
-implements the inventory milestone of the flows/inventory/export plan. The original inventory milestone did not include reader
-catalog arguments, optimizer pruning, within-file indexes or PCAP export; those were not
-part of this change. Existing reader schemas and filtering behavior remain unchanged.
+`capture_inventory` returns file-level metadata for PCAP and PCAPNG sources and
+supports explicit incremental refresh. For optional reader time filtering, see
+[catalog-assisted selection](CATALOG_PRUNING.md). Existing reader schemas remain
+unchanged; within-file indexes and PCAP export remain later milestones.
 
 ```sql
 SELECT filename, packet_count, min_timestamp, max_timestamp, scan_status

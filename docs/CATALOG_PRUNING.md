@@ -114,3 +114,22 @@ collections, compiler/build/machine details and actual HTTP request/body counts.
 Local OS cache state is uncontrolled: these are not certified cold-disk measurements
 or cloud-service performance claims. PCAP export and within-file seeking remain later
 milestones. Hosted native platform checks remain required for this change.
+
+
+### Recorded local results (September 19, 2026)
+
+Implementation commit: `75fe465`. Release SQL passed 1,899 assertions in 12 cases.
+Catalog integration passed six tests; shared inventory passed nine; path selection
+passed six; existing remote reads and remote cache each passed nine. Formatting and
+selective-I/O regressions passed. ThreadSanitizer passed the catalog suite (139
+assertions), shared inventory suite (92 assertions), and native reader overlap,
+cancellation, LIMIT and cleanup checks. Native progress passed with one and four
+threads, including catalog-selected scans. Hosted checks remain pending publication.
+
+[Benchmark evidence](benchmarks/catalog-pruning-2026-09-19.json) records repeated
+queries over 16, 128 and 512 files. At 512 files with 1,000 packets each and one
+matching file, median repeat times were 0.163 s without a catalog, 0.160 s in strict
+mode and 0.021 s in immutable mode. These are synthetic local observations with
+uncontrolled OS cache state. For the excluded HTTP fixture, strict mode used one
+HEAD and one GET (207 body bytes), while immutable mode used one HEAD and no GET
+or body bytes. Request counts are distinct from capture-data reads.
