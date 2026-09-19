@@ -25,6 +25,9 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
+#include "duckdb/common/hive_partitioning.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -708,8 +711,31 @@ private:
 };
 
 struct PcapBindData : public TableFunctionData {
+	// Original occurrences stay immutable: stream IDs use their indexes and count.
 	vector<OpenFileInfo> files;
+	vector<idx_t> selected_indices;
 	vector<LogicalType> types;
+	idx_t base_column_count = 0;
+	bool hive_partitioning = false;
+	vector<string> partition_keys;
+	vector<vector<Value>> partition_values;
+
+	vector<OpenFileInfo> SelectedFiles() const {
+		vector<OpenFileInfo> result;
+		result.reserve(selected_indices.size());
+		for (auto index : selected_indices) {
+			result.push_back(files[index]);
+		}
+		return result;
+	}
+
+	bool SetPartition(Vector &output, idx_t row, column_t column, idx_t file_index) const {
+		if (column < base_column_count || column >= types.size()) {
+			return false;
+		}
+		output.SetValue(row, partition_values[file_index][column - base_column_count]);
+		return true;
+	}
 	bool dns_scan = false;
 	shared_ptr<StreamPlanCount> stream_plan;
 
@@ -717,6 +743,11 @@ struct PcapBindData : public TableFunctionData {
 		auto result = make_uniq<PcapBindData>();
 		result->files = files;
 		result->types = types;
+		result->selected_indices = selected_indices;
+		result->base_column_count = base_column_count;
+		result->hive_partitioning = hive_partitioning;
+		result->partition_keys = partition_keys;
+		result->partition_values = partition_values;
 		result->dns_scan = dns_scan;
 		result->stream_plan = stream_plan;
 		if (stream_plan) {
@@ -727,12 +758,22 @@ struct PcapBindData : public TableFunctionData {
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<PcapBindData>();
-		if (files.size() != other.files.size() || types != other.types || dns_scan != other.dns_scan) {
+		if (files.size() != other.files.size() || types != other.types || dns_scan != other.dns_scan ||
+		    selected_indices != other.selected_indices || base_column_count != other.base_column_count ||
+		    hive_partitioning != other.hive_partitioning || partition_keys != other.partition_keys ||
+		    partition_values.size() != other.partition_values.size()) {
 			return false;
 		}
 		for (idx_t i = 0; i < files.size(); i++) {
 			if (files[i].path != other.files[i].path) {
 				return false;
+			}
+		}
+		for (idx_t file = 0; file < partition_values.size(); ++file) {
+			for (idx_t key = 0; key < partition_keys.size(); ++key) {
+				if (!Value::NotDistinctFrom(partition_values[file][key], other.partition_values[file][key])) {
+					return false;
+				}
 			}
 		}
 		return true;
@@ -781,6 +822,7 @@ struct PcapGlobalState : public CaptureGlobalState {
 };
 
 struct PcapLocalState : public LocalTableFunctionState {
+	idx_t file_index = 0;
 	ScanOptions options;
 	vector<unique_ptr<PacketFilter>> filters;
 	unique_ptr<CaptureReader> reader;
@@ -887,24 +929,125 @@ static unique_ptr<FunctionData> DnsBind(ClientContext &context, TableFunctionBin
 	return result;
 }
 
+template <table_function_bind_t BIND>
+static unique_ptr<FunctionData> BindCapture(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &types, vector<string> &names) {
+	auto result = BIND(context, input, types, names);
+	auto &bind = result->Cast<PcapBindData>();
+	bind.base_column_count = types.size();
+	for (idx_t i = 0; i < bind.files.size(); ++i) {
+		bind.selected_indices.push_back(i);
+	}
+	MultiFileOptions options;
+	options.auto_detect_hive_partitioning = false;
+	options.hive_types_autocast = false;
+	auto reader = MultiFileReader::Create(input.table_function);
+	bool has_type_options = false;
+	for (auto &entry : input.named_parameters) {
+		if (!reader->ParseOption(entry.first, entry.second, options, context)) {
+			throw BinderException("Unsupported capture option: %s", entry.first);
+		}
+		has_type_options |= !StringUtil::CIEquals(entry.first, "hive_partitioning");
+	}
+	if (has_type_options && !options.hive_partitioning) {
+		throw BinderException("Capture partition type options require hive_partitioning=true");
+	}
+	bind.hive_partitioning = options.hive_partitioning;
+	if (!options.hive_partitioning || bind.files.empty()) {
+		return result;
+	}
+
+	const auto partitions = HivePartitioning::Parse(bind.files[0].path);
+	case_insensitive_set_t used_names;
+	for (auto &name : names) {
+		used_names.insert(name);
+	}
+	for (auto &entry : partitions) {
+		if (!used_names.insert(entry.first).second) {
+			throw BinderException("Capture partition column '%s' collides with an existing column", entry.first);
+		}
+		bind.partition_keys.push_back(entry.first);
+	}
+	for (auto &entry : options.hive_types_schema) {
+		bool found = false;
+		for (auto &key : bind.partition_keys) {
+			found |= StringUtil::CIEquals(entry.first, key);
+		}
+		if (!found) {
+			throw BinderException("Unknown capture partition in hive_types: %s", entry.first);
+		}
+	}
+	// Validate all path metadata, including files that may later be pruned. No opens.
+	for (auto &file : bind.files) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		const auto values = HivePartitioning::Parse(file.path);
+		if (values.size() != partitions.size()) {
+			throw BinderException("Hive partition mismatch between capture files '%s' and '%s'", bind.files[0].path,
+			                      file.path);
+		}
+		for (auto &key : bind.partition_keys) {
+			if (values.find(key) == values.end()) {
+				throw BinderException("Hive partition mismatch in capture '%s': key '%s' not found", file.path, key);
+			}
+		}
+	}
+	if (options.hive_types_autocast) {
+		SimpleMultiFileList files(bind.files);
+		options.AutoDetectHiveTypesInternal(files, context);
+	}
+	for (auto &key : bind.partition_keys) {
+		names.push_back(key);
+		types.push_back(options.GetHiveLogicalType(key));
+	}
+	for (auto &file : bind.files) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		const auto values = HivePartitioning::Parse(file.path);
+		vector<Value> typed_values;
+		for (auto &key : bind.partition_keys) {
+			typed_values.push_back(options.GetHivePartitionValue(values.at(key), key, context));
+		}
+		bind.partition_values.push_back(std::move(typed_values));
+	}
+	bind.types = types;
+	return result;
+}
+
+static bool SupportsPacketFilter(const FunctionData &data, idx_t column) {
+	const auto &bind = data.Cast<PcapBindData>();
+	return column < bind.base_column_count && bind.types[column].id() != LogicalTypeId::LIST;
+}
+
 static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<PcapBindData>();
-	auto result = make_uniq<PcapGlobalState>(bind.files.size());
-	result->progress.Initialize(context, bind.files);
-	result->column_ids = input.column_ids;
+	auto result = make_uniq<PcapGlobalState>(bind.selected_indices.size());
+	result->progress.Initialize(context, bind.SelectedFiles());
+	// DuckDB can keep filter-only columns out of the scan output. Unsupported
+	// partition/list filters are restored above the scan with their own projection.
+	if (input.projection_ids.empty()) {
+		result->column_ids = input.column_ids;
+	} else {
+		for (auto index : input.projection_ids) {
+			result->column_ids.push_back(input.column_ids[index]);
+		}
+	}
 	auto &options = result->options;
 	options.dns_scan = bind.dns_scan;
 	if (bind.dns_scan) {
 		options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
 	}
-	for (const auto column : result->column_ids) {
+	// Filter-only packet columns still determine the required decode depth.
+	for (const auto column : input.column_ids) {
 		if (column == 9) {
 			options.materialize_packet_data = true;
 		}
-		if (column >= 40 && column < bind.types.size()) {
+		if (column >= 40 && column < bind.base_column_count) {
 			options.decode_dns = true;
 		}
-		if (column >= 11 && column < bind.types.size()) {
+		if (column >= 11 && column < bind.base_column_count) {
 			const auto depth = static_cast<packetquapture::DecodeDepth>(MinValue<unsigned>(3, ColumnStage(column)));
 			if (depth > options.decode_depth) {
 				options.decode_depth = depth;
@@ -921,6 +1064,12 @@ static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, Tab
 				continue;
 			}
 			const auto column = input.column_ids[entry.first];
+			// Join filters can arrive after physical planning (including conjunctions
+			// of advisory filters). Never interpret partition/list columns as packet fields.
+			// Their static predicates remain above the scan; joins enforce dynamic ones.
+			if (!SupportsPacketFilter(bind, column)) {
+				continue;
+			}
 			result->filters.push_back({column, filter.Copy()});
 			options.filter_stages[ColumnStage(column)] = true;
 		}
@@ -1224,16 +1373,88 @@ static void NormalizeBooleanFilter(unique_ptr<Expression> &expression) {
 	}
 }
 
-static void NormalizePacketFilters(ClientContext &, LogicalGet &, FunctionData *,
+static void PruneCaptureFiles(ClientContext &context, LogicalGet &get, FunctionData *data,
+                              vector<unique_ptr<Expression>> &filters) {
+	auto &bind = data->Cast<PcapBindData>();
+	HivePartitioningFilterInfo filter_info;
+	filter_info.filename_enabled = true;
+	filter_info.hive_enabled = bind.hive_partitioning;
+	MultiFilePushdownInfo info(get);
+	for (idx_t i = 0; i < info.column_ids.size(); ++i) {
+		const auto column = info.column_ids[i];
+		if (column == 0 || (column >= bind.base_column_count && column < bind.types.size())) {
+			filter_info.column_map.emplace(get.names[column], i);
+		}
+	}
+	vector<idx_t> selected;
+	// Batches bound cancellation latency in DuckDB's scalar file-filter evaluator.
+	for (idx_t start = 0; start < bind.selected_indices.size(); start += 512) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		const auto end = MinValue<idx_t>(start + 512, bind.selected_indices.size());
+		vector<OpenFileInfo> files;
+		for (idx_t i = start; i < end; ++i) {
+			files.push_back(bind.files[bind.selected_indices[i]]);
+		}
+		vector<unique_ptr<Expression>> copies;
+		for (auto &filter : filters) {
+			copies.push_back(filter->Copy());
+		}
+		ExtraOperatorInfo extra;
+		MultiFilePushdownInfo batch_info(get.table_index, get.names, info.column_ids, extra);
+		HivePartitioning::ApplyFiltersToFileList(context, files, copies, filter_info, batch_info);
+		if (!extra.file_filters.empty() && get.extra_info.file_filters.find(extra.file_filters) == string::npos) {
+			if (!get.extra_info.file_filters.empty()) {
+				get.extra_info.file_filters += "; ";
+			}
+			get.extra_info.file_filters += extra.file_filters;
+		}
+		idx_t cursor = start;
+		for (auto &file : files) {
+			while (cursor < end && bind.files[bind.selected_indices[cursor]].path != file.path) {
+				++cursor;
+			}
+			if (cursor == end) {
+				throw InternalException("Capture pruning did not preserve input occurrence order");
+			}
+			selected.push_back(bind.selected_indices[cursor++]);
+		}
+	}
+	bind.selected_indices = std::move(selected);
+	get.extra_info.total_files = bind.files.size();
+	get.extra_info.filtered_files = bind.selected_indices.size();
+	// Keep residual SQL predicates; the helper evaluated copies, not the original filters.
+}
+
+static void NormalizePacketFilters(ClientContext &context, LogicalGet &get, FunctionData *data,
                                    vector<unique_ptr<Expression>> &filters) {
 	for (auto &filter : filters) {
 		NormalizeBooleanFilter(filter);
 	}
+	PruneCaptureFiles(context, get, data, filters);
 }
 
-static bool SupportsPacketFilter(const FunctionData &data, idx_t column) {
-	const auto &types = data.Cast<PcapBindData>().types;
-	return column < types.size() && types[column].id() != LogicalTypeId::LIST;
+static InsertionOrderPreservingMap<string> CaptureToString(TableFunctionToStringInput &input) {
+	const auto &bind = input.bind_data->Cast<PcapBindData>();
+	InsertionOrderPreservingMap<string> result;
+	result["Scanning Files"] = StringUtil::Format("%llu/%llu", bind.selected_indices.size(), bind.files.size());
+	return result;
+}
+
+static unique_ptr<NodeStatistics> CaptureCardinality(ClientContext &, const FunctionData *data) {
+	if (data->Cast<PcapBindData>().selected_indices.empty()) {
+		return make_uniq<NodeStatistics>(0, 0);
+	}
+	return nullptr;
+}
+
+static void AddCaptureOptions(TableFunction &function) {
+	function.named_parameters["hive_partitioning"] = LogicalType::BOOLEAN;
+	function.named_parameters["hive_types"] = LogicalType::ANY;
+	function.named_parameters["hive_types_autocast"] = LogicalType::BOOLEAN;
+	function.to_string = CaptureToString;
+	function.cardinality = CaptureCardinality;
 }
 
 static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
@@ -1250,7 +1471,8 @@ static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChun
 			if (!global.scheduler.Claim(file_index)) {
 				break;
 			}
-			state.reader = make_uniq<CaptureReader>(context, bind_data.files[file_index], state.options,
+			state.file_index = bind_data.selected_indices[file_index];
+			state.reader = make_uniq<CaptureReader>(context, bind_data.files[state.file_index], state.options,
 			                                        &global.progress, file_index);
 		}
 		PacketRecord record;
@@ -1262,7 +1484,10 @@ static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChun
 			continue;
 		}
 		for (idx_t output_column = 0; output_column < global.column_ids.size(); output_column++) {
-			SetRecordValue(output.data[output_column], output_count, global.column_ids[output_column], record);
+			if (!bind_data.SetPartition(output.data[output_column], output_count, global.column_ids[output_column],
+			                            state.file_index)) {
+				SetRecordValue(output.data[output_column], output_count, global.column_ids[output_column], record);
+			}
 		}
 		output_count++;
 	}
@@ -1271,7 +1496,7 @@ static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChun
 
 struct StreamGlobalState : public CaptureGlobalState {
 	StreamGlobalState(ClientContext &context, const PcapBindData &bind)
-	    : scheduler(bind.files.size()), file_count(bind.files.size()) {
+	    : scheduler(bind.selected_indices.size()), file_count(bind.selected_indices.size()) {
 		budget = context.registered_state->GetOrCreate<StreamQueryBudget>("packetquapture_stream_budget", context);
 		if (bind.stream_plan) {
 			bind.stream_plan->sealed.store(true);
@@ -1389,13 +1614,15 @@ static bool NextStreamEvent(ClientContext &context, const PcapBindData &bind, St
 			global.Drained();
 		}
 		if (!state.reader) {
-			if (!global.scheduler.Claim(state.file_index)) {
+			idx_t work_index;
+			if (!global.scheduler.Claim(work_index)) {
 				return false;
 			}
+			state.file_index = bind.selected_indices[work_index];
 			const auto &file = bind.files[state.file_index];
 			state.filename = file.path;
 			state.reassembler = packetquapture::TcpReassembler();
-			state.reader = make_uniq<CaptureReader>(context, file, global.options, &global.progress, state.file_index);
+			state.reader = make_uniq<CaptureReader>(context, file, global.options, &global.progress, work_index);
 		}
 		PacketRecord record;
 		if (!state.reader->Next(record)) {
@@ -1463,7 +1690,7 @@ static unique_ptr<FunctionData> DnsMessagesBind(ClientContext &context, TableFun
 
 static unique_ptr<GlobalTableFunctionState> DnsMessagesInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto state = make_uniq<StreamGlobalState>(context, input.bind_data->Cast<PcapBindData>());
-	state->progress.Initialize(context, input.bind_data->Cast<PcapBindData>().files, true);
+	state->progress.Initialize(context, input.bind_data->Cast<PcapBindData>().SelectedFiles(), true);
 	state->columns = input.column_ids;
 	state->options.reassemble_dns = true;
 	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
@@ -1609,7 +1836,9 @@ static void DnsMessagesScan(ClientContext &context, TableFunctionInput &input, D
 				}
 			}
 			for (idx_t i = 0; i < global.columns.size(); ++i) {
-				SetMessageValue(output.data[i], count, global.columns[i], state.filename, message, dns_record);
+				if (!bind.SetPartition(output.data[i], count, global.columns[i], state.file_index)) {
+					SetMessageValue(output.data[i], count, global.columns[i], state.filename, message, dns_record);
+				}
 			}
 			output_bytes += 1024 + state.filename.size() + message.data.size() * 4;
 			output_bytes += (dns_record.dns.questions.size() + dns_record.dns.answers.size() +
@@ -1728,7 +1957,7 @@ static unique_ptr<FunctionData> TcpStreamsBind(ClientContext &context, TableFunc
 }
 static unique_ptr<GlobalTableFunctionState> TcpStreamsInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto state = make_uniq<StreamGlobalState>(context, input.bind_data->Cast<PcapBindData>());
-	state->progress.Initialize(context, input.bind_data->Cast<PcapBindData>().files, true);
+	state->progress.Initialize(context, input.bind_data->Cast<PcapBindData>().SelectedFiles(), true);
 	state->columns = input.column_ids;
 	state->options.reassemble_tcp = true;
 	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
@@ -1883,7 +2112,9 @@ static void TcpStreamsScan(ClientContext &context, TableFunctionInput &input, Da
 			break;
 		}
 		for (idx_t i = 0; i < global.columns.size(); ++i) {
-			SetStreamValue(output.data[i], count, global.columns[i], state.filename, event.stream);
+			if (!bind.SetPartition(output.data[i], count, global.columns[i], state.file_index)) {
+				SetStreamValue(output.data[i], count, global.columns[i], state.filename, event.stream);
+			}
 		}
 		output_bytes += 1024 + state.filename.size() + event.stream.captured_bytes * 4ULL +
 		                (event.stream.chunks.size() + event.stream.gaps.size()) * 1024ULL;
@@ -1899,12 +2130,15 @@ static void TcpStreamsScan(ClientContext &context, TableFunctionInput &input, Da
 }
 
 static TableFunction ReadPcapFunction() {
-	TableFunction function("read_pcap", {LogicalType::VARCHAR}, PcapScan, PcapBind, PcapInit, PcapInitLocal);
+	TableFunction function("read_pcap", {LogicalType::VARCHAR}, PcapScan, BindCapture<PcapBind>, PcapInit,
+	                       PcapInitLocal);
 	function.projection_pushdown = true;
 	function.table_scan_progress = CaptureScanProgress;
 	function.filter_pushdown = true;
+	function.filter_prune = true;
 	function.supports_pushdown_type = SupportsPacketFilter;
 	function.pushdown_complex_filter = NormalizePacketFilters;
+	AddCaptureOptions(function);
 	return function;
 }
 
@@ -1915,30 +2149,39 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                        "Query-wide stream-worker admission budget in MiB, capped at half memory_limit",
 	                        LogicalType::UBIGINT, Value::UBIGINT(512));
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(ReadPcapFunction()));
-	TableFunction packets("read_packets", {LogicalType::VARCHAR}, PcapScan, PacketsBind, PcapInit, PcapInitLocal);
+	TableFunction packets("read_packets", {LogicalType::VARCHAR}, PcapScan, BindCapture<PacketsBind>, PcapInit,
+	                      PcapInitLocal);
 	packets.projection_pushdown = true;
 	packets.table_scan_progress = CaptureScanProgress;
 	packets.filter_pushdown = true;
+	packets.filter_prune = true;
 	packets.supports_pushdown_type = SupportsPacketFilter;
 	packets.pushdown_complex_filter = NormalizePacketFilters;
+	AddCaptureOptions(packets);
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(packets));
-	TableFunction dns("read_dns", {LogicalType::VARCHAR}, PcapScan, DnsBind, PcapInit, PcapInitLocal);
+	TableFunction dns("read_dns", {LogicalType::VARCHAR}, PcapScan, BindCapture<DnsBind>, PcapInit, PcapInitLocal);
 	dns.projection_pushdown = true;
 	dns.table_scan_progress = CaptureScanProgress;
 	dns.filter_pushdown = true;
+	dns.filter_prune = true;
 	dns.supports_pushdown_type = SupportsPacketFilter;
 	dns.pushdown_complex_filter = NormalizePacketFilters;
+	AddCaptureOptions(dns);
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(dns));
-	TableFunction messages("read_dns_messages", {LogicalType::VARCHAR}, DnsMessagesScan, DnsMessagesBind,
+	TableFunction messages("read_dns_messages", {LogicalType::VARCHAR}, DnsMessagesScan, BindCapture<DnsMessagesBind>,
 	                       DnsMessagesInit, StreamInitLocal);
 	messages.projection_pushdown = true;
 	messages.table_scan_progress = CaptureScanProgress;
+	messages.pushdown_complex_filter = PruneCaptureFiles;
+	AddCaptureOptions(messages);
 	// Segment-level predicates could remove bytes required to reconstruct a matching message.
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(messages));
-	TableFunction streams("read_tcp_streams", {LogicalType::VARCHAR}, TcpStreamsScan, TcpStreamsBind, TcpStreamsInit,
-	                      StreamInitLocal);
+	TableFunction streams("read_tcp_streams", {LogicalType::VARCHAR}, TcpStreamsScan, BindCapture<TcpStreamsBind>,
+	                      TcpStreamsInit, StreamInitLocal);
 	streams.projection_pushdown = true;
 	streams.table_scan_progress = CaptureScanProgress;
+	streams.pushdown_complex_filter = PruneCaptureFiles;
+	AddCaptureOptions(streams);
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(streams));
 }
 

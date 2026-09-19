@@ -19,6 +19,7 @@ jobs:
           python3 scripts/generate_dns_captures.py
           python3 scripts/generate_reassembly_captures.py
           python3 scripts/generate_tcp_stream_captures.py
+          python3 scripts/generate_partition_captures.py
           git diff --exit-code -- test/data
       - name: Build standalone decoder with sanitizers
         run: |
