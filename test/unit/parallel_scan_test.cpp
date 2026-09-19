@@ -2,6 +2,7 @@
 // Observe live capture descriptors, interrupt actual queries, and reuse the connection.
 #include "duckdb.hpp"
 #include "stream_scan_budget.hpp"
+#include "flow_scan_budget.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -71,13 +72,15 @@ int main() {
 	}
 	duckdb::DuckDB database(nullptr);
 	duckdb::Connection connection(database);
-	for (const auto *function : {"read_pcap", "read_packets", "read_dns", "read_tcp_streams", "read_dns_messages"}) {
+	for (const auto *function :
+	     {"read_pcap", "read_packets", "read_dns", "read_tcp_streams", "read_dns_messages", "read_flows"}) {
 		for (const size_t threads : {1, 2, 4, 8}) {
 			Execute(connection, "SET threads=" + std::to_string(threads));
 			for (const size_t files : {1, 8}) {
 				const auto sql =
 				    "SELECT count(*) FROM " + std::string(function) + "(" + Inputs(capture, files) + ") WHERE " +
-				    (std::string(function) == "read_tcp_streams" || std::string(function) == "read_dns_messages"
+				    (std::string(function) == "read_tcp_streams" || std::string(function) == "read_dns_messages" ||
+				             std::string(function) == "read_flows"
 				         ? "first_packet_number = 0"
 				         : "captured_length = 4294967295");
 				auto query = std::async(std::launch::async, [&] {
@@ -127,10 +130,11 @@ int main() {
 			Execute(connection, "SELECT count(*) FROM " + std::string(function) + "(" + Inputs(small, 8) + ")");
 			Require(Readers(small) == 0, "EOF leaked capture handles");
 			// A 2,500-message direction leaves pending DNS output when LIMIT stops.
-			const auto early =
-			    std::string(function) == "read_tcp_streams" || std::string(function) == "read_dns_messages"
-			        ? fs::absolute("test/data/reassembly/chunks.pcap")
-			        : capture;
+			const auto early = std::string(function) == "read_tcp_streams" ||
+			                           std::string(function) == "read_dns_messages" ||
+			                           std::string(function) == "read_flows"
+			                       ? fs::absolute("test/data/reassembly/chunks.pcap")
+			                       : capture;
 			Execute(connection, "SELECT * FROM " + std::string(function) + "(" + Inputs(early, 8) + ") LIMIT 1");
 			Require(Readers(early) == 0, "Early LIMIT leaked capture handles");
 		}
@@ -170,6 +174,43 @@ int main() {
 			std::cout << function << " budget=" << budget << " MiB readers=" << peak << " passed\n";
 		}
 	}
+
+	for (const size_t slots : {1, 2, 4}) {
+		Execute(connection, "SET packetquapture_flow_memory_mb=" + std::to_string(slots * 48));
+		auto query = std::async(std::launch::async, [&] {
+			return connection.Query("SELECT count(*) FROM read_flows(" + Inputs(capture, 8) +
+			                        ") WHERE first_packet_number=0");
+		});
+		size_t peak = 0;
+		auto deadline = std::chrono::steady_clock::now() + 10s;
+		while (std::chrono::steady_clock::now() < deadline && peak < slots) {
+			peak = std::max(peak, Readers(capture));
+			if (query.wait_for(0ms) == std::future_status::ready)
+				break;
+			std::this_thread::sleep_for(1ms);
+		}
+		connection.Interrupt();
+		Require(query.wait_for(5s) == std::future_status::ready, "Flow scan did not cancel");
+		Require(query.get()->HasError() && peak == slots, "Flow admission count mismatch");
+		Require(Readers(capture) == 0, "Flow reservation leaked capture handles");
+		auto usage = connection.Query("SELECT memory_usage_bytes FROM duckdb_memory() WHERE tag='EXTENSION'");
+		Require(!usage->HasError() && usage->GetValue(0, 0).GetValue<uint64_t>() == 0,
+		        "Flow reservation leaked memory");
+	}
+	Execute(connection, "SET packetquapture_flow_memory_mb=96");
+	Execute(connection, "SELECT count(*) FROM read_flows('test/data/flows/tcp.pcap') a CROSS JOIN "
+	                    "read_flows('test/data/flows/udp.pcap') b");
+	Execute(connection, "PREPARE flows AS SELECT count(*) FROM read_flows('test/data/flows/tcp.pcap')");
+	for (size_t i = 0; i < 3; ++i)
+		Execute(connection, "EXECUTE flows");
+	Require(duckdb::FlowScanId(7, 1, 3) == 20, "Flow ID mapping failed");
+	bool flow_overflow = false;
+	try {
+		duckdb::FlowScanId(UINT64_MAX, 1, 2);
+	} catch (const duckdb::InvalidInputException &) {
+		flow_overflow = true;
+	}
+	Require(flow_overflow, "Flow ID overflow was not detected");
 	Execute(connection, "SET packetquapture_stream_memory_mb=128");
 	auto insufficient =
 	    connection.Query("SELECT a.stream_id FROM read_tcp_streams('test/data/tcp_streams/protocols.pcap') a "

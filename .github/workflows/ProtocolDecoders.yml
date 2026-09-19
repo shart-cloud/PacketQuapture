@@ -20,6 +20,7 @@ jobs:
           python3 scripts/generate_reassembly_captures.py
           python3 scripts/generate_tcp_stream_captures.py
           python3 scripts/generate_partition_captures.py
+          python3 scripts/generate_flow_captures.py
           git diff --exit-code -- test/data
       - name: Build standalone decoder with sanitizers
         run: |
@@ -52,3 +53,18 @@ jobs:
             -Isrc/include src/tcp_reassembly.cpp src/dns_tcp_framer.cpp test/unit/dns_tcp_framer_test.cpp \
             -o build/dns_tcp_framer_test
           ./build/dns_tcp_framer_test
+
+      - name: Build and test payload-free session aggregation
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -g -O1 \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Isrc/include src/flow_aggregator.cpp test/unit/flow_aggregator_test.cpp \
+            -o build/flow_aggregator_test
+          ./build/flow_aggregator_test
+
+      - name: Fuzz session lifecycle and conservation
+        run: |
+          clang++ -std=c++17 -O1 -g -fsanitize=fuzzer,address,undefined \
+            -Isrc/include src/flow_aggregator.cpp test/unit/flow_aggregator_fuzz.cpp \
+            -o build/flow_aggregator_fuzz
+          ./build/flow_aggregator_fuzz -runs=20000 -max_len=4096

@@ -28,6 +28,7 @@ READERS = [
     "read_dns",
     "read_tcp_streams",
     "read_dns_messages",
+    "read_flows",
 ]
 FIXTURE = ROOT / "test/data/reassembly/streams.pcap"
 
@@ -150,6 +151,7 @@ class FilePruningTests(unittest.TestCase):
                             self.assertEqual(c.query(sql), expected)
                             self.assertTrue(all(e["path"] == a for e in server.finish()))
                             c.query("SET packetquapture_stream_memory_mb=0")
+                            c.query("SET packetquapture_flow_memory_mb=0")
                             empty = "host='missing'" if partitioned else "filename='missing'"
                             server.begin()
                             self.assertEqual(
@@ -222,7 +224,7 @@ class FilePruningTests(unittest.TestCase):
             with self.subTest(reader=reader), Connection(LIBRARY) as c:
                 for key in [
                     "filename",
-                    "TiMeStAmP" if reader in READERS[:3] else "STREAM_ID",
+                    "TiMeStAmP" if reader in READERS[:3] else ("FLOW_ID" if reader == "read_flows" else "STREAM_ID"),
                 ]:
                     path = self.capture("collision/" + key + "=x")
                     with self.assertRaisesRegex(RuntimeError, "collides"):

@@ -32,6 +32,10 @@ with p.open("wb") as f:
         f.write(packet)
 for name, columns in [
     ("metadata", "count(*)"),
+    (
+        "flows",
+        "sum(orig_packets+resp_packets),sum(orig_payload_bytes+resp_payload_bytes)",
+    ),
     ("ethernet", "count(src_mac)"),
     ("ip", "count(src_ip)"),
     ("tcp", "sum(tcp_flags), sum(payload_length)"),
@@ -42,7 +46,8 @@ for name, columns in [
     ("accept_tcp", "sum(octet_length(packet_data))"),
 ]:
     log = r / f"build/header_reads_{name}.log"
-    sql = f"select {columns} from read_packets('{p}')"
+    reader = "read_flows" if name == "flows" else "read_packets"
+    sql = f"select {columns} from {reader}('{p}')"
     predicates = {
         "reject_metadata": "captured_length < 100",
         "reject_ip": "ip_version = 6",
@@ -86,6 +91,7 @@ for name, columns in [
     print(name, count, "bytes read;", result.stdout.strip())
     expected = {
         "metadata": 16024,
+        "flows": 70024,
         "ethernet": 30024,
         "ip": 50024,
         "tcp": 70024,

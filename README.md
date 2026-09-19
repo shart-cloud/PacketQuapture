@@ -156,3 +156,8 @@ The implementation roadmap, architectural boundaries, acceptance criteria, and l
 [`docs/HANDOFF.md`](docs/HANDOFF.md).
 
 PacketQuapture is licensed under the MIT License.
+
+## Session summaries
+
+Use `read_flows` for payload-free, bidirectional TCP/UDP session counts and timing.
+See [session semantics, schema, and resource limits](docs/FLOWS.md).
