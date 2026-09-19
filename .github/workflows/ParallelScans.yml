@@ -84,6 +84,9 @@ jobs:
           timeout 180s python3 test/unit/capture_inventory_test.py
           timeout 180s python3 test/unit/catalog_pruning_test.py
           timeout 120s python3 test/unit/pcap_writer_roundtrip_test.py
+          sudo apt-get update
+          sudo apt-get install -y tcpdump
+          timeout 180s python3 test/unit/pcap_copy_test.py
           timeout 60s python3 test/unit/remote_reads_test.py
           timeout 120s python3 test/unit/remote_cache_test.py
           timeout 180s python3 scripts/benchmark_remote_reads.py \

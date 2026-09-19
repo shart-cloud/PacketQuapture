@@ -1,22 +1,20 @@
-# Flow implementation handoff
+# Flows, inventory and export status
 
-September 19, 2026. Branch: `flows-inventory-export`, based on merged PR #3 at
-`19e46bd237004ce3bd78b479f37b7aa51b7fa383`.
+September 19, 2026.
 
-Phase 1 (`read_flows`) is merged with hosted native checks passing. See [API and validation](FLOWS.md).
-[Capture inventory and explicit refresh](CAPTURE_INVENTORY.md) is merged as PR #5.
-[Catalog-assisted query pruning](CATALOG_PRUNING.md) follows on branch `catalog-pruning`; PCAP export remains a later milestone.
+| Milestone | Status |
+| --- | --- |
+| Session summaries | [PR #4](https://github.com/shart-cloud/PacketQuapture/pull/4) merged; [read_flows API and validation](FLOWS.md) |
+| Inventory and explicit refresh | [PR #5](https://github.com/shart-cloud/PacketQuapture/pull/5) merged; [API and identity contract](CAPTURE_INVENTORY.md) |
+| Catalog-assisted timestamp selection | [PR #6](https://github.com/shart-cloud/PacketQuapture/pull/6) merged; [scope and fallback](CATALOG_PRUNING.md) |
+| Standalone PCAP writer | [PR #7](https://github.com/shart-cloud/PacketQuapture/pull/7) merged with native checks passing; [writer contract](PCAP_WRITER.md) |
+| SQL PCAP export | Implemented locally on `pcap-copy`; [types, ordering, publication and validation](PCAP_EXPORT.md); publication and hosted checks pending |
 
-The first implementation commit is `2d8d45d94394d992a9ec734a82440b3bc27194a3`.
-A follow-up evidence commit records the benchmark and final validation results.
-The user's pre-existing `docs/CURRENT_HANDOFF.md` changes and untracked
-`docs/FLOWS_INVENTORY_EXPORT_PLAN.md` are preserved and excluded from these commits.
+Core planned functionality is implemented. Conservative limitations remain explicit:
+strict catalog mode scans weak identities, S3 pruning awaits provider verification,
+no catalog counts become optimizer bounds, and exported timestamps have microsecond
+precision. Within-file indexes, nanosecond reader/export APIs, cross-file stateful
+aggregation and WASM remain follow-ups rather than part of these releases.
 
-The user authorized publication, and the branch is now published as
-[PR #4](https://github.com/shart-cloud/PacketQuapture/pull/4).
-Hosted Linux, macOS, Windows, sanitizer and quality checks passed. The user merged
-PR #4 as `d5dd94a44cbcd8e900dc0fa26fe8438bf6f0317f`. Capture inventory work continues on branch `capture-inventory`.
-
-Local validation logs are `/tmp/packetquapture-flows-*.log`; compact benchmark evidence
-is tracked in `docs/benchmarks/flows-2026-09-19.json`. No temporary benchmark capture
-is retained. Existing repository benchmark fixtures in build remain untouched.
+The user's pre-existing `docs/CURRENT_HANDOFF.md` and untracked
+`docs/FLOWS_INVENTORY_EXPORT_PLAN.md` edits are preserved and excluded from commits.

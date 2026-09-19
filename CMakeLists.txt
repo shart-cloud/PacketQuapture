@@ -12,7 +12,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/packetquapture_extension.cpp src/pcap_writer.cpp src/flow_aggregator.cpp src/packet_decoder.cpp src/dns_decoder.cpp src/tcp_reassembly.cpp src/dns_tcp_framer.cpp)
+set(EXTENSION_SOURCES src/packetquapture_extension.cpp src/pcap_writer.cpp src/pcap_copy.cpp src/flow_aggregator.cpp src/packet_decoder.cpp src/dns_decoder.cpp src/tcp_reassembly.cpp src/dns_tcp_framer.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
