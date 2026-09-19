@@ -1,0 +1,115 @@
+# name: test/sql/read_flows.test
+# description: Session lifecycle, accounting, duplicate IDs, null time and capacity
+# group: [sql]
+
+require packetquapture
+
+query IIIIITT
+SELECT first_packet_number,last_packet_number,orig_packets,resp_packets,orig_payload_bytes,handshake_complete,finalized_by FROM read_flows('test/data/flows/tcp.pcap') ORDER BY flow_id;
+----
+1	6	4	2	0	true	tuple_reuse
+7	8	1	1	0	false	reset
+9	9	1	0	0	false	eof
+
+query IIIIT
+SELECT first_packet_number,last_packet_number,orig_packets,late_packets,finalized_by FROM read_flows('test/data/flows/udp.pcap',udp_idle_timeout=INTERVAL '10 microseconds') ORDER BY flow_id;
+----
+1	2	2	0	idle_timeout
+3	4	2	1	idle_timeout
+6	6	1	1	eof
+
+query I
+SELECT count(*) FROM read_flows('test/data/flows/udp.pcap',udp_idle_timeout=INTERVAL '0 seconds');
+----
+1
+
+query IIIITT
+SELECT section_number,interface_id,orig_packets,missing_timestamp_packets,duration IS NULL,finalized_by FROM read_flows('test/data/flows/scopes.pcapng',udp_idle_timeout=INTERVAL '10 microseconds') ORDER BY flow_id;
+----
+1	0	3	1	true	section_boundary
+1	1	1	0	false	section_boundary
+2	0	1	0	false	section_boundary
+
+query III
+SELECT input_index,flow_id,first_packet_number FROM read_flows(['test/data/flows/tcp.pcap','test/data/flows/tcp.pcap']) ORDER BY flow_id;
+----
+1	1	1
+2	2	1
+1	13	7
+2	14	7
+1	17	9
+2	18	9
+
+statement error
+SELECT * FROM read_flows('test/data/flows/tcp.pcap',tcp_idle_timeout=INTERVAL '-1 second');
+----
+nonnegative fixed interval
+
+statement error
+SELECT * FROM read_flows('test/data/flows/tcp.pcap',tcp_idle_timeout=INTERVAL '1 month');
+----
+nonnegative fixed interval
+
+statement error
+SELECT * FROM read_flows('test/data/flows/tcp.pcap',udp_idle_timeout=NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM read_flows('test/data/flows/tcp.pcap',max_active_flows=0);
+----
+between 1 and 16384
+
+statement error
+SELECT * FROM read_flows('test/data/flows/scopes.pcapng',max_active_flows=1);
+----
+capacity exceeded
+
+statement ok
+SET packetquapture_flow_memory_mb=47;
+
+statement error
+SELECT * FROM read_flows('test/data/flows/tcp.pcap');
+----
+cannot reserve 48 MiB
+
+statement ok
+SET packetquapture_flow_memory_mb=192;
+
+query I
+SELECT count(*) FROM read_flows('test/data/flows/tcp.pcap');
+----
+3
+
+# Conservation includes control-only packets and both directions, no reconstruction.
+query TTTT
+WITH packets AS (SELECT count(*) n,sum(captured_length) c,sum(original_length) o,sum(payload_length) p FROM read_packets('test/data/protocols/ethernet.pcap') WHERE src_port IS NOT NULL AND NOT ip_more_fragments AND ip_fragment_offset=0), flows AS (SELECT sum(orig_packets+resp_packets) n,sum(orig_captured_bytes+resp_captured_bytes) c,sum(orig_reported_bytes+resp_reported_bytes) o,sum(orig_payload_bytes+resp_payload_bytes) p FROM read_flows('test/data/protocols/ethernet.pcap')) SELECT packets.n=flows.n,packets.c=flows.c,packets.o=flows.o,packets.p=flows.p FROM packets,flows;
+----
+true	true	true	true
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE expected_flows AS SELECT * FROM read_flows(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/flows/scopes.pcapng','test/data/flows/tcp.pcap']);
+
+foreach workers 1 2 4 8
+
+statement ok
+SET threads=${workers};
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_flows(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/flows/scopes.pcapng','test/data/flows/tcp.pcap']) EXCEPT ALL SELECT * FROM expected_flows) UNION ALL (SELECT * FROM expected_flows EXCEPT ALL SELECT * FROM read_flows(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/flows/scopes.pcapng','test/data/flows/tcp.pcap'])));
+----
+0
+
+# Filtering timestamps must happen after complete aggregation.
+query I
+SELECT count(*) FROM ((SELECT * FROM read_flows(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/flows/scopes.pcapng','test/data/flows/tcp.pcap']) WHERE first_timestamp > TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM expected_flows WHERE first_timestamp > TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM expected_flows WHERE first_timestamp > TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_flows(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/flows/scopes.pcapng','test/data/flows/tcp.pcap']) WHERE first_timestamp > TIMESTAMP '1970-01-01'));
+----
+0
+
+endloop
+
+statement ok
+DROP TABLE expected_flows;

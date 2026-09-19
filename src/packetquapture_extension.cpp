@@ -3,6 +3,9 @@
 #include "packetquapture_extension.hpp"
 #include "capture_progress.hpp"
 #include "stream_scan_budget.hpp"
+#include "flow_scan_budget.hpp"
+#include "flow_aggregator.hpp"
+#include "duckdb/common/types/interval.hpp"
 #include "packet_decoder.hpp"
 #include "dns_decoder.hpp"
 #include "tcp_reassembly.hpp"
@@ -123,6 +126,7 @@ static unsigned ColumnStage(column_t column) {
 
 struct ScanOptions {
 	bool materialize_packet_data = false;
+	bool flow_scan = false;
 	bool dns_scan = false, decode_dns = false;
 	bool reassemble_dns = false, reassemble_tcp = false;
 	packetquapture::DecodeDepth decode_depth = packetquapture::DecodeDepth::NONE;
@@ -207,6 +211,10 @@ public:
 			error.Throw(StringUtil::Format("Capture '%s', packet cursor %llu, byte cursor %llu: ", file.path,
 			                               packet_number, position));
 		}
+	}
+
+	uint32_t SectionNumber() const {
+		return format == CaptureFormat::PCAP ? 1 : section_number;
 	}
 
 private:
@@ -405,7 +413,7 @@ private:
 			offset += padded_length;
 		}
 		// Bound stream-worker metadata independently of capture size.
-		if ((options.reassemble_tcp || options.reassemble_dns) && interfaces.size() >= 65536) {
+		if ((options.reassemble_tcp || options.reassemble_dns || options.flow_scan) && interfaces.size() >= 65536) {
 			throw InvalidInputException("Stream scan exceeds 65536 PCAPNG interfaces per section in '%s'", file.path);
 		}
 		interfaces.push_back(interface);
@@ -738,6 +746,9 @@ struct PcapBindData : public TableFunctionData {
 	}
 	bool dns_scan = false;
 	shared_ptr<StreamPlanCount> stream_plan;
+	shared_ptr<FlowPlanCount> flow_plan;
+	packetquapture::FlowLimits flow_limits;
+	bool flow_scan = false;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<PcapBindData>();
@@ -750,6 +761,12 @@ struct PcapBindData : public TableFunctionData {
 		result->partition_values = partition_values;
 		result->dns_scan = dns_scan;
 		result->stream_plan = stream_plan;
+		result->flow_plan = flow_plan;
+		result->flow_limits = flow_limits;
+		result->flow_scan = flow_scan;
+		if (flow_plan) {
+			flow_plan->scans.fetch_add(1);
+		}
 		if (stream_plan) {
 			stream_plan->scans.fetch_add(1);
 		}
@@ -758,10 +775,12 @@ struct PcapBindData : public TableFunctionData {
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<PcapBindData>();
-		if (files.size() != other.files.size() || types != other.types || dns_scan != other.dns_scan ||
-		    selected_indices != other.selected_indices || base_column_count != other.base_column_count ||
-		    hive_partitioning != other.hive_partitioning || partition_keys != other.partition_keys ||
-		    partition_values.size() != other.partition_values.size()) {
+		if (flow_scan != other.flow_scan || flow_limits.tcp_idle_us != other.flow_limits.tcp_idle_us ||
+		    flow_limits.udp_idle_us != other.flow_limits.udp_idle_us ||
+		    flow_limits.max_flows != other.flow_limits.max_flows || files.size() != other.files.size() ||
+		    types != other.types || dns_scan != other.dns_scan || selected_indices != other.selected_indices ||
+		    base_column_count != other.base_column_count || hive_partitioning != other.hive_partitioning ||
+		    partition_keys != other.partition_keys || partition_values.size() != other.partition_values.size()) {
 			return false;
 		}
 		for (idx_t i = 0; i < files.size(); i++) {
@@ -944,6 +963,11 @@ static unique_ptr<FunctionData> BindCapture(ClientContext &context, TableFunctio
 	auto reader = MultiFileReader::Create(input.table_function);
 	bool has_type_options = false;
 	for (auto &entry : input.named_parameters) {
+		if (bind.flow_scan && (StringUtil::CIEquals(entry.first, "tcp_idle_timeout") ||
+		                       StringUtil::CIEquals(entry.first, "udp_idle_timeout") ||
+		                       StringUtil::CIEquals(entry.first, "max_active_flows"))) {
+			continue;
+		}
 		if (!reader->ParseOption(entry.first, entry.second, options, context)) {
 			throw BinderException("Unsupported capture option: %s", entry.first);
 		}
@@ -2129,6 +2153,379 @@ static void TcpStreamsScan(ClientContext &context, TableFunctionInput &input, Da
 	}
 }
 
+struct FlowGlobalState : public CaptureGlobalState {
+	FlowGlobalState(ClientContext &context, const PcapBindData &bind)
+	    : scheduler(bind.selected_indices.size()), file_count(bind.selected_indices.size()) {
+		budget = context.registered_state->GetOrCreate<FlowQueryBudget>("packetquapture_flow_budget", context);
+		if (bind.flow_plan) {
+			bind.flow_plan->sealed.store(true);
+			max_workers = MaxValue<idx_t>(1, budget->Slots() / bind.flow_plan->scans.load());
+		}
+		max_workers = MinValue<idx_t>(max_workers, MaxValue<idx_t>(1, file_count));
+		if (file_count) {
+			initial = make_uniq<FlowReservation>(budget);
+			if (!initial->Acquired()) {
+				throw OutOfMemoryException("PacketQuapture cannot reserve 48 MiB for a flow worker. "
+				                           "Increase packetquapture_flow_memory_mb or memory_limit; "
+				                           "all flow scans in this query share the budget.");
+			}
+		}
+	}
+	idx_t MaxThreads() const override {
+		return max_workers;
+	}
+	unique_ptr<FlowReservation> Admit() {
+		lock_guard<mutex> guard(lock);
+		if (admitted >= max_workers) {
+			return nullptr;
+		}
+		++admitted;
+		if (initial) {
+			return std::move(initial);
+		}
+		auto result = make_uniq<FlowReservation>(budget);
+		return result->Acquired() ? std::move(result) : nullptr;
+	}
+	void Drained() {
+		if (drained.fetch_add(1, std::memory_order_relaxed) + 1 == file_count) {
+			progress.Finish();
+		}
+	}
+	FileScheduler scheduler;
+	const idx_t file_count;
+	shared_ptr<FlowQueryBudget> budget;
+	unique_ptr<FlowReservation> initial;
+	mutex lock;
+	std::atomic<idx_t> drained {0};
+	idx_t max_workers = 1, admitted = 0;
+	vector<column_t> columns;
+	ScanOptions options;
+	bool decode_dns = false;
+};
+
+struct FlowScanState : public LocalTableFunctionState {
+	unique_ptr<FlowReservation> reservation;
+	idx_t file_index = 0;
+	bool initialized = false, finished = false;
+	unique_ptr<CaptureReader> reader;
+	unique_ptr<packetquapture::FlowAggregator> aggregator;
+};
+static unique_ptr<LocalTableFunctionState> FlowsInitLocal(ExecutionContext &, TableFunctionInitInput &,
+                                                          GlobalTableFunctionState *) {
+	return make_uniq<FlowScanState>();
+}
+static unique_ptr<FunctionData> FlowsBind(ClientContext &context, TableFunctionBindInput &input,
+                                          vector<LogicalType> &types, vector<string> &names) {
+	auto result = PcapBind(context, input, types, names);
+	auto &bind = result->Cast<PcapBindData>();
+	bind.flow_scan = true;
+	for (auto &entry : input.named_parameters) {
+		if (StringUtil::CIEquals(entry.first, "max_active_flows")) {
+			if (entry.second.IsNull()) {
+				throw BinderException("max_active_flows must not be NULL");
+			}
+			auto value = entry.second.GetValue<uint64_t>();
+			if (!value || value > 16384) {
+				throw BinderException("max_active_flows must be between 1 and 16384");
+			}
+			bind.flow_limits.max_flows = value;
+		} else if (StringUtil::CIEquals(entry.first, "tcp_idle_timeout") ||
+		           StringUtil::CIEquals(entry.first, "udp_idle_timeout")) {
+			if (entry.second.IsNull()) {
+				throw BinderException("Flow idle timeout must not be NULL");
+			}
+			const auto interval = entry.second.GetValue<interval_t>();
+			int64_t micros;
+			if (interval.months || !Interval::TryGetMicro(interval, micros) || micros < 0) {
+				throw BinderException("Flow idle timeout must be a nonnegative fixed interval without months");
+			}
+			if (StringUtil::CIEquals(entry.first, "tcp_idle_timeout")) {
+				bind.flow_limits.tcp_idle_us = micros;
+			} else {
+				bind.flow_limits.udp_idle_us = micros;
+			}
+		}
+	}
+	names = {"filename",
+	         "input_index",
+	         "flow_id",
+	         "section_number",
+	         "interface_id",
+	         "vlan_ids",
+	         "first_packet_number",
+	         "last_packet_number",
+	         "transport",
+	         "ip_version",
+	         "orig_ip",
+	         "orig_port",
+	         "resp_ip",
+	         "resp_port",
+	         "originator_basis",
+	         "orig_packets",
+	         "resp_packets",
+	         "orig_captured_bytes",
+	         "resp_captured_bytes",
+	         "orig_reported_bytes",
+	         "resp_reported_bytes",
+	         "orig_payload_bytes",
+	         "resp_payload_bytes",
+	         "first_timestamp",
+	         "last_timestamp",
+	         "duration",
+	         "missing_timestamp_packets",
+	         "late_packets",
+	         "orig_tcp_flags",
+	         "resp_tcp_flags",
+	         "handshake_complete",
+	         "syn_seen",
+	         "fin_seen",
+	         "reset_seen",
+	         "simultaneous_open",
+	         "equal_endpoints",
+	         "partial_session",
+	         "ambiguous",
+	         "finalized_by"};
+	types = {LogicalType::VARCHAR,   LogicalType::UBIGINT,   LogicalType::UBIGINT,
+	         LogicalType::UINTEGER,  LogicalType::UINTEGER,  LogicalType::LIST(LogicalType::USMALLINT),
+	         LogicalType::UBIGINT,   LogicalType::UBIGINT,   LogicalType::VARCHAR,
+	         LogicalType::UTINYINT,  LogicalType::VARCHAR,   LogicalType::USMALLINT,
+	         LogicalType::VARCHAR,   LogicalType::USMALLINT, LogicalType::VARCHAR,
+	         LogicalType::UBIGINT,   LogicalType::UBIGINT,   LogicalType::UBIGINT,
+	         LogicalType::UBIGINT,   LogicalType::UBIGINT,   LogicalType::UBIGINT,
+	         LogicalType::UBIGINT,   LogicalType::UBIGINT,   LogicalType::TIMESTAMP,
+	         LogicalType::TIMESTAMP, LogicalType::INTERVAL,  LogicalType::UBIGINT,
+	         LogicalType::UBIGINT,   LogicalType::USMALLINT, LogicalType::USMALLINT,
+	         LogicalType::BOOLEAN,   LogicalType::BOOLEAN,   LogicalType::BOOLEAN,
+	         LogicalType::BOOLEAN,   LogicalType::BOOLEAN,   LogicalType::BOOLEAN,
+	         LogicalType::BOOLEAN,   LogicalType::BOOLEAN,   LogicalType::VARCHAR};
+	bind.types = types;
+	bind.flow_plan = context.registered_state->GetOrCreate<FlowPlanRegistry>("packetquapture_flow_plans")->Register();
+	return result;
+}
+static unique_ptr<GlobalTableFunctionState> FlowsInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto state = make_uniq<FlowGlobalState>(context, input.bind_data->Cast<PcapBindData>());
+	state->progress.Initialize(context, input.bind_data->Cast<PcapBindData>().SelectedFiles(), true);
+	state->columns = input.column_ids;
+	state->options.flow_scan = true;
+	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
+	return std::move(state);
+}
+static void SetFlowValue(Vector &v, idx_t row, column_t col, const PcapBindData &bind, idx_t file,
+                         const packetquapture::FlowSummary &flow) {
+	const auto &orig = flow.orig_is_low ? flow.key.low : flow.key.high;
+	const auto &resp = flow.orig_is_low ? flow.key.high : flow.key.low;
+	const bool tcp = flow.key.protocol == 6;
+	if ((!tcp && col >= 28 && col <= 34) || ((col == 23 || col == 24) && !flow.has_timestamp) ||
+	    (col == 25 && (!flow.has_timestamp || flow.missing_timestamps))) {
+		FlatVector::SetNull(v, row, true);
+		return;
+	}
+	switch (col) {
+	case 0:
+		v.SetValue(row, bind.files[file].path);
+		break;
+	case 1:
+		v.SetValue(row, Value::UBIGINT(file + 1));
+		break;
+	case 2:
+		v.SetValue(row, Value::UBIGINT(FlowScanId(flow.first_packet, file, bind.files.size())));
+		break;
+	case 3:
+		v.SetValue(row, Value::UINTEGER(flow.section));
+		break;
+	case 4:
+		v.SetValue(row, Value::UINTEGER(flow.key.interface_id));
+		break;
+	case 5: {
+		vector<Value> tags;
+		for (idx_t i = 0; i < flow.key.vlan_count; ++i)
+			tags.push_back(Value::USMALLINT(flow.key.vlans[i]));
+		v.SetValue(row, Value::LIST(LogicalType::USMALLINT, tags));
+		break;
+	}
+	case 6:
+		v.SetValue(row, Value::UBIGINT(flow.first_packet));
+		break;
+	case 7:
+		v.SetValue(row, Value::UBIGINT(flow.last_packet));
+		break;
+	case 8:
+		v.SetValue(row, tcp ? "tcp" : "udp");
+		break;
+	case 9:
+		v.SetValue(row, Value::UTINYINT(flow.key.ip_version));
+		break;
+	case 10:
+		v.SetValue(row, IpString(orig.ip, flow.key.ip_version));
+		break;
+	case 11:
+		v.SetValue(row, Value::USMALLINT(orig.port));
+		break;
+	case 12:
+		v.SetValue(row, IpString(resp.ip, flow.key.ip_version));
+		break;
+	case 13:
+		v.SetValue(row, Value::USMALLINT(resp.port));
+		break;
+	case 14:
+		v.SetValue(row, flow.originator_basis);
+		break;
+	case 15:
+		v.SetValue(row, Value::UBIGINT(flow.orig.packets));
+		break;
+	case 16:
+		v.SetValue(row, Value::UBIGINT(flow.resp.packets));
+		break;
+	case 17:
+		v.SetValue(row, Value::UBIGINT(flow.orig.captured_bytes));
+		break;
+	case 18:
+		v.SetValue(row, Value::UBIGINT(flow.resp.captured_bytes));
+		break;
+	case 19:
+		v.SetValue(row, Value::UBIGINT(flow.orig.reported_bytes));
+		break;
+	case 20:
+		v.SetValue(row, Value::UBIGINT(flow.resp.reported_bytes));
+		break;
+	case 21:
+		v.SetValue(row, Value::UBIGINT(flow.orig.payload_bytes));
+		break;
+	case 22:
+		v.SetValue(row, Value::UBIGINT(flow.resp.payload_bytes));
+		break;
+	case 23:
+		v.SetValue(row, Value::TIMESTAMP(timestamp_t(flow.first_timestamp)));
+		break;
+	case 24:
+		v.SetValue(row, Value::TIMESTAMP(timestamp_t(flow.last_timestamp)));
+		break;
+	case 25: {
+		if (flow.first_timestamp < 0 &&
+		    flow.last_timestamp > NumericLimits<int64_t>::Maximum() + flow.first_timestamp) {
+			throw OutOfRangeException("Flow duration exceeds INTERVAL microsecond capacity");
+		}
+		interval_t duration {0, 0, flow.last_timestamp - flow.first_timestamp};
+		v.SetValue(row, Value::INTERVAL(duration));
+		break;
+	}
+	case 26:
+		v.SetValue(row, Value::UBIGINT(flow.missing_timestamps));
+		break;
+	case 27:
+		v.SetValue(row, Value::UBIGINT(flow.late_packets));
+		break;
+	case 28:
+		v.SetValue(row, Value::USMALLINT(flow.orig.flags));
+		break;
+	case 29:
+		v.SetValue(row, Value::USMALLINT(flow.resp.flags));
+		break;
+	case 30:
+		v.SetValue(row, Value(flow.handshake_complete));
+		break;
+	case 31:
+		v.SetValue(row, Value(flow.syn_seen));
+		break;
+	case 32:
+		v.SetValue(row, Value(flow.fin_seen));
+		break;
+	case 33:
+		v.SetValue(row, Value(flow.reset_seen));
+		break;
+	case 34:
+		v.SetValue(row, Value(flow.simultaneous_open));
+		break;
+	case 35:
+		v.SetValue(row, Value(flow.equal_endpoints));
+		break;
+	case 36:
+		v.SetValue(row, Value(!tcp || !flow.handshake_complete ||
+		                      (!flow.reset_seen && !((flow.orig.flags & 1) && (flow.resp.flags & 1)))));
+		break;
+	case 37:
+		v.SetValue(row, Value(flow.equal_endpoints || flow.simultaneous_open || flow.late_packets ||
+		                      flow.missing_timestamps || flow.originator_basis == "first_packet"));
+		break;
+	case 38:
+		v.SetValue(row, flow.finalized_by);
+		break;
+	default:
+		throw InternalException("Unexpected read_flows column id %d", col);
+	}
+}
+static void FlowsScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &bind = input.bind_data->Cast<PcapBindData>();
+	auto &global = input.global_state->Cast<FlowGlobalState>();
+	auto &state = input.local_state->Cast<FlowScanState>();
+	if (!state.initialized) {
+		state.initialized = true;
+		if (global.file_count)
+			state.reservation = global.Admit();
+	}
+	if (!state.reservation)
+		return;
+	idx_t count = 0, bytes = 0;
+	while (count < STANDARD_VECTOR_SIZE && bytes < FLOW_OUTPUT_BATCH_BYTES) {
+		if (context.IsInterrupted())
+			throw InterruptException();
+		if (!state.reader) {
+			idx_t work;
+			if (!global.scheduler.Claim(work))
+				break;
+			state.file_index = bind.selected_indices[work];
+			state.aggregator = make_uniq<packetquapture::FlowAggregator>(bind.flow_limits);
+			state.reader =
+			    make_uniq<CaptureReader>(context, bind.files[state.file_index], global.options, &global.progress, work);
+			state.finished = false;
+		}
+		packetquapture::FlowSummary flow;
+		bool have_flow = false;
+		try {
+			have_flow = state.aggregator->Next(flow);
+		} catch (const std::exception &exception) {
+			ErrorData error(exception);
+			error.Throw(StringUtil::Format("Flow scan '%s': ", bind.files[state.file_index].path));
+		}
+		if (have_flow) {
+			for (idx_t i = 0; i < global.columns.size(); ++i) {
+				if (!bind.SetPartition(output.data[i], count, global.columns[i], state.file_index)) {
+					SetFlowValue(output.data[i], count, global.columns[i], bind, state.file_index, flow);
+				}
+			}
+			bytes += 1024 + bind.files[state.file_index].path.size();
+			++count;
+			continue;
+		}
+		if (state.finished) {
+			state.aggregator.reset();
+			state.reader.reset();
+			global.Drained();
+			continue;
+		}
+		PacketRecord record;
+		if (!state.reader->Next(record)) {
+			state.aggregator->Finish(state.reader->SectionNumber());
+			state.finished = true;
+			continue;
+		}
+		packetquapture::FlowInput packet;
+		packet.section = record.section_number;
+		packet.interface_id = record.interface_id;
+		packet.captured_length = record.captured_length;
+		packet.original_length = record.original_length;
+		packet.stamp = Stamp(record);
+		packet.packet = std::move(record.decoded);
+		state.aggregator->Push(std::move(packet));
+	}
+	output.SetCardinality(count);
+	if (!count) {
+		state.aggregator.reset();
+		state.reader.reset();
+		state.reservation.reset();
+	}
+}
+
 static TableFunction ReadPcapFunction() {
 	TableFunction function("read_pcap", {LogicalType::VARCHAR}, PcapScan, BindCapture<PcapBind>, PcapInit,
 	                       PcapInitLocal);
@@ -2148,6 +2545,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    .AddExtensionOption("packetquapture_stream_memory_mb",
 	                        "Query-wide stream-worker admission budget in MiB, capped at half memory_limit",
 	                        LogicalType::UBIGINT, Value::UBIGINT(512));
+	DBConfig::GetConfig(loader.GetDatabaseInstance())
+	    .AddExtensionOption("packetquapture_flow_memory_mb",
+	                        "Query-wide flow-worker budget in MiB, capped at half memory_limit", LogicalType::UBIGINT,
+	                        Value::UBIGINT(192));
+	TableFunction flows("read_flows", {LogicalType::VARCHAR}, FlowsScan, BindCapture<FlowsBind>, FlowsInit,
+	                    FlowsInitLocal);
+	flows.projection_pushdown = true;
+	flows.table_scan_progress = CaptureScanProgress;
+	flows.pushdown_complex_filter = PruneCaptureFiles;
+	AddCaptureOptions(flows);
+	flows.named_parameters["tcp_idle_timeout"] = LogicalType::INTERVAL;
+	flows.named_parameters["udp_idle_timeout"] = LogicalType::INTERVAL;
+	flows.named_parameters["max_active_flows"] = LogicalType::UBIGINT;
+	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(flows));
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(ReadPcapFunction()));
 	TableFunction packets("read_packets", {LogicalType::VARCHAR}, PcapScan, BindCapture<PacketsBind>, PcapInit,
 	                      PcapInitLocal);

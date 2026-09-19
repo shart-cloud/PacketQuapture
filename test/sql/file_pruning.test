@@ -4,7 +4,7 @@
 
 require packetquapture
 
-foreach reader read_pcap read_packets read_dns read_tcp_streams read_dns_messages
+foreach reader read_pcap read_packets read_dns read_tcp_streams read_dns_messages read_flows
 
 statement ok
 SET threads=1;
