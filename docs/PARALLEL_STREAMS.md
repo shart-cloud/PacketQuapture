@@ -118,4 +118,5 @@ These informed the design; none provides TCP reconstruction directly.
 Coverage is in `test/sql/parallel_streams.test`, `test/unit/parallel_scan_test.cpp`,
 `test/unit/stream_memory_test.py`, and the existing progress/cache suites. CI wiring
 includes the new tests; hosted CI was not run during local implementation validation.
-No throughput claim or new benchmark result is made by this implementation.
+Local multicore timing and memory measurements are reported separately in
+[the stream benchmark](STREAM_MULTICORE_BENCHMARK.md).
