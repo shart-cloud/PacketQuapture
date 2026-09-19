@@ -245,3 +245,21 @@ instrumentation. The benchmark reports first inventory, strict refresh, unchange
 immutable refresh and one-file update on increasing synthetic collections, along with
 machine/build/cache information. No cold-cache, cloud-service or speedup guarantee is
 implied. Hosted native platform checks remain a release gate.
+
+
+### Recorded local results (September 19, 2026)
+
+- Final release SQL suite: 1,760 assertions across 11 cases; refresh integration: nine tests.
+- ThreadSanitizer: full suite passed 1,750 assertions before the final locator/cache guard changes; final inventory suite passed all 92 assertions, and final native concurrency/cancellation checks passed.
+- Native query-progress checks passed, including inventory with one and four threads.
+- Decoder ASan/UBSan passed 68,000 mutations and 140,000 random link cases.
+- Existing file-pruning (six), remote-read (nine), and remote-cache (nine) integration tests passed. Repository formatting passed.
+- The documented transactional refresh recipe was executed successfully against the flow fixtures.
+
+[Benchmark evidence](benchmarks/inventory-2026-09-19.json) records implementation
+commit `c93e68b`, hardware, build flags, cache caveats and request counts. For 512
+synthetic files (1,000 packets each), first inventory took 0.430 s, strict refresh
+0.449 s, unchanged immutable refresh 0.058 s and one-file update 0.062 s. These are
+single local measurements, not statistical performance claims. Both loopback HTTP
+and S3-client immutable refreshes used one HEAD request and zero GET/body bytes.
+Actual AWS/MinIO and hosted platform checks remain unverified for this milestone.
