@@ -1,0 +1,135 @@
+# name: test/sql/pcap_copy.test
+# description: Typed ordered PCAP export, replacement and failure cleanup
+# group: [sql]
+
+require packetquapture
+
+statement ok
+COPY (SELECT make_timestamp(1000001) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1);
+
+query IIIIT
+SELECT epoch_us(timestamp),captured_length,original_length,link_type,hex(packet_data) FROM read_pcap('__TEST_DIR__/packetquapture-copy.pcap');
+----
+1000001	3	5	1	0080FF
+
+statement ok
+SET threads=1;
+
+statement ok
+COPY (SELECT make_timestamp(i) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data FROM range(5000) t(i) ORDER BY i DESC) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1,USE_TMP_FILE true);
+
+query I
+SELECT count(*) FROM read_pcap('__TEST_DIR__/packetquapture-copy.pcap') WHERE epoch_us(timestamp)<>5000-packet_number;
+----
+0
+
+statement ok
+SET threads=2;
+
+statement ok
+COPY (SELECT make_timestamp(i) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data FROM range(5000) t(i) ORDER BY i DESC) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1,USE_TMP_FILE true);
+
+query I
+SELECT count(*) FROM read_pcap('__TEST_DIR__/packetquapture-copy.pcap') WHERE epoch_us(timestamp)<>5000-packet_number;
+----
+0
+
+statement ok
+SET threads=4;
+
+statement ok
+COPY (SELECT make_timestamp(i) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data FROM range(5000) t(i) ORDER BY i DESC) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1,USE_TMP_FILE true);
+
+query I
+SELECT count(*) FROM read_pcap('__TEST_DIR__/packetquapture-copy.pcap') WHERE epoch_us(timestamp)<>5000-packet_number;
+----
+0
+
+statement ok
+SET threads=8;
+
+statement ok
+COPY (SELECT make_timestamp(i) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data FROM range(5000) t(i) ORDER BY i DESC) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1,USE_TMP_FILE true);
+
+query I
+SELECT count(*) FROM read_pcap('__TEST_DIR__/packetquapture-copy.pcap') WHERE epoch_us(timestamp)<>5000-packet_number;
+----
+0
+
+statement error
+COPY (SELECT * REPLACE(NULL::TIMESTAMP AS timestamp) FROM (SELECT make_timestamp(1000001) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data)) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1);
+----
+must not contain NULL
+
+statement error
+COPY (SELECT * REPLACE(NULL::UINTEGER AS captured_length) FROM (SELECT make_timestamp(1000001) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data)) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1);
+----
+must not contain NULL
+
+statement error
+COPY (SELECT * REPLACE(NULL::UINTEGER AS original_length) FROM (SELECT make_timestamp(1000001) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data)) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1);
+----
+must not contain NULL
+
+statement error
+COPY (SELECT * REPLACE(NULL::UINTEGER AS link_type) FROM (SELECT make_timestamp(1000001) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data)) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1);
+----
+must not contain NULL
+
+statement error
+COPY (SELECT * REPLACE(NULL::BLOB AS packet_data) FROM (SELECT make_timestamp(1000001) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data)) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1);
+----
+must not contain NULL
+
+query I
+SELECT count(*) FROM read_pcap('__TEST_DIR__/packetquapture-copy.pcap');
+----
+5000
+
+statement error
+COPY (SELECT make_timestamp(-1) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1);
+----
+timestamp is outside
+
+statement error
+COPY (SELECT make_timestamp(4294967296000000) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1);
+----
+timestamp is outside
+
+statement error
+COPY (SELECT make_timestamp(1)::TIMESTAMP_NS AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1);
+----
+exact type TIMESTAMP
+
+statement error
+COPY (SELECT make_timestamp(1000001) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 65536);
+----
+requires LINKTYPE
+
+statement error
+COPY (SELECT make_timestamp(1000001) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1,SNAPLEN 2);
+----
+exceeds SNAPLEN
+
+statement error
+COPY (SELECT make_timestamp(1000001) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1,USE_TMP_FILE false);
+----
+cannot be disabled
+
+statement error
+COPY (SELECT make_timestamp(1000001) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 1,APPEND true);
+----
+Unsupported PCAP COPY option
+
+statement ok
+COPY (SELECT make_timestamp(1000001) AS timestamp,3::UINTEGER captured_length,5::UINTEGER original_length,1::UINTEGER link_type,from_hex('0080FF') packet_data WHERE false) TO '__TEST_DIR__/packetquapture-copy.pcap' (FORMAT PCAP,LINKTYPE 101);
+
+query I
+SELECT count(*) FROM read_pcap('__TEST_DIR__/packetquapture-copy.pcap');
+----
+0
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/.packetquapture-*.pcap.tmp');
+----
+0

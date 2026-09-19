@@ -1,8 +1,8 @@
 # Independent classic-PCAP byte writer
 
 This is the standalone byte-writer milestone from the flows/inventory/export plan.
-It does **not** register `COPY ... FORMAT PCAP` yet. The next change must integrate
-DuckDB's ordered COPY lifecycle, type/NULL checks, and owned temporary-file publication.
+The separate [SQL COPY integration](PCAP_EXPORT.md) supplies DuckDB ordering,
+type/NULL checks, and owned temporary-file publication.
 The implementation has no DuckDB or filesystem dependency and adds no shipped libpcap
 dependency. `pcap_writer.cpp` is compiled into the extension for the next integration.
 
@@ -109,3 +109,9 @@ columns with exact types, provide local exclusive staging, close before publicat
 and clean only owned artifacts on errors/interruption. Test new/existing destinations,
 competing writers, source failures and native platform behavior. Neither a mutex around
 parallel writes nor this byte writer alone establishes ordered or safely published COPY.
+
+
+Writer core merged in [PR #7](https://github.com/shart-cloud/PacketQuapture/pull/7)
+as `cd707a289af88620010a16e899c273c068747edf`, with hosted native, sanitizer,
+quality and concurrency checks passing. The COPY gate described above is implemented
+separately in [PCAP_EXPORT.md](PCAP_EXPORT.md), pending its own hosted checks.

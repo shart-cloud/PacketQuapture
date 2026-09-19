@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "packetquapture_extension.hpp"
+#include "pcap_copy.hpp"
 #include "capture_progress.hpp"
 #include "stream_scan_budget.hpp"
 #include "flow_scan_budget.hpp"
@@ -3339,6 +3340,7 @@ static TableFunction ReadPcapFunction() {
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	RegisterPcapCopy(loader);
 	loader.SetDescription("Query PCAP and PCAPNG packet captures directly from DuckDB");
 	DBConfig::GetConfig(loader.GetDatabaseInstance())
 	    .AddExtensionOption("packetquapture_stream_memory_mb",

@@ -169,5 +169,6 @@ catalog. See [identity, refresh, and error semantics](docs/CAPTURE_INVENTORY.md)
 Packet readers can use [catalog-assisted time selection](docs/CATALOG_PRUNING.md)
 with an explicit immutable-archive guarantee.
 
-The [standalone PCAP writer core](docs/PCAP_WRITER.md) is available for the upcoming
-export integration. SQL `COPY ... FORMAT PCAP` is not registered yet.
+Export selected raw packets with `COPY (...) TO 'selected.pcap' (FORMAT PCAP, LINKTYPE 1)`.
+See [PCAP export, ordering and publication](docs/PCAP_EXPORT.md) for required columns
+and failure behavior.
