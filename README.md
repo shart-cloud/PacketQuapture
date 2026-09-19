@@ -168,3 +168,6 @@ Use `capture_inventory` to inspect capture metadata and explicitly refresh a sto
 catalog. See [identity, refresh, and error semantics](docs/CAPTURE_INVENTORY.md).
 Packet readers can use [catalog-assisted time selection](docs/CATALOG_PRUNING.md)
 with an explicit immutable-archive guarantee.
+
+The [standalone PCAP writer core](docs/PCAP_WRITER.md) is available for the upcoming
+export integration. SQL `COPY ... FORMAT PCAP` is not registered yet.

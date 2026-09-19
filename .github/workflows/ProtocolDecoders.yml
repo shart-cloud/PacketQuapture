@@ -69,3 +69,15 @@ jobs:
             -Isrc/include src/flow_aggregator.cpp test/unit/flow_aggregator_fuzz.cpp \
             -o build/flow_aggregator_fuzz
           ./build/flow_aggregator_fuzz -runs=20000 -max_len=4096
+
+      - name: Build and test independent PCAP writer with sanitizers and libpcap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev tcpdump
+          mkdir -p build/pcap-writer
+          c++ -std=c++11 -Wall -Wextra -Werror -g -O1 \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -DPCAP_ORACLE \
+            -Isrc/include src/pcap_writer.cpp test/unit/pcap_writer_test.cpp \
+            -lpcap -o build/pcap_writer_test
+          ./build/pcap_writer_test build/pcap-writer
+          tcpdump -nn -r build/pcap-writer/udp.pcap

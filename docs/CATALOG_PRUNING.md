@@ -133,3 +133,9 @@ mode and 0.021 s in immutable mode. These are synthetic local observations with
 uncontrolled OS cache state. For the excluded HTTP fixture, strict mode used one
 HEAD and one GET (207 body bytes), while immutable mode used one HEAD and no GET
 or body bytes. Request counts are distinct from capture-data reads.
+
+
+Merged as [PR #6](https://github.com/shart-cloud/PacketQuapture/pull/6), commit
+`dabbcb00729104a44b51c3e87cfea25f2e2cc9f2`. Native distribution and quality checks
+passed at the latest inspection; one parallel-scan job was still running. The next
+independent milestone is the [PCAP byte writer](PCAP_WRITER.md).
