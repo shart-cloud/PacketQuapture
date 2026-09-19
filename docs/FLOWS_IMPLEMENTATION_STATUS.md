@@ -12,11 +12,10 @@ A follow-up evidence commit records the benchmark and final validation results.
 The user's pre-existing `docs/CURRENT_HANDOFF.md` changes and untracked
 `docs/FLOWS_INVENTORY_EXPORT_PLAN.md` are preserved and excluded from these commits.
 
-The GitHub push and draft PR were rejected by automatic approval review because
-explicit authorization to publish this implementation to shart-cloud/PacketQuapture
-was required. Nothing was pushed and no PR was created. A permission question is
-pending in the task. After authorization, push this branch and create a draft PR
-against main, then inspect/fix the hosted checks before progressing to inventory.
+The user authorized publication, and the branch is now published as
+[draft PR #4](https://github.com/shart-cloud/PacketQuapture/pull/4).
+Hosted checks are pending. Inspect and fix those checks before progressing to inventory.
+The PR has not been merged.
 
 Local validation logs are `/tmp/packetquapture-flows-*.log`; compact benchmark evidence
 is tracked in `docs/benchmarks/flows-2026-09-19.json`. No temporary benchmark capture
