@@ -127,3 +127,19 @@ The benchmark verifies output size and complete ordering while measuring SQL-gen
 exports with 64/1500-byte frames, 1,000/10,000 packets and one/four query threads.
 Elapsed time includes sorting, writing, sync, close and publication. OS cache state is
 uncontrolled; no cold-disk or cloud-performance claim is made.
+
+
+### Recorded local results (September 19, 2026)
+
+Implementation commit `2a1519c`: release build and all 1,933 assertions in 13 SQL
+cases passed. All 13 COPY integration tests passed, including injected close errors
+and independent tcpdump comparison. The final COPY SQL suite passed 34 assertions
+under ThreadSanitizer. Repository formatting passed. Core writer sanitizer and decoder
+coverage is inherited from merged PR #7; the new SQL tests run in native hosted CI.
+
+[Benchmark evidence](benchmarks/pcap-copy-2026-09-19.json) records the implementation
+commit, compiler, machine, build flags and cache caveat. Exporting 10,000 synthetic
+1,500-byte packets produced exactly 15,160,024 bytes in 0.056 s with one query thread
+and 0.050 s with four. Every run verifies packet count, payload byte total and complete
+ordering on readback. These are single local observations rather than speedup or
+cold-disk claims. Hosted native checks for this COPY milestone remain pending.
