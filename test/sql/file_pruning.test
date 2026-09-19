@@ -1,0 +1,178 @@
+# name: test/sql/file_pruning.test
+# description: file pruning preserves complete rows, occurrence identity and partition constants
+# group: [sql]
+
+require packetquapture
+
+foreach reader read_pcap read_packets read_dns read_tcp_streams read_dns_messages
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE plain AS SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap']);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE partitioned AS SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE});
+
+foreach workers 1 2 4 8
+
+statement ok
+SET threads=${workers};
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap']) WHERE filename='test/data/partitioned/dt=2026-09-18/host=001/capture.pcap' EXCEPT ALL SELECT * FROM plain WHERE filename='test/data/partitioned/dt=2026-09-18/host=001/capture.pcap') UNION ALL (SELECT * FROM plain WHERE filename='test/data/partitioned/dt=2026-09-18/host=001/capture.pcap' EXCEPT ALL SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap']) WHERE filename='test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap']) WHERE filename IN ('test/data/partitioned/dt=2026-09-17/host=002/capture.pcap') EXCEPT ALL SELECT * FROM plain WHERE filename IN ('test/data/partitioned/dt=2026-09-17/host=002/capture.pcap')) UNION ALL (SELECT * FROM plain WHERE filename IN ('test/data/partitioned/dt=2026-09-17/host=002/capture.pcap') EXCEPT ALL SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap']) WHERE filename IN ('test/data/partitioned/dt=2026-09-17/host=002/capture.pcap')));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap']) WHERE contains(filename, 'host=001') OR filename IS NULL EXCEPT ALL SELECT * FROM plain WHERE contains(filename, 'host=001') OR filename IS NULL) UNION ALL (SELECT * FROM plain WHERE contains(filename, 'host=001') OR filename IS NULL EXCEPT ALL SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap']) WHERE contains(filename, 'host=001') OR filename IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap']) WHERE filename LIKE '%host=002/%' OR interface_id=0 EXCEPT ALL SELECT * FROM plain WHERE filename LIKE '%host=002/%' OR interface_id=0) UNION ALL (SELECT * FROM plain WHERE filename LIKE '%host=002/%' OR interface_id=0 EXCEPT ALL SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap']) WHERE filename LIKE '%host=002/%' OR interface_id=0));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE dt=DATE '2026-09-18' AND host='001' EXCEPT ALL SELECT * FROM partitioned WHERE dt=DATE '2026-09-18' AND host='001') UNION ALL (SELECT * FROM partitioned WHERE dt=DATE '2026-09-18' AND host='001' EXCEPT ALL SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE dt=DATE '2026-09-18' AND host='001'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE host IN ('001', '002') EXCEPT ALL SELECT * FROM partitioned WHERE host IN ('001', '002')) UNION ALL (SELECT * FROM partitioned WHERE host IN ('001', '002') EXCEPT ALL SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE host IN ('001', '002')));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE host='002' OR interface_id=0 EXCEPT ALL SELECT * FROM partitioned WHERE host='002' OR interface_id=0) UNION ALL (SELECT * FROM partitioned WHERE host='002' OR interface_id=0 EXCEPT ALL SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE host='002' OR interface_id=0));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE try_cast(host AS INTEGER)=1 AND filename IS NOT NULL EXCEPT ALL SELECT * FROM partitioned WHERE try_cast(host AS INTEGER)=1 AND filename IS NOT NULL) UNION ALL (SELECT * FROM partitioned WHERE try_cast(host AS INTEGER)=1 AND filename IS NOT NULL EXCEPT ALL SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE try_cast(host AS INTEGER)=1 AND filename IS NOT NULL));
+----
+0
+
+endloop
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE filename COLLATE nocase=upper('test/data/partitioned/dt=2026-09-18/host=001/capture.pcap') EXCEPT ALL SELECT * FROM partitioned WHERE filename COLLATE nocase=upper('test/data/partitioned/dt=2026-09-18/host=001/capture.pcap')) UNION ALL (SELECT * FROM partitioned WHERE filename COLLATE nocase=upper('test/data/partitioned/dt=2026-09-18/host=001/capture.pcap') EXCEPT ALL SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE filename COLLATE nocase=upper('test/data/partitioned/dt=2026-09-18/host=001/capture.pcap')));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE lower(filename)=lower('test/data/partitioned/dt=2026-09-18/host=001/capture.pcap') EXCEPT ALL SELECT * FROM partitioned WHERE lower(filename)=lower('test/data/partitioned/dt=2026-09-18/host=001/capture.pcap')) UNION ALL (SELECT * FROM partitioned WHERE lower(filename)=lower('test/data/partitioned/dt=2026-09-18/host=001/capture.pcap') EXCEPT ALL SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE lower(filename)=lower('test/data/partitioned/dt=2026-09-18/host=001/capture.pcap')));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT p.* FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) p JOIN (VALUES ('001'), ('missing')) selected(host) ON p.host=selected.host EXCEPT ALL SELECT p.* FROM partitioned p JOIN (VALUES ('001'), ('missing')) selected(host) ON p.host=selected.host) UNION ALL (SELECT p.* FROM partitioned p JOIN (VALUES ('001'), ('missing')) selected(host) ON p.host=selected.host EXCEPT ALL SELECT p.* FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) p JOIN (VALUES ('001'), ('missing')) selected(host) ON p.host=selected.host));
+----
+0
+
+statement ok
+CREATE OR REPLACE TEMP TABLE globbed AS SELECT * FROM ${reader}('test/data/partitioned/*/*/*.pcap', hive_partitioning=true);
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ${reader}('test/data/partitioned/*/*/*.pcap', hive_partitioning=true) WHERE host='001' EXCEPT ALL SELECT * FROM globbed WHERE host='001') UNION ALL (SELECT * FROM globbed WHERE host='001' EXCEPT ALL SELECT * FROM ${reader}('test/data/partitioned/*/*/*.pcap', hive_partitioning=true) WHERE host='001'));
+----
+0
+
+# Reordered projections and an unprojected partition filter.
+query TTI rowsort
+SELECT host, dt::VARCHAR, count(*) > 0 FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE host='001' GROUP BY ALL;
+----
+001	2026-09-18	true
+
+query I
+SELECT count(*) FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE host='001' AND dt IS NULL;
+----
+0
+
+statement ok
+PREPARE selected AS WITH actual AS (SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap','test/data/partitioned/dt=2026-09-17/host=002/capture.pcap','test/data/partitioned/dt=2026-09-18/host=001/capture.pcap'], hive_partitioning=true, hive_types={'dt':DATE}) WHERE host=$1), expected AS (SELECT * FROM partitioned WHERE host=$1) SELECT count(*) FROM ((SELECT * FROM actual EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual));
+
+query I
+EXECUTE selected('001');
+----
+0
+
+query I
+EXECUTE selected('002');
+----
+0
+
+query I
+EXECUTE selected('missing');
+----
+0
+
+query I
+EXECUTE selected('001');
+----
+0
+
+statement ok
+DEALLOCATE selected;
+
+# Excluded malformed captures must not be parsed.
+query I
+SELECT count(*) > 0 FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap', 'test/data/not-a-capture.bin', 'test/data/partitioned/dt=2026-09-18/host=001/capture.pcap']) WHERE filename='test/data/partitioned/dt=2026-09-18/host=001/capture.pcap';
+----
+true
+
+query I
+SELECT count(*) FROM ${reader}(['test/data/not-a-capture.bin']) WHERE filename='missing';
+----
+0
+
+statement error
+SELECT count(*) FROM ${reader}(['test/data/not-a-capture.bin']);
+----
+
+# A volatile predicate must never become evidence for excluding an input.
+statement error
+SELECT count(*) FROM ${reader}(['test/data/not-a-capture.bin']) WHERE random()<0;
+----
+
+statement error
+SELECT * FROM ${reader}('test/data/partitioned/dt=2026-09-18/host=001/capture.pcap', hive_types={'dt':DATE});
+----
+require hive_partitioning=true
+
+statement error
+SELECT * FROM ${reader}('test/data/partitioned/dt=2026-09-18/host=001/capture.pcap', hive_partitioning=true, hive_types={'unknown':DATE});
+----
+Unknown capture partition
+
+statement error
+SELECT * FROM ${reader}(['test/data/partitioned/dt=2026-09-18/host=001/capture.pcap', 'test/data/sample.pcap'], hive_partitioning=true) WHERE filename='test/data/partitioned/dt=2026-09-18/host=001/capture.pcap';
+----
+Hive partition mismatch
+
+endloop
+
+statement ok
+SET packetquapture_stream_memory_mb=0;
+
+foreach reader read_tcp_streams read_dns_messages
+
+query I
+SELECT count(*) FROM ${reader}(['test/data/not-a-capture.bin']) WHERE filename='missing';
+----
+0
+
+endloop
+
+statement ok
+SET packetquapture_stream_memory_mb=512;
+
+statement ok
+SET threads=1;

@@ -66,8 +66,38 @@ Use `SET threads=8` to allow up to eight workers; one file remains sequential.
 Input lists retain repeated paths, and packet numbers and offsets remain file-relative.
 Results have no global ordering guarantee; use `ORDER BY` when needed.
 
-`read_tcp_streams` and `read_dns_messages` remain sequential pending the stream identifier
-and aggregate-memory work. See [parallel scans and validation](docs/PARALLEL_SCANS.md).
+`read_tcp_streams` and `read_dns_messages` also scan whole files in parallel, with
+stable IDs for the same input list and a shared memory admission budget. See
+[parallel stream scans](docs/PARALLEL_STREAMS.md) and the
+[multicore benchmark](docs/STREAM_MULTICORE_BENCHMARK.md).
+
+## File filters and partition columns
+
+All five readers skip captures excluded by a filter on `filename`. Stream IDs and
+duplicate input occurrences are preserved. `EXPLAIN` shows `Scanning Files: selected/original`.
+
+For directory layouts such as `dt=2026-09-18/host=fw01/capture.pcap`, opt in to
+partition columns and filter by them before captures are opened:
+
+```sql
+SELECT dt, host, count(*)
+FROM read_dns_messages(
+    'captures/dt=*/host=*/*.pcap',
+    hive_partitioning=true,
+    hive_types={'dt': DATE}
+)
+WHERE dt=DATE '2026-09-18' AND host='fw01'
+GROUP BY dt, host;
+```
+
+Partition columns are appended to the existing schema and default to VARCHAR.
+Use `hive_types` for explicit types or `hive_types_autocast=true` for DuckDB's
+inference. Layouts must have consistent keys; names that collide with reader
+columns are rejected. Directory dates describe the layout, not packet timestamps.
+
+Excluded literal paths cause no execution-time file opens or HTTP requests, even
+with progress enabled. Glob expansion still lists inputs. See the
+[file pruning contract and validation](docs/FILE_PRUNING_DESIGN.md).
 
 ## Scan progress
 
@@ -96,6 +126,7 @@ python3 scripts/generate_protocol_captures.py
 python3 scripts/generate_dns_captures.py
 python3 scripts/generate_reassembly_captures.py
 python3 scripts/generate_tcp_stream_captures.py
+python3 scripts/generate_partition_captures.py
 make test_debug
 ```
 

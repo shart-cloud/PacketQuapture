@@ -3,14 +3,17 @@
 `read_tcp_streams` and `read_dns_messages` schedule whole input occurrences on
 DuckDB workers. A worker owns its reader, TCP reassembler, and pending DNS output.
 No transport state crosses files, duplicate occurrences, sections, or interfaces.
-One file remains sequential. SQL filtering still follows reconstruction.
+One file remains sequential. Filename and partition filters can exclude whole files
+before opening them; predicates on reconstructed data still follow reconstruction.
 
 ## Identifier contract
 
 `stream_id` remains UBIGINT and identifies a direction within one function call.
 For a one-based file-local direction number L, zero-based input occurrence I,
-and expanded input count N, its value is `(L - 1) * N + I + 1`.
-This includes resource diagnostics and distinguishes repeated paths. All DNS
+and original expanded input count N (before file pruning), its value is `(L - 1) * N + I + 1`.
+File pruning retains the original I and N, so filtering a scan preserves the IDs
+of filtering its materialized unpruned result. This includes resource diagnostics
+and distinguishes repeated paths. All DNS
 messages belonging to one direction retain its ID. UDP IDs remain null.
 
 IDs are independent of worker scheduling and thread count for the same ordered
@@ -32,13 +35,14 @@ All stream table-function instances in one query share an admission budget of
 reserves 128 MiB through DuckDB's buffer manager before opening a file. At most
 four workers are admitted with the default setting; a 512 MiB DuckDB memory
 limit permits at most two, and 256 MiB permits one. Actual concurrency is also
-bounded by input count and DuckDB's available threads.
+bounded by selected input count and DuckDB's available threads.
 
 Binding counts stream scan instances and conservatively counts copied plans. Each
 scan's worker ceiling is its equal share of the available slots (at least one),
-also capped by input count. Plan copies may lower concurrency conservatively.
+also capped by selected input count. Plan copies may lower concurrency conservatively.
 This prevents an early pipeline from consuming later scans' worker allowances.
-Each nonempty scan reserves one starter slot during initialization. Remaining
+Each scan with selected inputs reserves one starter slot during initialization.
+An entirely pruned scan opens no captures and needs no starter slot. Remaining
 workers try to acquire spare slots without blocking; workers without a slot do
 not claim inputs. Scans initialized together need one starter slot each; later pipelines can reuse
 slots released by finished scans. Failure to admit a starter is a clear out-of-memory error, never a partial successful scan.
@@ -118,4 +122,7 @@ These informed the design; none provides TCP reconstruction directly.
 Coverage is in `test/sql/parallel_streams.test`, `test/unit/parallel_scan_test.cpp`,
 `test/unit/stream_memory_test.py`, and the existing progress/cache suites. CI wiring
 includes the new tests; hosted CI was not run during local implementation validation.
-No throughput claim or new benchmark result is made by this implementation.
+File-pruning follow-up validation is recorded in the
+[file pruning notes](FILE_PRUNING_DESIGN.md).
+Local multicore timing and memory measurements are reported separately in
+[the stream benchmark](STREAM_MULTICORE_BENCHMARK.md).

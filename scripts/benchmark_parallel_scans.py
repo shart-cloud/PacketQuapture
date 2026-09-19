@@ -130,7 +130,13 @@ def verify(cli, trials):
         paths += paths[
             :2
         ]  # Exercise multiplicity even if random choices happen to be unique.
-        for function in ("read_pcap", "read_packets", "read_dns", "read_tcp_streams", "read_dns_messages"):
+        for function in (
+            "read_pcap",
+            "read_packets",
+            "read_dns",
+            "read_tcp_streams",
+            "read_dns_messages",
+        ):
             source = f"{function}({inputs(paths)})"
             predicate = "packet_number > 1 AND captured_length > 30"
             if function != "read_pcap":
@@ -140,7 +146,9 @@ def verify(cli, trials):
             if function == "read_dns":
                 predicate += " AND (dns_valid OR dns_id IS NULL)"
             if function in ("read_tcp_streams", "read_dns_messages"):
-                predicate = "first_packet_number > 1 AND (src_port > 0 OR dst_port = 53)"
+                predicate = (
+                    "first_packet_number > 1 AND (src_port > 0 OR dst_port = 53)"
+                )
             sql = (
                 f"SET threads=1; CREATE TEMP TABLE expected AS SELECT * FROM {source};"
             )
@@ -188,6 +196,9 @@ def main():
     parser.add_argument("--verify-only", action="store_true")
     parser.add_argument("--storage-note", default="unspecified; see mount record")
     parser.add_argument("--label", default="working tree")
+    parser.add_argument("--work-dir", type=Path, default=ROOT / "build/parallel-scans")
+    parser.add_argument("--stream-memory-mb", type=int)
+    parser.add_argument("--memory-limit", help="DuckDB memory_limit, for example 4GiB")
     parser.add_argument(
         "--output", type=Path, default=ROOT / "build/parallel-scans/report.json"
     )
@@ -195,6 +206,7 @@ def main():
     if (
         min(args.units, args.tiny_files, args.trials, *args.threads) < 1
         or args.verify_mixes < 0
+        or (args.stream_memory_mb is not None and args.stream_memory_mb < 1)
     ):
         parser.error(
             "sizes, trials, and thread counts must be positive; mixes must be nonnegative"
@@ -205,13 +217,34 @@ def main():
         return
     args.output = args.output.resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    directory = ROOT / "build/parallel-scans"
+    directory = args.work_dir.resolve()
+    settings = ""
+    if args.memory_limit is not None:
+        settings += f"SET memory_limit={quote(args.memory_limit)};"
+    if args.stream_memory_mb is not None:
+        settings += f"SET packetquapture_stream_memory_mb={args.stream_memory_mb};"
+    effective_settings = json.loads(
+        command(
+            [
+                str(args.cli),
+                "-json",
+                "-c",
+                settings
+                + "SELECT current_setting('memory_limit') AS memory_limit, "
+                + "current_setting('packetquapture_stream_memory_mb') AS stream_memory_mb",
+            ]
+        )
+    )[0]
     captures, unit_bytes = generate(
         directory, args.units, args.tiny_files, args.layouts
     )
     cache = ROOT / "build/release/CMakeCache.txt"
     report = {
         "label": args.label,
+        "settings": effective_settings,
+        "work_dir": str(directory),
+        "verification_mixes": args.verify_mixes,
+        "trial_order": "thread/trial pairs shuffled within each layout/case using seed 20260918",
         "cli": str(args.cli),
         "revision": command(["git", "rev-parse", "HEAD"]),
         "working_tree": command(["git", "status", "--short"]),
@@ -253,68 +286,79 @@ def main():
             if predicate:
                 sql += " WHERE " + predicate
             plan_path = directory / f"plan-{layout}-{case}.txt"
-            plan_path.write_text(command([str(args.cli), "-c", "EXPLAIN " + sql]))
+            plan_path.write_text(
+                command([str(args.cli), "-c", settings + "EXPLAIN " + sql])
+            )
             if predicate:
                 assert "Filters:" in plan_path.read_text(), (
                     case,
                     "filter pushdown missing",
                 )
-            for threads in args.threads:
-                runs = []
-                for trial in range(args.trials):
-                    warm(paths)
-                    profile = directory / "profile.json"
-                    metrics = directory / "process-time.txt"
-                    query = f"SET threads={threads}; SET enable_profiling='json'; SET profiling_output={quote(profile)}; {sql};"
-                    start = time.monotonic()
-                    output = command(
-                        [
-                            "/usr/bin/time",
-                            "-f",
-                            "%e %U %S %M",
-                            "-o",
-                            str(metrics),
-                            str(args.cli),
-                            "-json",
-                            "-c",
-                            query,
-                        ]
-                    )
-                    elapsed = time.monotonic() - start
-                    result = json.loads(output)
-                    if case not in expected:
-                        expected[case] = result
-                    assert result == expected[case], (
-                        layout,
-                        case,
-                        threads,
-                        result,
-                        expected[case],
-                    )
-                    measured = json.loads(profile.read_text())
-                    wall, user, system, rss = map(float, metrics.read_text().split())
-                    latency = measured["latency"]
-                    rows = result[0]["rows"]
-                    run = {
-                        "layout": layout,
-                        "files": len(paths),
-                        "case": case,
-                        "threads": threads,
-                        "trial": trial,
-                        "source_bytes": source_bytes,
-                        "rows": rows,
-                        "query_wall_s": latency,
-                        "process_wall_s": elapsed,
-                        "process_cpu_s": user + system,
-                        "process_cpu_percent": 100 * (user + system) / elapsed,
-                        "peak_rss_kib": rss,
-                        "rows_per_s": rows / latency,
-                        "source_mib_per_s": source_bytes / (1024**2) / latency,
-                        "result": result,
-                        "plan": str(plan_path),
-                    }
-                    runs.append(run)
-                    report["runs"].append(run)
+            runs_by_threads = {threads: [] for threads in args.threads}
+            trial_order = [
+                (threads, trial)
+                for trial in range(args.trials)
+                for threads in args.threads
+            ]
+            random.Random(20260918).shuffle(trial_order)
+            for threads, trial in trial_order:
+                warm(paths)
+                profile = directory / "profile.json"
+                metrics = directory / "process-time.txt"
+                query = (
+                    settings
+                    + f"SET threads={threads}; SET enable_profiling='json'; SET profiling_output={quote(profile)}; {sql};"
+                )
+                start = time.monotonic()
+                output = command(
+                    [
+                        "/usr/bin/time",
+                        "-f",
+                        "%e %U %S %M",
+                        "-o",
+                        str(metrics),
+                        str(args.cli),
+                        "-json",
+                        "-c",
+                        query,
+                    ]
+                )
+                elapsed = time.monotonic() - start
+                result = json.loads(output)
+                if case not in expected:
+                    expected[case] = result
+                assert result == expected[case], (
+                    layout,
+                    case,
+                    threads,
+                    result,
+                    expected[case],
+                )
+                measured = json.loads(profile.read_text())
+                wall, user, system, rss = map(float, metrics.read_text().split())
+                latency = measured["latency"]
+                rows = result[0]["rows"]
+                run = {
+                    "layout": layout,
+                    "files": len(paths),
+                    "case": case,
+                    "threads": threads,
+                    "trial": trial,
+                    "source_bytes": source_bytes,
+                    "rows": rows,
+                    "query_wall_s": latency,
+                    "process_wall_s": elapsed,
+                    "process_cpu_s": user + system,
+                    "process_cpu_percent": 100 * (user + system) / elapsed,
+                    "peak_rss_kib": rss,
+                    "rows_per_s": rows / latency,
+                    "source_mib_per_s": source_bytes / (1024**2) / latency,
+                    "result": result,
+                    "plan": str(plan_path),
+                }
+                runs_by_threads[threads].append(run)
+                report["runs"].append(run)
+            for threads, runs in runs_by_threads.items():
                 times = [run["query_wall_s"] for run in runs]
                 summary = {
                     "layout": layout,
