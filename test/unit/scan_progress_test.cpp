@@ -143,7 +143,7 @@ int main() {
 	};
 	SQL(connection, "SET enable_progress_bar_print=true");
 	SQL(connection, "SET progress_bar_time=0");
-	for (const auto *function : {"read_pcap", "read_packets", "read_dns", "read_flows"}) {
+	for (const auto *function : {"read_pcap", "read_packets", "read_dns", "read_flows", "capture_inventory"}) {
 		for (const auto threads : {1, 4}) {
 			std::cout << function << " threads=" << threads << std::endl;
 			SQL(connection, "SET threads=" + std::to_string(threads));

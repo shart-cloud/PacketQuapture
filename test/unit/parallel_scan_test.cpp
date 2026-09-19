@@ -72,14 +72,15 @@ int main() {
 	}
 	duckdb::DuckDB database(nullptr);
 	duckdb::Connection connection(database);
-	for (const auto *function :
-	     {"read_pcap", "read_packets", "read_dns", "read_tcp_streams", "read_dns_messages", "read_flows"}) {
+	for (const auto *function : {"read_pcap", "read_packets", "read_dns", "read_tcp_streams", "read_dns_messages",
+	                             "read_flows", "capture_inventory"}) {
 		for (const size_t threads : {1, 2, 4, 8}) {
 			Execute(connection, "SET threads=" + std::to_string(threads));
 			for (const size_t files : {1, 8}) {
 				const auto sql =
 				    "SELECT count(*) FROM " + std::string(function) + "(" + Inputs(capture, files) + ") WHERE " +
-				    (std::string(function) == "read_tcp_streams" || std::string(function) == "read_dns_messages" ||
+				    (std::string(function) == "capture_inventory" ? "packet_count=18446744073709551615"
+				     : std::string(function) == "read_tcp_streams" || std::string(function) == "read_dns_messages" ||
 				             std::string(function) == "read_flows"
 				         ? "first_packet_number = 0"
 				         : "captured_length = 4294967295");

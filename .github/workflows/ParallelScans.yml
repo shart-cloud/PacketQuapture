@@ -81,6 +81,7 @@ jobs:
         run: |
           ./build/release/duckdb -c "INSTALL httpfs; LOAD httpfs;"
           timeout 180s python3 test/unit/file_pruning_test.py
+          timeout 180s python3 test/unit/capture_inventory_test.py
           timeout 60s python3 test/unit/remote_reads_test.py
           timeout 120s python3 test/unit/remote_cache_test.py
           timeout 180s python3 scripts/benchmark_remote_reads.py \

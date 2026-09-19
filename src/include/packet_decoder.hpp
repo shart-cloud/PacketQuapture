@@ -16,7 +16,10 @@ struct PacketView {
 
 enum class DecodeDepth : uint8_t { NONE, LINK, NETWORK, TRANSPORT };
 
+enum class DecodeOutcome : uint8_t { NOT_REQUESTED, DECODED, MALFORMED, UNSUPPORTED, FRAGMENT };
+
 struct DecodedPacket {
+	DecodeOutcome outcome = DecodeOutcome::NOT_REQUESTED;
 	bool ethernet = false;
 	bool network = false;
 	bool transport = false;

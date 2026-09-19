@@ -161,3 +161,8 @@ PacketQuapture is licensed under the MIT License.
 
 Use `read_flows` for payload-free, bidirectional TCP/UDP session counts and timing.
 See [session semantics, schema, and resource limits](docs/FLOWS.md).
+
+## Capture inventory
+
+Use `capture_inventory` to inspect capture metadata and explicitly refresh a stored
+catalog. See [identity, refresh, and error semantics](docs/CAPTURE_INVENTORY.md).

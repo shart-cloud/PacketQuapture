@@ -28,6 +28,7 @@ DecodedPacket DecodePacket(PacketSource &source, uint32_t link_type, DecodeDepth
 	if (depth == DecodeDepth::NONE) {
 		return result;
 	}
+	result.outcome = DecodeOutcome::MALFORMED;
 	const auto size = source.Size();
 	const uint8_t *data = nullptr;
 	auto ensure = [&](size_t start, size_t length) {
@@ -38,6 +39,7 @@ DecodedPacket DecodePacket(PacketSource &source, uint32_t link_type, DecodeDepth
 		return true;
 	};
 	if (depth == DecodeDepth::LINK && link_type != 1) {
+		result.outcome = DecodeOutcome::UNSUPPORTED;
 		return result;
 	}
 	size_t offset = 0;
@@ -52,7 +54,9 @@ DecodedPacket DecodePacket(PacketSource &source, uint32_t link_type, DecodeDepth
 		offset = 14;
 		while (type == 0x8100 || type == 0x88a8) {
 			if (result.vlan_ids.size() == 8 || !ensure(offset, 4)) {
-				return DecodedPacket();
+				DecodedPacket invalid;
+				invalid.outcome = result.vlan_ids.size() == 8 ? DecodeOutcome::UNSUPPORTED : DecodeOutcome::MALFORMED;
+				return invalid;
 			}
 			result.vlan_ids.push_back(U16(data + offset) & 0x0fffU);
 			type = U16(data + offset + 2);
@@ -75,9 +79,11 @@ DecodedPacket DecodePacket(PacketSource &source, uint32_t link_type, DecodeDepth
 		type = U16(data + (link_type == 113 ? 14 : 0));
 		offset = length;
 	} else {
+		result.outcome = DecodeOutcome::UNSUPPORTED;
 		return result;
 	}
 	if (depth == DecodeDepth::LINK) {
+		result.outcome = DecodeOutcome::DECODED;
 		return result;
 	}
 
@@ -119,6 +125,9 @@ DecodedPacket DecodePacket(PacketSource &source, uint32_t link_type, DecodeDepth
 		unsigned extensions = 0;
 		while (IsExtension(network.ip_protocol)) {
 			if (++extensions > 16 || (!Has(end, offset, 8) || !ensure(offset, 8))) {
+				if (extensions > 16) {
+					result.outcome = DecodeOutcome::UNSUPPORTED;
+				}
 				return result;
 			}
 			const auto protocol = network.ip_protocol;
@@ -150,11 +159,14 @@ DecodedPacket DecodePacket(PacketSource &source, uint32_t link_type, DecodeDepth
 			}
 		}
 	} else {
+		result.outcome = (link_type == 101 && !type) ? DecodeOutcome::MALFORMED : DecodeOutcome::UNSUPPORTED;
 		return result;
 	}
 	network.network = true;
 	result = network;
 	if (depth == DecodeDepth::NETWORK || result.ip_fragment_offset != 0 || result.ip_more_fragments) {
+		result.outcome =
+		    result.ip_fragment_offset || result.ip_more_fragments ? DecodeOutcome::FRAGMENT : DecodeOutcome::DECODED;
 		return result;
 	}
 
@@ -185,8 +197,10 @@ DecodedPacket DecodePacket(PacketSource &source, uint32_t link_type, DecodeDepth
 		result.udp_length = length;
 		end = offset + length;
 	} else {
+		result.outcome = DecodeOutcome::UNSUPPORTED;
 		return result;
 	}
+	result.outcome = DecodeOutcome::DECODED;
 	result.transport = true;
 	result.src_port = U16(data + offset);
 	result.dst_port = U16(data + offset + 2);
