@@ -1,8 +1,8 @@
 # Capture inventory and explicit refresh
 
 `capture_inventory` returns file-level metadata for PCAP and PCAPNG sources. This
-implements the inventory milestone of the flows/inventory/export plan. Reader
-catalog arguments, optimizer pruning, within-file indexes and PCAP export are not
+implements the inventory milestone of the flows/inventory/export plan. The original inventory milestone did not include reader
+catalog arguments, optimizer pruning, within-file indexes or PCAP export; those were not
 part of this change. Existing reader schemas and filtering behavior remain unchanged.
 
 ```sql
@@ -88,7 +88,7 @@ filesystem's direct-I/O path. Fresh identity checks can issue HEAD requests; avo
 capture-body reads are reported separately from metadata requests. Stable remote
 locators must not contain query strings, URL fragments or user information; use
 DuckDB's credential mechanisms. Authentication headers and transient signed URLs
-are not catalog fields. No negative pruning evidence is enabled by this milestone.
+are not catalog fields. Inventory refresh itself does not prune reader queries; see [catalog-assisted selection](CATALOG_PRUNING.md) for that separate opt-in API.
 
 ## Incremental refresh
 
@@ -263,3 +263,9 @@ synthetic files (1,000 packets each), first inventory took 0.430 s, strict refre
 single local measurements, not statistical performance claims. Both loopback HTTP
 and S3-client immutable refreshes used one HEAD request and zero GET/body bytes.
 Actual AWS/MinIO and hosted platform checks remain unverified for this milestone.
+
+
+Inventory was merged in [PR #5](https://github.com/shart-cloud/PacketQuapture/pull/5)
+as `e2896d9cbbdf4893551ba7fcf67283b46105143b`; hosted native platform, quality,
+concurrency and decoder checks passed. The following milestone adds
+[catalog-assisted packet-time selection](CATALOG_PRUNING.md).

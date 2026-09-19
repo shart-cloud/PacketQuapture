@@ -1,0 +1,682 @@
+# name: test/sql/catalog_pruning.test
+# description: Runtime timestamp catalog selection preserves complete packet rows
+# group: [sql]
+
+require packetquapture
+
+statement ok
+CREATE TABLE time_catalog AS SELECT * FROM capture_inventory(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap']);
+
+statement ok
+SET threads=1;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970));
+----
+0
+
+statement ok
+SET threads=2;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970));
+----
+0
+
+statement ok
+SET threads=4;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970));
+----
+0
+
+statement ok
+SET threads=8;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970) UNION ALL (SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_pcap(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970) UNION ALL (SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_packets(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp >= TIMESTAMP '1970-01-01' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000020'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp = TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp > TIMESTAMP '1970-01-01 00:00:00.000040'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp IS NOT NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR timestamp IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp < TIMESTAMP '1970-01-01' OR link_type=1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01') UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE timestamp <> TIMESTAMP '1970-01-01' EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE timestamp <> TIMESTAMP '1970-01-01'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970) UNION ALL (SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap'],catalog='time_catalog',catalog_validation='immutable') WHERE date_part('year',timestamp)=1970 EXCEPT ALL SELECT * FROM read_dns(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/inventory/all-null.pcapng','test/data/inventory/empty.pcap','test/data/flows/udp.pcap']) WHERE date_part('year',timestamp)=1970));
+----
+0
+
+statement ok
+PREPARE catalog_q AS SELECT count(*) FROM read_packets('test/data/flows/udp.pcap',catalog='time_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL;
+
+query T
+SELECT (SELECT count(*) FROM read_packets('test/data/flows/udp.pcap',catalog='time_catalog',catalog_validation='immutable'))=(SELECT count(*) FROM read_packets('test/data/flows/udp.pcap'));
+----
+true
+
+statement ok
+UPDATE time_catalog SET semantic_version=999;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets('test/data/flows/udp.pcap') EXCEPT ALL SELECT * FROM read_packets('test/data/flows/udp.pcap',catalog='time_catalog',catalog_validation='immutable')));
+----
+0
+
+statement ok
+UPDATE time_catalog SET scan_status='error';
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets('test/data/flows/udp.pcap') EXCEPT ALL SELECT * FROM read_packets('test/data/flows/udp.pcap',catalog='time_catalog',catalog_validation='immutable')));
+----
+0
+
+statement ok
+DELETE FROM time_catalog;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM read_packets('test/data/flows/udp.pcap') EXCEPT ALL SELECT * FROM read_packets('test/data/flows/udp.pcap',catalog='time_catalog',catalog_validation='immutable')));
+----
+0
+
+statement error
+SELECT * FROM read_flows('test/data/flows/tcp.pcap',catalog='time_catalog');
+----
+Invalid named parameter
+
+statement error
+SELECT * FROM read_tcp_streams('test/data/flows/tcp.pcap',catalog='time_catalog');
+----
+Invalid named parameter
+
+statement error
+SELECT * FROM read_dns_messages('test/data/flows/tcp.pcap',catalog='time_catalog');
+----
+Invalid named parameter
+
+statement error
+SELECT * FROM read_packets('test/data/flows/tcp.pcap',catalog=NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM read_packets('test/data/flows/tcp.pcap',catalog_validation='immutable');
+----
+requires catalog
+
+statement error
+SELECT * FROM read_packets('test/data/flows/tcp.pcap',catalog='time_catalog',catalog_validation='bad');
+----
+must be strict or immutable

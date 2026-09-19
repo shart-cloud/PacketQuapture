@@ -140,6 +140,36 @@ int main() {
 			Require(Readers(early) == 0, "Early LIMIT leaked capture handles");
 		}
 	}
+	// The catalog map is execution-local; parallel workers only see the selected
+	// occurrence vector. Exercise cancellation and LIMIT after a real snapshot.
+	Execute(connection, "CREATE TABLE scan_catalog AS SELECT * FROM capture_inventory('" + capture.string() + "')");
+	Execute(connection, "SET threads=4");
+	const auto catalog_options = ",catalog='scan_catalog',catalog_validation='immutable'";
+	auto catalog_query = std::async(std::launch::async, [&] {
+		return connection.Query("SELECT count(*) FROM read_packets(" + Inputs(capture, 8) + catalog_options +
+		                        ") WHERE timestamp IS NOT NULL AND captured_length=4294967295");
+	});
+	size_t catalog_peak = 0;
+	const auto catalog_deadline = std::chrono::steady_clock::now() + 15s;
+	while (std::chrono::steady_clock::now() < catalog_deadline) {
+		catalog_peak = std::max(catalog_peak, Readers(capture));
+		if (catalog_peak >= 2 || catalog_query.wait_for(0ms) == std::future_status::ready)
+			break;
+		std::this_thread::sleep_for(1ms);
+	}
+	Require(catalog_peak >= 2, "Catalog-selected readers did not overlap");
+	connection.Interrupt();
+	Require(catalog_query.wait_for(5s) == std::future_status::ready, "Catalog query cancellation timed out");
+	Require(catalog_query.get()->HasError(), "Expected catalog query interruption");
+	Require(Readers(capture) == 0, "Catalog cancellation leaked handles");
+	Execute(connection, "SELECT * FROM read_packets(" + Inputs(capture, 8) + catalog_options +
+	                        ") WHERE timestamp IS NOT NULL LIMIT 1");
+	Require(Readers(capture) == 0, "Catalog LIMIT leaked handles");
+	auto catalog_memory =
+	    connection.Query("SELECT coalesce(sum(memory_usage_bytes),0) FROM duckdb_memory() WHERE tag='EXTENSION'");
+	Require(!catalog_memory->HasError() && catalog_memory->GetValue(0, 0).GetValue<uint64_t>() == 0,
+	        "Catalog query leaked reservations");
+	std::cout << "Catalog-selected overlap, cancellation, LIMIT and memory cleanup passed\n";
 	// Actual descriptor counts verify that the admission budget limits workers,
 	// independently of the DuckDB thread setting. Both readers must release slots.
 	Execute(connection, "SET threads=8");
