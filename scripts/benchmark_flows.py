@@ -33,7 +33,26 @@ def main():
         "packets_per_occurrence": args.packets,
         "input_occurrences": 8,
         "cache": "Local OS cache uncontrolled; warm-up query; eight duplicate occurrences of one immutable synthetic file",
-        "build": "Existing release build; inspect build/release/CMakeCache.txt for flags",
+        "commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip(),
+        "duckdb_version": subprocess.check_output(
+            [str(cli), "-csv", "-noheader", "-c", "SELECT version()"], text=True
+        ).strip(),
+        "build": [
+            line
+            for line in (ROOT / "build/release/CMakeCache.txt").read_text().splitlines()
+            if line.startswith(
+                (
+                    "CMAKE_BUILD_TYPE:",
+                    "CMAKE_CXX_FLAGS:",
+                    "CMAKE_CXX_FLAGS_RELEASE:",
+                    "ENABLE_SANITIZER:",
+                    "ENABLE_UBSAN:",
+                    "ENABLE_THREAD_SANITIZER:",
+                )
+            )
+        ],
         "flow_memory_mb": 384,
         "trials": [],
     }

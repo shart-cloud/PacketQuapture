@@ -212,3 +212,30 @@ The benchmark uses eight duplicate input occurrences, controlled packet counts, 
 and uncontrolled local OS cache. Its JSON records machine/compiler information and raw
 trial times. It is not a cold-storage benchmark or a performance guarantee. Hosted native
 platform CI must pass on the proposed change before calling the phase release-ready.
+
+## Local validation result (September 19, 2026)
+
+The release and full ThreadSanitizer SQL runs each passed 1,668 assertions in 10 cases.
+The native concurrency/admission suite passed in release and ThreadSanitizer builds.
+ASan/UBSan core fixtures, 400,000 reference packets, and 20,000 fuzz runs passed.
+The six path-pruning integration tests (including read_flows), nine remote-read tests,
+and nine remote-cache tests passed. The real-query progress test passed on rerun after
+one timing-sensitive intermediate-display assertion; that first failure is not hidden.
+Formatting, whitespace and byte-identical fixture regeneration passed. The final
+filename-context diagnostic change received a focused flow SQL rerun.
+
+The [benchmark evidence](benchmarks/flows-2026-09-19.json) records three trials per
+thread count for 800,000 packet observations (eight occurrences of one 100,000-packet
+synthetic file), with a 384 MiB flow budget. Median wall times including CLI startup:
+
+| Threads | Seconds |
+| --- | ---: |
+| 1 | 2.323 |
+| 2 | 1.251 |
+| 4 | 0.676 |
+| 8 | 0.550 |
+
+These measurements were taken after local sanitizer workloads completed. Cache state
+was uncontrolled after warm-up. They do not establish remote-storage throughput,
+single-file parallelism, or behavior on real traffic. Hosted cross-platform checks
+remain pending publication of the branch.
