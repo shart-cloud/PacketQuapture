@@ -4,8 +4,8 @@ September 19, 2026. Branch: `flows-inventory-export`, based on merged PR #3 at
 `19e46bd237004ce3bd78b479f37b7aa51b7fa383`.
 
 Phase 1 (`read_flows`) is merged with hosted native checks passing. See [API and validation](FLOWS.md).
-The next milestone implements [capture inventory and explicit refresh](CAPTURE_INVENTORY.md).
-Catalog-assisted query pruning and PCAP export remain later milestones.
+[Capture inventory and explicit refresh](CAPTURE_INVENTORY.md) is merged as PR #5.
+[Catalog-assisted query pruning](CATALOG_PRUNING.md) follows on branch `catalog-pruning`; PCAP export remains a later milestone.
 
 The first implementation commit is `2d8d45d94394d992a9ec734a82440b3bc27194a3`.
 A follow-up evidence commit records the benchmark and final validation results.

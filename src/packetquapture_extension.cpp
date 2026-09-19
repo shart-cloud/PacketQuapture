@@ -26,6 +26,9 @@
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -755,6 +758,8 @@ private:
 	vector<PcapNgInterface> interfaces;
 };
 
+static string BindInventoryCatalog(ClientContext &context, const string &name);
+
 struct PcapBindData : public TableFunctionData {
 	// Original occurrences stay immutable: stream IDs use their indexes and count.
 	vector<OpenFileInfo> files;
@@ -781,6 +786,8 @@ struct PcapBindData : public TableFunctionData {
 		output.SetValue(row, partition_values[file_index][column - base_column_count]);
 		return true;
 	}
+	string catalog;
+	bool catalog_immutable = false;
 	bool dns_scan = false;
 	shared_ptr<StreamPlanCount> stream_plan;
 	shared_ptr<FlowPlanCount> flow_plan;
@@ -796,6 +803,8 @@ struct PcapBindData : public TableFunctionData {
 		result->hive_partitioning = hive_partitioning;
 		result->partition_keys = partition_keys;
 		result->partition_values = partition_values;
+		result->catalog = catalog;
+		result->catalog_immutable = catalog_immutable;
 		result->dns_scan = dns_scan;
 		result->stream_plan = stream_plan;
 		result->flow_plan = flow_plan;
@@ -812,7 +821,8 @@ struct PcapBindData : public TableFunctionData {
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<PcapBindData>();
-		if (flow_scan != other.flow_scan || flow_limits.tcp_idle_us != other.flow_limits.tcp_idle_us ||
+		if (catalog != other.catalog || catalog_immutable != other.catalog_immutable || flow_scan != other.flow_scan ||
+		    flow_limits.tcp_idle_us != other.flow_limits.tcp_idle_us ||
 		    flow_limits.udp_idle_us != other.flow_limits.udp_idle_us ||
 		    flow_limits.max_flows != other.flow_limits.max_flows || files.size() != other.files.size() ||
 		    types != other.types || dns_scan != other.dns_scan || selected_indices != other.selected_indices ||
@@ -863,14 +873,20 @@ struct PacketFilterDefinition {
 	unique_ptr<TableFilter> filter;
 };
 
+static vector<idx_t> SelectCatalogFiles(ClientContext &context, const PcapBindData &bind, TableFunctionInitInput &input,
+                                        map<string, idx_t> &reasons);
+
 struct PcapGlobalState : public CaptureGlobalState {
-	explicit PcapGlobalState(idx_t file_count) : scheduler(file_count) {
+	explicit PcapGlobalState(vector<idx_t> selected)
+	    : selected_indices(std::move(selected)), scheduler(selected_indices.size()) {
 	}
 
 	idx_t MaxThreads() const override {
 		return scheduler.MaxThreads();
 	}
 
+	vector<idx_t> selected_indices;
+	map<string, idx_t> catalog_reasons;
 	FileScheduler scheduler;
 	vector<column_t> column_ids;
 	ScanOptions options;
@@ -1000,6 +1016,21 @@ static unique_ptr<FunctionData> BindCapture(ClientContext &context, TableFunctio
 	auto reader = MultiFileReader::Create(input.table_function);
 	bool has_type_options = false;
 	for (auto &entry : input.named_parameters) {
+		if (StringUtil::CIEquals(entry.first, "catalog")) {
+			if (entry.second.IsNull())
+				throw BinderException("catalog must not be NULL");
+			bind.catalog = BindInventoryCatalog(context, entry.second.GetValue<string>());
+			continue;
+		}
+		if (StringUtil::CIEquals(entry.first, "catalog_validation")) {
+			if (entry.second.IsNull())
+				throw BinderException("catalog_validation must not be NULL");
+			auto mode = StringUtil::Lower(entry.second.GetValue<string>());
+			if (mode != "strict" && mode != "immutable")
+				throw BinderException("catalog_validation must be strict or immutable");
+			bind.catalog_immutable = mode == "immutable";
+			continue;
+		}
 		if (bind.flow_scan && (StringUtil::CIEquals(entry.first, "tcp_idle_timeout") ||
 		                       StringUtil::CIEquals(entry.first, "udp_idle_timeout") ||
 		                       StringUtil::CIEquals(entry.first, "max_active_flows"))) {
@@ -1010,6 +1041,8 @@ static unique_ptr<FunctionData> BindCapture(ClientContext &context, TableFunctio
 		}
 		has_type_options |= !StringUtil::CIEquals(entry.first, "hive_partitioning");
 	}
+	if (bind.catalog.empty() && input.named_parameters.count("catalog_validation"))
+		throw BinderException("catalog_validation requires catalog");
 	if (has_type_options && !options.hive_partitioning) {
 		throw BinderException("Capture partition type options require hive_partitioning=true");
 	}
@@ -1084,8 +1117,13 @@ static bool SupportsPacketFilter(const FunctionData &data, idx_t column) {
 
 static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<PcapBindData>();
-	auto result = make_uniq<PcapGlobalState>(bind.selected_indices.size());
-	result->progress.Initialize(context, bind.SelectedFiles());
+	map<string, idx_t> reasons;
+	auto result = make_uniq<PcapGlobalState>(SelectCatalogFiles(context, bind, input, reasons));
+	result->catalog_reasons = std::move(reasons);
+	vector<OpenFileInfo> selected_files;
+	for (auto index : result->selected_indices)
+		selected_files.push_back(bind.files[index]);
+	result->progress.Initialize(context, selected_files);
 	// DuckDB can keep filter-only columns out of the scan output. Unsupported
 	// partition/list filters are restored above the scan with their own projection.
 	if (input.projection_ids.empty()) {
@@ -1499,6 +1537,10 @@ static void NormalizePacketFilters(ClientContext &context, LogicalGet &get, Func
 static InsertionOrderPreservingMap<string> CaptureToString(TableFunctionToStringInput &input) {
 	const auto &bind = input.bind_data->Cast<PcapBindData>();
 	InsertionOrderPreservingMap<string> result;
+	if (!bind.catalog.empty()) {
+		result["Catalog Selection"] = "pending execution; timestamp statistics only";
+		result["Catalog Validation"] = bind.catalog_immutable ? "immutable" : "strict (scan fallback)";
+	}
 	result["Scanning Files"] = StringUtil::Format("%llu/%llu", bind.selected_indices.size(), bind.files.size());
 	return result;
 }
@@ -1532,7 +1574,7 @@ static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChun
 			if (!global.scheduler.Claim(file_index)) {
 				break;
 			}
-			state.file_index = bind_data.selected_indices[file_index];
+			state.file_index = global.selected_indices[file_index];
 			state.reader = make_uniq<CaptureReader>(context, bind_data.files[state.file_index], state.options,
 			                                        &global.progress, file_index);
 		}
@@ -2693,6 +2735,15 @@ static TableCatalogEntry &InventoryCatalog(ClientContext &context, const string 
 	}
 	return table;
 }
+static string BindInventoryCatalog(ClientContext &context, const string &name) {
+	vector<StorageIndex> columns;
+	auto &table = InventoryCatalog(context, name, columns);
+	QualifiedName resolved;
+	resolved.catalog = table.catalog.GetName();
+	resolved.schema = table.schema.name;
+	resolved.name = table.name;
+	return resolved.ToString();
+}
 static void ValidateInventoryLocator(const string &path) {
 	if (!FileSystem::IsRemoteFile(path))
 		return;
@@ -2801,6 +2852,58 @@ static bool InventoryAgreement(const vector<Value> &a, const vector<Value> &b) {
 	}
 	return true;
 }
+static void LoadInventorySnapshot(ClientContext &context, const string &catalog, const vector<OpenFileInfo> &files,
+                                  InventorySnapshotMemory &snapshot_memory,
+                                  unordered_map<string, InventoryPrevious> &previous) {
+	unordered_set<string> wanted;
+	for (const auto &file : files) {
+		if (wanted.insert(file.path).second)
+			snapshot_memory.Add(128 + file.path.size() * 2);
+	}
+	vector<StorageIndex> ids;
+	auto &table = InventoryCatalog(context, catalog, ids);
+	auto &transaction = DuckTransaction::Get(context, table.catalog);
+	auto &storage = table.GetStorage();
+	TableScanState scan;
+	storage.InitializeScan(context, transaction, scan, ids);
+	vector<LogicalType> types;
+	vector<string> names;
+	InventorySchema(types, names);
+	DataChunk chunk;
+	chunk.Initialize(context, types);
+	while (true) {
+		if (context.IsInterrupted())
+			throw InterruptException();
+		chunk.Reset();
+		storage.Scan(transaction, chunk, scan);
+		if (!chunk.size())
+			break;
+		for (idx_t n = 0; n < chunk.size(); ++n) {
+			auto file = chunk.GetValue(IC_FILE, n);
+			if (file.IsNull() || !wanted.count(file.GetValue<string>()))
+				continue;
+			vector<Value> values;
+			idx_t bytes = 512 + file.GetValue<string>().size() * 2;
+			for (idx_t c = 0; c < IC_COUNT; ++c) {
+				auto value = chunk.GetValue(c, n);
+				bytes += sizeof(Value) * 2;
+				if (!value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR)
+					bytes += StringValue::Get(value).size() * 2;
+				if (!value.IsNull() && c == IC_LINKS)
+					bytes += ListValue::GetChildren(value).size() * sizeof(Value) * 2;
+				values.push_back(std::move(value));
+			}
+			auto found = previous.find(file.GetValue<string>());
+			if (found == previous.end()) {
+				snapshot_memory.Add(bytes);
+				InventoryPrevious entry;
+				entry.row = std::move(values);
+				previous.emplace(file.GetValue<string>(), std::move(entry));
+			} else if (!InventoryAgreement(found->second.row, values))
+				found->second.conflict = true;
+		}
+	}
+}
 struct InventoryGlobalState : public CaptureGlobalState {
 	InventoryGlobalState(ClientContext &context, const InventoryBindData &bind)
 	    : files(InventoryFiles(context, bind)), scheduler(files.size()), snapshot_memory(context) {
@@ -2818,56 +2921,8 @@ struct InventoryGlobalState : public CaptureGlobalState {
 				throw OutOfMemoryException("PacketQuapture cannot reserve 32 MiB for an inventory worker; increase "
 				                           "packetquapture_inventory_memory_mb or memory_limit");
 		}
-		if (!bind.previous.empty() && !files.empty()) {
-			unordered_set<string> wanted;
-			for (const auto &file : files) {
-				if (wanted.insert(file.path).second)
-					snapshot_memory.Add(128 + file.path.size() * 2);
-			}
-			vector<StorageIndex> ids;
-			auto &table = InventoryCatalog(context, bind.previous, ids);
-			auto &transaction = DuckTransaction::Get(context, table.catalog);
-			auto &storage = table.GetStorage();
-			TableScanState scan;
-			storage.InitializeScan(context, transaction, scan, ids);
-			vector<LogicalType> types;
-			vector<string> names;
-			InventorySchema(types, names);
-			DataChunk chunk;
-			chunk.Initialize(context, types);
-			while (true) {
-				if (context.IsInterrupted())
-					throw InterruptException();
-				chunk.Reset();
-				storage.Scan(transaction, chunk, scan);
-				if (!chunk.size())
-					break;
-				for (idx_t n = 0; n < chunk.size(); ++n) {
-					auto file = chunk.GetValue(IC_FILE, n);
-					if (file.IsNull() || !wanted.count(file.GetValue<string>()))
-						continue;
-					vector<Value> values;
-					idx_t bytes = 512 + file.GetValue<string>().size() * 2;
-					for (idx_t c = 0; c < IC_COUNT; ++c) {
-						auto value = chunk.GetValue(c, n);
-						bytes += sizeof(Value) * 2;
-						if (!value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR)
-							bytes += StringValue::Get(value).size() * 2;
-						if (!value.IsNull() && c == IC_LINKS)
-							bytes += ListValue::GetChildren(value).size() * sizeof(Value) * 2;
-						values.push_back(std::move(value));
-					}
-					auto found = previous.find(file.GetValue<string>());
-					if (found == previous.end()) {
-						snapshot_memory.Add(bytes);
-						InventoryPrevious entry;
-						entry.row = std::move(values);
-						previous.emplace(file.GetValue<string>(), std::move(entry));
-					} else if (!InventoryAgreement(found->second.row, values))
-						found->second.conflict = true;
-				}
-			}
-		}
+		if (!bind.previous.empty() && !files.empty())
+			LoadInventorySnapshot(context, bind.previous, files, snapshot_memory, previous);
 		progress.Initialize(context, files, true);
 	}
 	idx_t MaxThreads() const override {
@@ -2979,6 +3034,148 @@ static bool InventoryValidPrevious(const vector<Value> &row, bool protocols) {
 	}
 	return true;
 }
+// Accept only the static scalar timestamp filters whose statistics semantics we
+// have tested. Unknown/dynamic/expression filters remain ordinary row filters.
+static bool CatalogTimestampFilter(const TableFilter &filter) {
+	switch (filter.filter_type) {
+	case TableFilterType::IS_NULL:
+	case TableFilterType::IS_NOT_NULL:
+		return true;
+	case TableFilterType::CONSTANT_COMPARISON: {
+		auto &constant = filter.Cast<ConstantFilter>();
+		return constant.constant.type() == LogicalType::TIMESTAMP;
+	}
+	case TableFilterType::CONJUNCTION_AND:
+	case TableFilterType::CONJUNCTION_OR: {
+		auto &conjunction = static_cast<const ConjunctionFilter &>(filter);
+		if (conjunction.child_filters.empty())
+			return false;
+		for (auto &child : conjunction.child_filters)
+			if (!CatalogTimestampFilter(*child))
+				return false;
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+static vector<idx_t> SelectCatalogFiles(ClientContext &context, const PcapBindData &bind, TableFunctionInitInput &input,
+                                        map<string, idx_t> &reasons) {
+	if (bind.catalog.empty() || bind.selected_indices.empty())
+		return bind.selected_indices;
+	// Re-resolve the table in the execution's transaction, even in strict mode.
+	vector<StorageIndex> ids;
+	InventoryCatalog(context, bind.catalog, ids);
+	const TableFilter *time_filter = nullptr;
+	if (input.filters) {
+		for (auto &entry : input.filters->filters)
+			if (input.column_ids[entry.first] == 2 && CatalogTimestampFilter(*entry.second))
+				time_filter = entry.second.get();
+	}
+	if (!bind.catalog_immutable || !time_filter) {
+		reasons[!bind.catalog_immutable ? "strict requires scan" : "no supported time filter"] =
+		    bind.selected_indices.size();
+		return bind.selected_indices;
+	}
+	auto &fs = FileSystem::GetFileSystem(context);
+	vector<OpenFileInfo> candidates;
+	for (auto index : bind.selected_indices) {
+		auto file = bind.files[index];
+		if (!FileSystem::IsRemoteFile(file.path))
+			file.path = fs.CanonicalizePath(file.path);
+		candidates.push_back(std::move(file));
+	}
+	InventorySnapshotMemory memory(context);
+	unordered_map<string, InventoryPrevious> previous;
+	LoadInventorySnapshot(context, bind.catalog, candidates, memory, previous);
+	vector<idx_t> selected;
+	vector<LogicalType> types;
+	vector<string> names;
+	InventorySchema(types, names);
+	for (idx_t n = 0; n < candidates.size(); ++n) {
+		if (context.IsInterrupted())
+			throw InterruptException();
+		auto &file = candidates[n];
+		string reason = "no matching summary";
+		bool exclude = false;
+		auto found = previous.find(file.path);
+		if (found != previous.end()) {
+			auto &old = found->second;
+			reason = old.conflict ? "conflicting summaries" : "incompatible summary";
+			if (!old.conflict && InventoryValidPrevious(old.row, false)) {
+				reason = "unverified remote backend";
+				// Only local and HTTP(S) have measured freshness behavior for this
+				// milestone. S3/other backends fall back until provider tests pass.
+				bool supported = !FileSystem::IsRemoteFile(file.path) || StringUtil::StartsWith(file.path, "http://") ||
+				                 StringUtil::StartsWith(file.path, "https://");
+				if (supported && FileSystem::IsRemoteFile(file.path)) {
+					Value cached;
+					if (context.TryGetCurrentSetting("enable_http_metadata_cache", cached) &&
+					    (cached.IsNull() || cached.GetValue<bool>())) {
+						supported = false;
+						reason = "metadata cache enabled";
+					}
+					if (file.path.find('?') != string::npos || file.path.find('#') != string::npos ||
+					    file.path.find('@') != string::npos) {
+						supported = false;
+						reason = "unstable remote locator";
+					}
+				}
+				if (supported) {
+					if (fs.IsPipe(file.path))
+						throw InvalidInputException("Catalog validation requires seekable capture files");
+					auto handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+					if (!handle->CanSeek() || handle->IsPipe())
+						throw InvalidInputException("Catalog validation requires seekable capture files");
+					auto identity = ReadCaptureIdentity(fs, *handle);
+					vector<Value> current;
+					for (auto &type : types)
+						current.emplace_back(type);
+					InventoryIdentityValues(current, identity);
+					bool match = identity.Known();
+					for (idx_t col = IC_ID_TYPE; col <= IC_MTIME; ++col)
+						match &= Value::NotDistinctFrom(current[col], old.row[col]);
+					reason = "identity mismatch or unavailable";
+					if (match) {
+						auto stats = NumericStats::CreateUnknown(LogicalType::TIMESTAMP);
+						auto packets = old.row[IC_PACKETS].GetValue<uint64_t>();
+						auto nulls = old.row[IC_NULLS].GetValue<uint64_t>();
+						stats.Set(nulls ? StatsInfo::CAN_HAVE_NULL_VALUES : StatsInfo::CANNOT_HAVE_NULL_VALUES);
+						stats.Set(packets > nulls ? StatsInfo::CAN_HAVE_VALID_VALUES
+						                          : StatsInfo::CANNOT_HAVE_VALID_VALUES);
+						if (packets > nulls) {
+							NumericStats::SetMin(stats, old.row[IC_MIN]);
+							NumericStats::SetMax(stats, old.row[IC_MAX]);
+						}
+						exclude = packets == 0 ||
+						          time_filter->CheckStatistics(stats) == FilterPropagateResult::FILTER_ALWAYS_FALSE;
+						reason = exclude ? "time excluded" : "time may match";
+					}
+				}
+			}
+		}
+		++reasons[reason];
+		if (!exclude)
+			selected.push_back(bind.selected_indices[n]);
+	}
+	return selected;
+}
+static InsertionOrderPreservingMap<string> CatalogDynamicToString(TableFunctionDynamicToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	if (!input.global_state || input.bind_data->Cast<PcapBindData>().catalog.empty())
+		return result;
+	auto &global = input.global_state->Cast<PcapGlobalState>();
+	result["Runtime Selected Files"] = StringUtil::Format("%llu", global.selected_indices.size());
+	for (auto &reason : global.catalog_reasons)
+		result["Catalog: " + reason.first] = StringUtil::Format("%llu", reason.second);
+	return result;
+}
+static void AddCatalogOptions(TableFunction &function) {
+	function.named_parameters["catalog"] = LogicalType::VARCHAR;
+	function.named_parameters["catalog_validation"] = LogicalType::VARCHAR;
+	function.dynamic_to_string = CatalogDynamicToString;
+}
+
 static vector<Value> InventoryOne(ClientContext &context, const InventoryBindData &bind, InventoryGlobalState &global,
                                   idx_t index) {
 	vector<LogicalType> types;
@@ -3137,6 +3334,7 @@ static TableFunction ReadPcapFunction() {
 	function.supports_pushdown_type = SupportsPacketFilter;
 	function.pushdown_complex_filter = NormalizePacketFilters;
 	AddCaptureOptions(function);
+	AddCatalogOptions(function);
 	return function;
 }
 
@@ -3181,6 +3379,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	packets.supports_pushdown_type = SupportsPacketFilter;
 	packets.pushdown_complex_filter = NormalizePacketFilters;
 	AddCaptureOptions(packets);
+	AddCatalogOptions(packets);
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(packets));
 	TableFunction dns("read_dns", {LogicalType::VARCHAR}, PcapScan, BindCapture<DnsBind>, PcapInit, PcapInitLocal);
 	dns.projection_pushdown = true;
@@ -3190,6 +3389,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	dns.supports_pushdown_type = SupportsPacketFilter;
 	dns.pushdown_complex_filter = NormalizePacketFilters;
 	AddCaptureOptions(dns);
+	AddCatalogOptions(dns);
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(dns));
 	TableFunction messages("read_dns_messages", {LogicalType::VARCHAR}, DnsMessagesScan, BindCapture<DnsMessagesBind>,
 	                       DnsMessagesInit, StreamInitLocal);

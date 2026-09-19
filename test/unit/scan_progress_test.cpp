@@ -143,14 +143,20 @@ int main() {
 	};
 	SQL(connection, "SET enable_progress_bar_print=true");
 	SQL(connection, "SET progress_bar_time=0");
-	for (const auto *function : {"read_pcap", "read_packets", "read_dns", "read_flows", "capture_inventory"}) {
+	SQL(connection, "CREATE TABLE progress_catalog AS SELECT * FROM capture_inventory('" + capture.string() + "')");
+	for (const auto *function :
+	     {"read_pcap", "read_packets", "read_dns", "read_flows", "capture_inventory", "catalog_packets"}) {
 		for (const auto threads : {1, 4}) {
 			std::cout << function << " threads=" << threads << std::endl;
 			SQL(connection, "SET threads=" + std::to_string(threads));
 			displayed.clear();
 			finished = false;
-			SQL(connection, "SELECT count(*) FROM " + std::string(function) + "(['" + capture.string() + "','" +
-			                    capture.string() + "'])");
+			const bool catalog = std::string(function) == "catalog_packets";
+			SQL(connection,
+			    "SELECT count(*) FROM " + std::string(catalog ? "read_packets" : function) + "(['" + capture.string() +
+			        "','" + capture.string() + "']" +
+			        (catalog ? ",catalog='progress_catalog',catalog_validation='immutable') WHERE timestamp IS NOT NULL"
+			                 : ")"));
 			Require(finished, "Query progress display did not finish");
 			bool intermediate = false;
 			double last = 0;

@@ -166,3 +166,5 @@ See [session semantics, schema, and resource limits](docs/FLOWS.md).
 
 Use `capture_inventory` to inspect capture metadata and explicitly refresh a stored
 catalog. See [identity, refresh, and error semantics](docs/CAPTURE_INVENTORY.md).
+Packet readers can use [catalog-assisted time selection](docs/CATALOG_PRUNING.md)
+with an explicit immutable-archive guarantee.
