@@ -1,0 +1,135 @@
+# name: test/sql/capture_inventory.test
+# description: Complete file inventory, null statistics, protocol scope and catalog refresh
+# group: [sql]
+
+require packetquapture
+
+query IIIIITT
+SELECT packet_count,captured_bytes,reported_bytes,timestamp_null_count,input_index,tcp_packets IS NULL,scan_status FROM capture_inventory('test/data/flows/tcp.pcap');
+----
+9	486	486	0	1	true	complete
+
+query IIIIIIII
+SELECT packet_count,ipv4_packets,ipv6_packets,tcp_packets,udp_packets,malformed_packets,unsupported_packets,fragment_packets FROM capture_inventory('test/data/protocols/ethernet.pcap',detail='protocols');
+----
+34	14	8	4	6	14	6	4
+
+query TTT
+SELECT min_timestamp=TIMESTAMP '1970-01-01', max_timestamp=TIMESTAMP '1970-01-01 00:00:00.00004',metadata_unchanged FROM capture_inventory('test/data/flows/udp.pcap');
+----
+true	true	true
+
+query IITTT
+SELECT packet_count,timestamp_null_count,min_timestamp IS NULL,max_timestamp IS NULL,link_types::VARCHAR FROM capture_inventory('test/data/inventory/*') ORDER BY filename;
+----
+2	2	true	true	[1, 101, 276]
+0	0	true	true	[101]
+0	0	true	true	[1, 101, 276]
+
+query IIT
+SELECT input_index,packet_count,scan_status FROM capture_inventory(['test/data/flows/tcp.pcap','test/data/flows/tcp.pcap']) ORDER BY input_index;
+----
+1	9	complete
+2	9	complete
+
+query TTTTT
+SELECT scan_status,packet_count IS NULL,captured_bytes IS NULL,link_types IS NULL,scan_error IS NOT NULL FROM capture_inventory(['test/data/not-a-capture.bin','test/data/missing-inventory.pcap'],on_error='report') ORDER BY input_index;
+----
+error	true	true	true	true
+error	true	true	true	true
+
+statement error
+SELECT * FROM capture_inventory('test/data/not-a-capture.bin');
+----
+not a PCAP or PCAPNG
+
+statement error
+SELECT * FROM capture_inventory('test/data/flows/tcp.pcap',detail='unknown');
+----
+detail must be
+
+statement error
+SELECT * FROM capture_inventory('test/data/flows/tcp.pcap',on_error=NULL);
+----
+must not be NULL
+
+statement ok
+CREATE TEMP TABLE old_inventory AS SELECT * FROM capture_inventory('test/data/flows/tcp.pcap',detail='protocols');
+
+query TIT
+SELECT reused,packet_count,reuse_reason FROM capture_inventory('test/data/flows/tcp.pcap',previous_catalog='old_inventory',detail='protocols');
+----
+false	9	strict_requires_scan
+
+query TIT
+SELECT reused,packet_count,udp_packets IS NULL FROM capture_inventory('test/data/flows/tcp.pcap',previous_catalog='old_inventory',catalog_validation='immutable');
+----
+true	9	true
+
+statement ok
+INSERT INTO old_inventory SELECT * FROM old_inventory;
+
+query I
+SELECT count(*) FROM capture_inventory('test/data/flows/tcp.pcap',previous_catalog='old_inventory',catalog_validation='immutable') WHERE reused;
+----
+1
+
+statement ok
+UPDATE old_inventory SET semantic_version=99;
+
+query T
+SELECT reused FROM capture_inventory('test/data/flows/tcp.pcap',previous_catalog='old_inventory',catalog_validation='immutable');
+----
+false
+
+statement ok
+DROP TABLE old_inventory;
+
+statement ok
+CREATE TABLE bad_inventory(filename VARCHAR);
+
+statement error
+SELECT * FROM capture_inventory('test/data/flows/tcp.pcap',previous_catalog='bad_inventory');
+----
+column
+
+statement ok
+DROP TABLE bad_inventory;
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE full_inventory AS SELECT * FROM capture_inventory(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/flows/scopes.pcapng','test/data/flows/tcp.pcap'],detail='protocols');
+
+statement ok
+CREATE TEMP TABLE reference_inventory AS SELECT * EXCLUDE(inventory_time,source_scan_time) FROM full_inventory;
+
+foreach workers 1 2 4 8
+
+statement ok
+SET threads=${workers};
+
+query I
+SELECT count(*) FROM ((SELECT * EXCLUDE(inventory_time,source_scan_time) FROM capture_inventory(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/flows/scopes.pcapng','test/data/flows/tcp.pcap'],detail='protocols') EXCEPT ALL SELECT * FROM reference_inventory) UNION ALL (SELECT * FROM reference_inventory EXCEPT ALL SELECT * EXCLUDE(inventory_time,source_scan_time) FROM capture_inventory(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/flows/scopes.pcapng','test/data/flows/tcp.pcap'],detail='protocols')));
+----
+0
+
+query IT
+SELECT count(*),bool_and(reused) FROM capture_inventory(['test/data/flows/tcp.pcap','test/data/flows/udp.pcap','test/data/flows/scopes.pcapng','test/data/flows/tcp.pcap'],detail='protocols',previous_catalog='full_inventory',catalog_validation='immutable');
+----
+4	true
+
+endloop
+
+statement ok
+DROP TABLE reference_inventory;
+
+statement ok
+DROP TABLE full_inventory;
+
+# Framing totals match the existing packet reader, including missing timestamps.
+query TTTT
+WITH i AS (SELECT * FROM capture_inventory('test/data/flows/scopes.pcapng')), p AS (SELECT count(*) n,sum(captured_length) c,sum(original_length) o,count(*)-count(timestamp) missing FROM read_pcap('test/data/flows/scopes.pcapng')) SELECT i.packet_count=p.n,i.captured_bytes=p.c,i.reported_bytes=p.o,i.timestamp_null_count=p.missing FROM i,p;
+----
+true	true	true	true

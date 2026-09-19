@@ -1,0 +1,74 @@
+{
+  "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           39 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  8\nOn-line CPU(s) list:                     0-7\nVendor ID:                               GenuineIntel\nModel name:                              12th Gen Intel(R) Core(TM) i9-12900HK\nCPU family:                              6\nModel:                                   154\nThread(s) per core:                      2\nCore(s) per socket:                      4\nSocket(s):                               1\nStepping:                                3\nBogoMIPS:                                5836.79\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology tsc_reliable nonstop_tsc cpuid tsc_known_freq pni pclmulqdq vmx ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves avx_vnni vnmi umip waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize flush_l1d arch_capabilities\nVirtualization:                          VT-x\nHypervisor vendor:                       Microsoft\nVirtualization type:                     full\nL1d cache:                               192 KiB (4 instances)\nL1i cache:                               128 KiB (4 instances)\nL2 cache:                                5 MiB (4 instances)\nL3 cache:                                24 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-7\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Mitigation; Clear Register File\nVulnerability Retbleed:                  Mitigation; Enhanced IBRS\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n",
+  "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+  "commit": "c93e68b8dc6361af99c7a3f548c68e694b1057b5",
+  "cache": "Local OS cache uncontrolled; synthetic files just written; no cold-cache or speedup claim",
+  "threads": 4,
+  "packets_per_file": 1000,
+  "runs": [
+    {
+      "files": 16,
+      "bytes_before_update": 976384,
+      "first_seconds": 0.018269356980454177,
+      "unchanged_seconds": 0.004872732009971514,
+      "strict_seconds": 0.0175191430025734,
+      "one_file_update_seconds": 0.005487713002366945
+    },
+    {
+      "files": 128,
+      "bytes_before_update": 7811072,
+      "first_seconds": 0.10466335297678597,
+      "unchanged_seconds": 0.01741821301402524,
+      "strict_seconds": 0.10790002599242143,
+      "one_file_update_seconds": 0.016685492009855807
+    },
+    {
+      "files": 512,
+      "bytes_before_update": 31244288,
+      "first_seconds": 0.4295826909947209,
+      "unchanged_seconds": 0.05814284601365216,
+      "strict_seconds": 0.44876914998167194,
+      "one_file_update_seconds": 0.06160403200192377
+    }
+  ],
+  "identity_probes": [
+    {
+      "backend": "http",
+      "endpoint": "loopback synthetic range server (not an actual S3 or MinIO service)",
+      "identity_type": "HTTPFileSystem",
+      "identity_strength": "weak",
+      "has_tag": "true",
+      "has_size": "true",
+      "has_mtime": "true",
+      "first_head": 1,
+      "first_get": 5,
+      "first_body_bytes": 72,
+      "reuse_head": 1,
+      "reuse_get": 0,
+      "reuse_body_bytes": 0
+    },
+    {
+      "backend": "s3",
+      "endpoint": "loopback synthetic range server (not an actual S3 or MinIO service)",
+      "identity_type": "S3FileSystem",
+      "identity_strength": "weak",
+      "has_tag": "true",
+      "has_size": "true",
+      "has_mtime": "true",
+      "first_head": 1,
+      "first_get": 5,
+      "first_body_bytes": 72,
+      "reuse_head": 1,
+      "reuse_get": 0,
+      "reuse_body_bytes": 0
+    }
+  ],
+  "build": [
+    "CMAKE_BUILD_TYPE:STRING=Release",
+    "CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG",
+    "ENABLE_THREAD_SANITIZER:BOOL=OFF",
+    "RELEASE_SANITIZER:BOOL=OFF"
+  ],
+  "duckdb_version": "v1.5.5"
+}
