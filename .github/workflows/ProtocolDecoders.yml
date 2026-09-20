@@ -22,6 +22,7 @@ jobs:
           python3 scripts/generate_partition_captures.py
           python3 scripts/generate_flow_captures.py
           python3 scripts/generate_inventory_captures.py
+          python3 scripts/generate_tls_captures.py
           git diff --exit-code -- test/data
       - name: Build standalone decoder with sanitizers
         run: |
@@ -39,6 +40,14 @@ jobs:
             -Isrc/include src/dns_decoder.cpp test/unit/dns_decoder_test.cpp \
             -o build/dns_decoder_test
           ./build/dns_decoder_test
+
+      - name: Build and test TLS record parsing with sanitizers
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -g -O1 \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Isrc/include src/tls_record.cpp test/unit/tls_record_test.cpp \
+            -o build/tls_record_test
+          ./build/tls_record_test
 
       - name: Build and test protocol-independent TCP reassembly
         run: |

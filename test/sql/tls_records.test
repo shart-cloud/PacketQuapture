@@ -1,0 +1,83 @@
+# name: test/sql/tls_records.test
+# description: single-packet TLS record fields on read_packets
+# group: [sql]
+
+require packetquapture
+
+# A ClientHello with SNI, its ServerHello, and an application-data record.
+query IIIIII
+SELECT packet_number, is_tls, tls_record_type, tls_record_version, tls_handshake_type, tls_sni
+FROM read_packets('test/data/tls/handshake.pcap') ORDER BY packet_number;
+----
+1	true	22	769	1	example.com
+2	true	22	769	2	NULL
+3	true	23	771	NULL	NULL
+
+# tls_truncated separates "no SNI in this ClientHello" from "ClientHello
+# continues past this packet", so a NULL tls_sni does not always mean the
+# reassembled reader would find more.
+query II
+SELECT tls_sni, tls_truncated FROM read_packets('test/data/tls/no_sni.pcap');
+----
+NULL	false
+
+query II
+SELECT tls_sni, tls_truncated FROM read_packets('test/data/tls/no_extensions.pcap');
+----
+NULL	false
+
+query II
+SELECT tls_sni, tls_truncated FROM read_packets('test/data/tls/truncated.pcap');
+----
+NULL	true
+
+# tls_truncated is NULL where nothing could have been truncated.
+query III
+SELECT tls_record_type, tls_handshake_type, tls_truncated
+FROM read_packets('test/data/tls/handshake.pcap') WHERE packet_number = 3;
+----
+23	NULL	NULL
+
+# Non-TLS packets are kept as rows with is_tls false, unlike read_dns which
+# drops packets that do not match.
+query IIII
+SELECT packet_number, dst_port, is_tls, tls_record_type
+FROM read_packets('test/data/tls/not_tls.pcap') ORDER BY packet_number;
+----
+1	80	false	NULL
+2	443	false	NULL
+
+query I
+SELECT count(*) FROM read_packets('test/data/tls/not_tls.pcap');
+----
+2
+
+# Detection is by record shape, not by port.
+query II
+SELECT dst_port, tls_sni FROM read_packets('test/data/tls/alt_port.pcap');
+----
+8443	example.com
+
+# Packets with no TCP payload, and UDP packets, are never TLS.
+query I
+SELECT count(*) FILTER (WHERE is_tls) FROM read_packets('test/data/dns/response.pcapng');
+----
+0
+
+# Filters on TLS columns push down and still select the right rows.
+query II
+SELECT packet_number, tls_sni FROM read_packets('test/data/tls/handshake.pcap')
+WHERE tls_handshake_type = 1;
+----
+1	example.com
+
+query I
+SELECT count(*) FROM read_packets('test/data/tls/handshake.pcap') WHERE is_tls;
+----
+3
+
+# read_dns keeps its own columns alongside the TLS ones.
+query II
+SELECT dns_valid, is_tls FROM read_dns('test/data/dns/response.pcapng');
+----
+true	false
