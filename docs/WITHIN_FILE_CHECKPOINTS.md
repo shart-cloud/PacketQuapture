@@ -170,15 +170,24 @@ stable — a workload this study has not observed in real captures, only constru
 
 Proposed order:
 
-1. Fix the per-record traversal: bulk header reads, and stop seeking past payloads when
-   the gap is small enough that reading it is cheaper. Re-run this benchmark unchanged
-   to quantify it. This is independently reviewable and has no metadata contract.
+1. **Done.** Fix the per-record traversal: bulk header reads, and stop seeking past
+   payloads when the gap is small enough that reading it is cheaper. See
+   [local record traversal](RECORD_TRAVERSAL.md) for the behaviour and its measured
+   effect, recorded by re-running this benchmark unchanged.
 2. Re-measure the remaining headroom against the new baseline, and gather real capture
    shapes — packet-size distribution, timestamp ordering, query selectivity and repeat
    rate. The decision to index depends on whether real captures resemble
    `mixed_payloads` or `unsorted_control`, and this study cannot answer that.
 3. Only if step 2 still shows worthwhile headroom, prototype checkpoints for classic
    PCAP under the correctness requirements above, with PCAPNG deferred.
+
+Step 1 moved the baseline that step 3 must now beat. Selective queries warm are 1.7×
+to 2.1× faster on the packet-dense shapes, and an inventory refresh of `small_payloads`
+is 5.0× faster, so the absolute saving still available to checkpoints on those shapes
+has shrunk by about half. The per-packet pipeline work that only region skipping can
+remove is now the larger share of what remains. `large_payloads` is unchanged, and the
+cold sparse pathology this study identified is still open: it was not addressed by step
+1 and is not a checkpoint question either.
 
 Do not turn region statistics into optimizer bounds or cached `EMPTY_RESULT` plans;
 the same weak-identity argument that keeps catalog counts out of the optimizer applies

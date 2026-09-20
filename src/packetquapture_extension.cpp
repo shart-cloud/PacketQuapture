@@ -63,6 +63,13 @@ namespace {
 
 // Bound each remote reader pin; the remaining windows are evictable in DuckDB's shared cache.
 constexpr idx_t REMOTE_READ_WINDOW_SIZE = 4ULL * 1024ULL * 1024ULL;
+// Local captures are traversed one record header at a time. Serving those headers from a
+// window turns a read and a seek per packet into one positioned read per window.
+constexpr idx_t LOCAL_READ_WINDOW_SIZE = 256ULL * 1024ULL;
+// Payload gaps at or below this share pages with the headers around them, so reading
+// through costs less than the syscall saved by skipping. Larger payloads are still
+// skipped exactly, which keeps sparse metadata scans off the payload bytes.
+constexpr idx_t LOCAL_SKIP_THRESHOLD = 4ULL * 1024ULL;
 constexpr idx_t MAX_CAPTURED_PACKET_SIZE = 256ULL * 1024ULL * 1024ULL;
 constexpr idx_t MAX_INTERFACE_BLOCK_SIZE = 16ULL * 1024ULL * 1024ULL;
 constexpr uint32_t PCAPNG_INTERFACE_DESCRIPTION = 0x00000001;
@@ -206,6 +213,7 @@ public:
 				can_skip_by_seek = true;
 			}
 		}
+		buffer_locally = can_skip_by_seek && !cached_handle && !FileSystem::IsRemoteFile(file.path);
 		if (progress) {
 			progress->CheckSize(file_index, can_skip_by_seek, seekable_size);
 		}
@@ -277,6 +285,39 @@ private:
 		const auto within_window = offset - window_start;
 		const auto count = MinValue<idx_t>(length, window_length - within_window);
 		memcpy(buffer, window_data + within_window, count);
+		return count;
+	}
+
+	// Positioned reads keep the window independent of the handle cursor, so a skipped
+	// payload costs no syscall at all: only `position` moves.
+	idx_t ReadLocalWindow(void *buffer, idx_t length, uint64_t offset) {
+		if (offset >= seekable_size) {
+			return 0;
+		}
+		if (!window_worthwhile) {
+			// Sparse traversal, and every scan until a small gap proves otherwise. Reading
+			// through the handle cursor keeps the kernel's sequential readahead engaged:
+			// positioned reads at a header-sized stride measured materially slower, and
+			// filling a window here would read payload bytes this scan never wants.
+			return NumericCast<idx_t>(RawHandle().Read(buffer, length));
+		}
+		const bool cached = local_length > 0 && offset >= local_start && offset - local_start < local_length;
+		if (!cached) {
+			if (length >= LOCAL_READ_WINDOW_SIZE) {
+				const auto direct = MinValue<idx_t>(length, seekable_size - offset);
+				fs.Read(*handle, buffer, NumericCast<int64_t>(direct), offset);
+				return direct;
+			}
+			if (!local_window) {
+				local_window = make_unsafe_uniq_array<data_t>(LOCAL_READ_WINDOW_SIZE);
+			}
+			local_start = offset;
+			local_length = MinValue<idx_t>(LOCAL_READ_WINDOW_SIZE, seekable_size - offset);
+			fs.Read(*handle, local_window.get(), NumericCast<int64_t>(local_length), local_start);
+		}
+		const auto within_window = offset - local_start;
+		const auto count = MinValue<idx_t>(length, local_length - within_window);
+		memcpy(buffer, local_window.get() + within_window, count);
 		return count;
 	}
 
@@ -687,9 +728,14 @@ private:
 				throw InterruptException();
 			}
 			auto destination = static_cast<uint8_t *>(buffer) + total;
-			const auto bytes_read = cached_handle && can_skip_by_seek
-			                            ? ReadRemoteWindow(destination, length - total, position + total)
-			                            : NumericCast<idx_t>(RawHandle().Read(destination, length - total));
+			idx_t bytes_read;
+			if (cached_handle && can_skip_by_seek) {
+				bytes_read = ReadRemoteWindow(destination, length - total, position + total);
+			} else if (buffer_locally) {
+				bytes_read = ReadLocalWindow(destination, length - total, position + total);
+			} else {
+				bytes_read = NumericCast<idx_t>(RawHandle().Read(destination, length - total));
+			}
 			if (bytes_read == 0) {
 				if (total == 0) {
 					return false;
@@ -717,7 +763,17 @@ private:
 			if (position > seekable_size || length > seekable_size - position) {
 				throw IOException("Unexpected end of '%s' while reading %s", file.path, description);
 			}
-			if (!cached_handle) {
+			if (buffer_locally) {
+				// A gap this small shares pages with the headers around it, so upcoming
+				// records are worth windowing. A wider gap returns the scan to cursor
+				// reads, which keeps sparse metadata traversals off the payload bytes.
+				window_worthwhile = length <= LOCAL_SKIP_THRESHOLD;
+				if (!window_worthwhile) {
+					// Window refills are positioned and leave the cursor behind; restore
+					// it before the next cursor read.
+					handle->Seek(position + length);
+				}
+			} else if (!cached_handle) {
 				handle->Seek(position + length);
 			}
 			position += length;
@@ -744,6 +800,10 @@ private:
 	BufferHandle window;
 	data_ptr_t window_data = nullptr;
 	idx_t window_start = 0, window_length = 0;
+	unsafe_unique_array<data_t> local_window;
+	idx_t local_start = 0, local_length = 0;
+	bool buffer_locally = false;
+	bool window_worthwhile = false;
 	const ScanOptions &options;
 	CaptureProgress *progress;
 	uint64_t published_position = 0;
