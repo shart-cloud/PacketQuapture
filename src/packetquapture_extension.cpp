@@ -19,6 +19,7 @@
 #include "duckdb/common/types/interval.hpp"
 #include "packet_decoder.hpp"
 #include "dns_decoder.hpp"
+#include "tls_record.hpp"
 #include "tcp_reassembly.hpp"
 #include "dns_tcp_framer.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -95,6 +96,7 @@ struct PacketRecord {
 	uint32_t section_number = 0;
 	packetquapture::DecodedPacket decoded;
 	packetquapture::DnsMessage dns;
+	packetquapture::TlsRecord tls;
 	bool selected = true;
 };
 
@@ -136,8 +138,9 @@ enum ColumnStage : uint8_t {
 	STAGE_NETWORK = 2,
 	STAGE_TRANSPORT = 3,
 	STAGE_DNS = 4,
-	STAGE_PACKET_DATA = 5,
-	STAGE_COUNT = 6,
+	STAGE_TLS = 5,
+	STAGE_PACKET_DATA = 6,
+	STAGE_COUNT = 7,
 };
 
 static_assert(static_cast<unsigned>(packetquapture::DecodeDepth::LINK) == STAGE_LINK &&
@@ -145,11 +148,25 @@ static_assert(static_cast<unsigned>(packetquapture::DecodeDepth::LINK) == STAGE_
                   static_cast<unsigned>(packetquapture::DecodeDepth::TRANSPORT) == STAGE_TRANSPORT,
               "stages 1-3 are cast to DecodeDepth");
 
+// read_packets appends the TLS columns after the decoded packet columns, and
+// read_dns appends its own after those. Value dispatch is index-based, so the
+// boundaries live here rather than as literals at each site.
+static const column_t PACKET_COLUMN_COUNT = 11;
+static const column_t TLS_COLUMN_BEGIN = 40;
+static const column_t TLS_COLUMN_COUNT = 6;
+static const column_t DNS_COLUMN_BEGIN = TLS_COLUMN_BEGIN + TLS_COLUMN_COUNT;
+static const column_t DNS_COLUMN_COUNT = 14;
+// read_dns_messages keeps the same dns_* columns but puts them after its own
+// per-message columns, so it remaps into the block above.
+static const column_t MESSAGE_DNS_COLUMN_BEGIN = 20;
+static const column_t MESSAGE_DNS_COLUMN_END = MESSAGE_DNS_COLUMN_BEGIN + DNS_COLUMN_COUNT;
+
 struct ScanOptions {
 	bool materialize_packet_data = false;
 	bool flow_scan = false;
 	bool inventory_scan = false;
 	bool dns_scan = false, decode_dns = false;
+	bool decode_tls = false;
 	bool reassemble_dns = false, reassemble_tcp = false;
 	packetquapture::DecodeDepth decode_depth = packetquapture::DecodeDepth::NONE;
 	std::array<bool, STAGE_COUNT> filter_stages {};
@@ -663,7 +680,19 @@ private:
 					record.dns = packetquapture::DecodeDns(message, message_length);
 				}
 			}
-			if (!accept(4)) {
+			if (!accept(STAGE_DNS)) {
+				Skip(length - source.Consumed(), "packet data");
+				return;
+			}
+		}
+		if (options.decode_tls) {
+			const auto &packet = record.decoded;
+			// TLS runs over TCP; DTLS frames differently and is not parsed here.
+			if (packet.transport && packet.tcp && packet.payload_length > 0) {
+				const auto *bytes = source.ReadPrefix(packet.payload_offset + packet.payload_length);
+				record.tls = packetquapture::DecodeTlsRecord(bytes + packet.payload_offset, packet.payload_length);
+			}
+			if (!accept(STAGE_TLS)) {
 				Skip(length - source.Consumed(), "packet data");
 				return;
 			}
@@ -671,7 +700,7 @@ private:
 		if (options.materialize_packet_data) {
 			source.ReadPrefix(length);
 			record.packet_data = source.TakeBytes();
-			accept(5);
+			accept(STAGE_PACKET_DATA);
 		} else {
 			Skip(length - source.Consumed(), "packet data");
 		}
@@ -1040,6 +1069,15 @@ static unique_ptr<FunctionData> PacketsBind(ClientContext &context, TableFunctio
 	      {"tcp_ece", LogicalType::BOOLEAN},
 	      {"tcp_cwr", LogicalType::BOOLEAN}}},
 	};
+	// Parsed from the TCP payload of each packet on its own, with no reassembly:
+	// a field needing bytes from another segment is reported absent, and
+	// tls_truncated says whether it was absent or merely out of reach.
+	const vector<std::pair<string, LogicalType>> tls = {{"is_tls", LogicalType::BOOLEAN},
+	                                                    {"tls_record_type", LogicalType::UTINYINT},
+	                                                    {"tls_record_version", LogicalType::USMALLINT},
+	                                                    {"tls_handshake_type", LogicalType::UTINYINT},
+	                                                    {"tls_sni", LogicalType::VARCHAR},
+	                                                    {"tls_truncated", LogicalType::BOOLEAN}};
 	auto &bind = result->Cast<PcapBindData>();
 	for (const auto &group : decoded) {
 		for (const auto &column : group.second) {
@@ -1048,6 +1086,14 @@ static unique_ptr<FunctionData> PacketsBind(ClientContext &context, TableFunctio
 		}
 		bind.AppendStages(group.first, group.second.size());
 	}
+	if (return_types.size() != TLS_COLUMN_BEGIN || tls.size() != TLS_COLUMN_COUNT) {
+		throw InternalException("read_packets column layout does not match the declared TLS boundaries");
+	}
+	for (const auto &column : tls) {
+		names.push_back(column.first);
+		return_types.push_back(column.second);
+	}
+	bind.AppendStages(STAGE_TLS, tls.size());
 	bind.types = return_types;
 	return result;
 }
@@ -1250,6 +1296,9 @@ static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, Tab
 		}
 		if (stage == STAGE_DNS) {
 			options.decode_dns = true;
+		}
+		if (stage == STAGE_TLS) {
+			options.decode_tls = true;
 		}
 		if (stage == STAGE_PACKET) {
 			continue;
@@ -1487,21 +1536,71 @@ static Value DnsRecordsValue(const std::vector<packetquapture::DnsRecord> &recor
 	return Value::LIST(DnsRecordType(), values);
 }
 
+// A packet that carries no TLS record still produces a row: is_tls is false and
+// every other column is NULL, unlike read_dns which drops non-matching packets.
+static void SetTlsValue(Vector &vector, idx_t row, column_t slot, const packetquapture::TlsRecord &tls) {
+	switch (slot) {
+	case 0:
+		SetDecodedScalar(vector, row, tls.valid);
+		return;
+	case 1:
+		if (tls.valid) {
+			SetDecodedScalar(vector, row, tls.record_type);
+			return;
+		}
+		break;
+	case 2:
+		if (tls.valid) {
+			SetDecodedScalar(vector, row, tls.record_version);
+			return;
+		}
+		break;
+	case 3:
+		if (tls.has_handshake_type) {
+			SetDecodedScalar(vector, row, tls.handshake_type);
+			return;
+		}
+		break;
+	case 4:
+		if (tls.has_server_name) {
+			vector.SetValue(row, tls.server_name);
+			return;
+		}
+		break;
+	case 5:
+		// Only meaningful for a ClientHello: elsewhere there is nothing whose
+		// absence could be explained by the record continuing.
+		if (tls.client_hello) {
+			SetDecodedScalar(vector, row, tls.truncated);
+			return;
+		}
+		break;
+	default:
+		throw InternalException("Unexpected TLS column slot %d", slot);
+	}
+	FlatVector::SetNull(vector, row, true);
+}
+
 static void SetRecordValue(Vector &vector, idx_t row, column_t column, const PacketRecord &record) {
-	if (column < 11) {
+	if (column < PACKET_COLUMN_COUNT) {
 		SetOutputValue(vector, row, column, record);
 		return;
 	}
-	if (column < 40) {
+	if (column < TLS_COLUMN_BEGIN) {
 		SetDecodedValue(vector, row, column, record.decoded);
 		return;
 	}
+	if (column < DNS_COLUMN_BEGIN) {
+		SetTlsValue(vector, row, column - TLS_COLUMN_BEGIN, record.tls);
+		return;
+	}
+	const auto dns_column = column - DNS_COLUMN_BEGIN;
 	const auto &dns = record.dns;
-	if (column == 40) {
+	if (dns_column == 0) {
 		SetDecodedScalar(vector, row, dns.valid);
 		return;
 	}
-	if (column == 53) {
+	if (dns_column == 13) {
 		if (dns.error.empty()) {
 			FlatVector::SetNull(vector, row, true);
 		} else {
@@ -1509,36 +1608,36 @@ static void SetRecordValue(Vector &vector, idx_t row, column_t column, const Pac
 		}
 		return;
 	}
-	if (!dns.valid || (column >= 46 && column <= 48 && dns.questions.empty())) {
+	if (!dns.valid || (dns_column >= 6 && dns_column <= 8 && dns.questions.empty())) {
 		FlatVector::SetNull(vector, row, true);
 		return;
 	}
-	switch (column) {
-	case 41:
+	switch (dns_column) {
+	case 1:
 		SetDecodedScalar(vector, row, dns.id);
 		break;
-	case 42:
+	case 2:
 		SetDecodedScalar(vector, row, dns.response);
 		break;
-	case 43:
+	case 3:
 		SetDecodedScalar(vector, row, dns.opcode);
 		break;
-	case 44:
+	case 4:
 		SetDecodedScalar(vector, row, dns.rcode);
 		break;
-	case 45:
+	case 5:
 		SetDecodedScalar(vector, row, dns.truncated);
 		break;
-	case 46:
+	case 6:
 		vector.SetValue(row, dns.questions[0].name);
 		break;
-	case 47:
+	case 7:
 		SetDecodedScalar(vector, row, dns.questions[0].type);
 		break;
-	case 48:
+	case 8:
 		SetDecodedScalar(vector, row, dns.questions[0].klass);
 		break;
-	case 49: {
+	case 9: {
 		duckdb::vector<Value> questions;
 		for (const auto &question : dns.questions) {
 			questions.push_back(Value::STRUCT(DnsQuestionType(), {Value(question.name), Value::USMALLINT(question.type),
@@ -1547,13 +1646,13 @@ static void SetRecordValue(Vector &vector, idx_t row, column_t column, const Pac
 		vector.SetValue(row, Value::LIST(DnsQuestionType(), questions));
 		break;
 	}
-	case 50:
+	case 10:
 		vector.SetValue(row, DnsRecordsValue(dns.answers));
 		break;
-	case 51:
+	case 11:
 		vector.SetValue(row, DnsRecordsValue(dns.authorities));
 		break;
-	case 52:
+	case 12:
 		vector.SetValue(row, DnsRecordsValue(dns.additionals));
 		break;
 	default:
@@ -1859,8 +1958,10 @@ static bool NextStreamEvent(ClientContext &context, const PcapBindData &bind, St
 static unique_ptr<FunctionData> DnsMessagesBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &types, vector<string> &names) {
 	auto result = DnsBind(context, input, types, names);
-	vector<LogicalType> dns_types(types.begin() + 40, types.end());
-	vector<string> dns_names(names.begin() + 40, names.end());
+	// Keep the dns_* columns and drop the per-packet ones: this reader reports one
+	// row per reassembled message, not per packet.
+	vector<LogicalType> dns_types(types.begin() + DNS_COLUMN_BEGIN, types.end());
+	vector<string> dns_names(names.begin() + DNS_COLUMN_BEGIN, names.end());
 	names = {"filename",
 	         "section_number",
 	         "interface_id",
@@ -1906,7 +2007,7 @@ static unique_ptr<GlobalTableFunctionState> DnsMessagesInit(ClientContext &conte
 	state->options.reassemble_dns = true;
 	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
 	for (const auto column : state->columns) {
-		if (column >= 20 && column < 34) {
+		if (column >= MESSAGE_DNS_COLUMN_BEGIN && column < MESSAGE_DNS_COLUMN_END) {
 			state->decode_dns = true;
 		}
 	}
@@ -1916,8 +2017,8 @@ static unique_ptr<GlobalTableFunctionState> DnsMessagesInit(ClientContext &conte
 static void SetMessageValue(Vector &vector, idx_t row, column_t column, const string &filename,
                             const packetquapture::TcpDnsMessage &message, const PacketRecord &dns_record) {
 	const auto &key = message.key;
-	if (column >= 20 && column < 34) {
-		SetRecordValue(vector, row, column + 20, dns_record);
+	if (column >= MESSAGE_DNS_COLUMN_BEGIN && column < MESSAGE_DNS_COLUMN_END) {
+		SetRecordValue(vector, row, column - MESSAGE_DNS_COLUMN_BEGIN + DNS_COLUMN_BEGIN, dns_record);
 		return;
 	}
 	switch (column) {
