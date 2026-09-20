@@ -2,7 +2,7 @@
 
 `read_packets` decodes the TLS record at the start of each TCP payload and exposes six columns.
 Nothing here reassembles: every field comes from the bytes of one packet. The reassembled
-layer, `read_tls()`, is a separate function and is not yet implemented.
+layer is [`read_tls()`](TLS_HANDSHAKES.md), a separate function.
 
 ```sql
 SELECT src_ip, dst_ip, dst_port, tls_sni
@@ -73,4 +73,5 @@ not mention them reads exactly the bytes it read before, at every projection dep
 - Only the first record of a payload is parsed. Later records in the same packet are ignored.
 - Only the first handshake message of a record is identified.
 - The negotiated version, cipher suite, ALPN, certificate chain and JA3/JA4 fingerprints need
-  both directions and full reassembly. They belong to `read_tls()`.
+  both directions and full reassembly. They belong to
+  [`read_tls()`](TLS_HANDSHAKES.md).

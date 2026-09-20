@@ -1,0 +1,140 @@
+# name: test/sql/read_tls.test
+# description: per-handshake TLS reporting over the shared TCP reassembly core
+# group: [sql]
+
+require packetquapture
+
+# Both directions captured: the offered name and the selected parameters arrive
+# on one row.
+query IIIIIIIII
+SELECT client_ip, server_ip, client_port, server_port, handshake_number,
+       client_hello, server_hello, tls_sni, reassembly_status
+FROM read_tls('test/data/tls/session.pcap');
+----
+192.0.2.1	198.51.100.2	51000	443	1	true	true	example.com	complete
+
+query III
+SELECT client_version, negotiated_version, cipher_suite
+FROM read_tls('test/data/tls/session.pcap');
+----
+771	771	4865
+
+# A ClientHello split across two TLS records and two TCP segments. The
+# single-packet layer cannot see this name; reassembly is the point of read_tls.
+query II
+SELECT tls_sni, reassembly_status FROM read_tls('test/data/tls/split.pcap');
+----
+split.example.com	complete
+
+query I
+SELECT count(*) FILTER (WHERE tls_sni IS NOT NULL)
+FROM read_packets('test/data/tls/split.pcap');
+----
+0
+
+# Only the client direction was captured: the server columns stay NULL rather
+# than being guessed, and the row is marked one-sided.
+query IIIIII
+SELECT client_hello, server_hello, tls_sni, negotiated_version, cipher_suite, reassembly_status
+FROM read_tls('test/data/tls/client_only.pcap');
+----
+true	false	example.com	NULL	NULL	one-sided
+
+query I
+SELECT server_stream_id IS NULL FROM read_tls('test/data/tls/client_only.pcap');
+----
+true
+
+# Only the server direction was captured. The key is still oriented client to
+# server, so rows from either case line up in one report.
+query IIIIII
+SELECT client_ip, server_ip, client_port, client_hello, server_hello, reassembly_status
+FROM read_tls('test/data/tls/server_only.pcap');
+----
+192.0.2.1	198.51.100.2	51000	false	true	one-sided
+
+query II
+SELECT client_stream_id IS NULL, tls_sni IS NULL
+FROM read_tls('test/data/tls/server_only.pcap');
+----
+true	true
+
+# Renegotiation in the clear produces a numbered row per handshake.
+query III
+SELECT handshake_number, tls_sni, reassembly_status
+FROM read_tls('test/data/tls/renegotiated.pcap') ORDER BY handshake_number;
+----
+1	example.com	complete
+2	second.example.com	complete
+
+# Parsing stops at change_cipher_spec: records after it are encrypted, and the
+# bytes here would otherwise read as a second ClientHello.
+query II
+SELECT count(*), max(tls_sni) FROM read_tls('test/data/tls/encrypted_after_ccs.pcap');
+----
+1	example.com
+
+# TCP that is not TLS produces no rows at all.
+query I
+SELECT count(*) FROM read_tls('test/data/tls/plain_tcp.pcap');
+----
+0
+
+# Neither does traffic with no TCP payload.
+query I
+SELECT count(*) FROM read_tls('test/data/dns/response.pcapng');
+----
+0
+
+# With both directions and TLS 1.2, resumption is decidable: this client offered
+# no session id, so it is a full handshake rather than a resumption.
+query I
+SELECT session_resumed FROM read_tls('test/data/tls/session.pcap');
+----
+false
+
+# One direction alone cannot answer the question, so it is left NULL rather than
+# reported as a full handshake.
+query I
+SELECT session_resumed FROM read_tls('test/data/tls/client_only.pcap');
+----
+NULL
+
+# Reading several captures at once keeps each handshake with its own file.
+query II
+SELECT regexp_extract(filename, '[^/]+$'), tls_sni
+FROM read_tls(['test/data/tls/session.pcap', 'test/data/tls/split.pcap'])
+ORDER BY tls_sni;
+----
+session.pcap	example.com
+split.pcap	split.example.com
+
+# Provenance points at the packets that carried the handshake.
+query II
+SELECT first_packet_number <= last_packet_number, first_timestamp IS NOT NULL
+FROM read_tls('test/data/tls/session.pcap');
+----
+true	true
+
+# Results do not depend on the thread count.
+statement ok
+SET threads=4;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE reassembly_status = 'complete')
+FROM read_tls(['test/data/tls/session.pcap', 'test/data/tls/split.pcap',
+               'test/data/tls/renegotiated.pcap', 'test/data/tls/client_only.pcap',
+               'test/data/tls/server_only.pcap', 'test/data/tls/plain_tcp.pcap']);
+----
+6	4
+
+statement ok
+SET threads=1;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE reassembly_status = 'complete')
+FROM read_tls(['test/data/tls/session.pcap', 'test/data/tls/split.pcap',
+               'test/data/tls/renegotiated.pcap', 'test/data/tls/client_only.pcap',
+               'test/data/tls/server_only.pcap', 'test/data/tls/plain_tcp.pcap']);
+----
+6	4
