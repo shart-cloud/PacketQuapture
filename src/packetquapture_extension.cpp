@@ -126,24 +126,24 @@ static idx_t AlignTo32Bits(idx_t size) {
 
 static void SetRecordValue(Vector &vector, idx_t row, column_t column, const PacketRecord &record);
 
-static unsigned ColumnStage(column_t column) {
-	if (column == 9) {
-		return 5;
-	}
-	if (column >= 40) {
-		return 4;
-	}
-	if (column >= 23) {
-		return 3;
-	}
-	if (column >= 15) {
-		return 2;
-	}
-	if (column >= 11) {
-		return 1;
-	}
-	return 0;
-}
+// A column's stage names the work a scan must finish before the column can be
+// produced. Stages 1-3 mirror DecodeDepth and are cast to it; the others name
+// work that sits outside the decode ladder. Each bind records the stage of every
+// column it appends, so adding columns never shifts the meaning of existing ones.
+enum ColumnStage : uint8_t {
+	STAGE_PACKET = 0,
+	STAGE_LINK = 1,
+	STAGE_NETWORK = 2,
+	STAGE_TRANSPORT = 3,
+	STAGE_DNS = 4,
+	STAGE_PACKET_DATA = 5,
+	STAGE_COUNT = 6,
+};
+
+static_assert(static_cast<unsigned>(packetquapture::DecodeDepth::LINK) == STAGE_LINK &&
+                  static_cast<unsigned>(packetquapture::DecodeDepth::NETWORK) == STAGE_NETWORK &&
+                  static_cast<unsigned>(packetquapture::DecodeDepth::TRANSPORT) == STAGE_TRANSPORT,
+              "stages 1-3 are cast to DecodeDepth");
 
 struct ScanOptions {
 	bool materialize_packet_data = false;
@@ -152,14 +152,15 @@ struct ScanOptions {
 	bool dns_scan = false, decode_dns = false;
 	bool reassemble_dns = false, reassemble_tcp = false;
 	packetquapture::DecodeDepth decode_depth = packetquapture::DecodeDepth::NONE;
-	std::array<bool, 6> filter_stages {};
+	std::array<bool, STAGE_COUNT> filter_stages {};
 	std::function<bool(const PacketRecord &, unsigned)> matches;
 };
 
 class PacketFilter {
 public:
-	PacketFilter(ClientContext &context, column_t column_p, const LogicalType &type, const TableFilter &filter)
-	    : column(column_p), stage(ColumnStage(column_p)) {
+	PacketFilter(ClientContext &context, column_t column_p, unsigned stage_p, const LogicalType &type,
+	             const TableFilter &filter)
+	    : column(column_p), stage(stage_p) {
 		BoundReferenceExpression reference(type, 0);
 		expression = filter.ToExpression(reference);
 		executor = make_uniq<ExpressionExecutor>(context, *expression);
@@ -826,10 +827,21 @@ struct PcapBindData : public TableFunctionData {
 	vector<OpenFileInfo> files;
 	vector<idx_t> selected_indices;
 	vector<LogicalType> types;
+	// One entry per base column, in column order. Appended to by each bind.
+	vector<uint8_t> column_stages;
 	idx_t base_column_count = 0;
 	bool hive_partitioning = false;
 	vector<string> partition_keys;
 	vector<vector<Value>> partition_values;
+
+	void AppendStages(ColumnStage stage, idx_t count) {
+		column_stages.insert(column_stages.end(), count, static_cast<uint8_t>(stage));
+	}
+
+	// Partition and virtual columns sit past the base columns and decode nothing.
+	unsigned StageOf(column_t column) const {
+		return column < column_stages.size() ? column_stages[column] : STAGE_PACKET;
+	}
 
 	vector<OpenFileInfo> SelectedFiles() const {
 		vector<OpenFileInfo> result;
@@ -859,6 +871,7 @@ struct PcapBindData : public TableFunctionData {
 		auto result = make_uniq<PcapBindData>();
 		result->files = files;
 		result->types = types;
+		result->column_stages = column_stages;
 		result->selected_indices = selected_indices;
 		result->base_column_count = base_column_count;
 		result->hive_partitioning = hive_partitioning;
@@ -886,9 +899,10 @@ struct PcapBindData : public TableFunctionData {
 		    flow_limits.tcp_idle_us != other.flow_limits.tcp_idle_us ||
 		    flow_limits.udp_idle_us != other.flow_limits.udp_idle_us ||
 		    flow_limits.max_flows != other.flow_limits.max_flows || files.size() != other.files.size() ||
-		    types != other.types || dns_scan != other.dns_scan || selected_indices != other.selected_indices ||
-		    base_column_count != other.base_column_count || hive_partitioning != other.hive_partitioning ||
-		    partition_keys != other.partition_keys || partition_values.size() != other.partition_values.size()) {
+		    types != other.types || column_stages != other.column_stages || dns_scan != other.dns_scan ||
+		    selected_indices != other.selected_indices || base_column_count != other.base_column_count ||
+		    hive_partitioning != other.hive_partitioning || partition_keys != other.partition_keys ||
+		    partition_values.size() != other.partition_values.size()) {
 			return false;
 		}
 		for (idx_t i = 0; i < files.size(); i++) {
@@ -961,6 +975,15 @@ struct PcapLocalState : public LocalTableFunctionState {
 	unique_ptr<CaptureReader> reader;
 };
 
+static idx_t NamedColumn(const vector<string> &names, const char *name) {
+	for (idx_t i = 0; i < names.size(); ++i) {
+		if (names[i] == name) {
+			return i;
+		}
+	}
+	throw InternalException("capture bind has no column named %s", name);
+}
+
 static unique_ptr<FunctionData> PcapBind(ClientContext &context, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<PcapBindData>();
@@ -973,52 +996,59 @@ static unique_ptr<FunctionData> PcapBind(ClientContext &context, TableFunctionBi
 	                LogicalType::UINTEGER, LogicalType::UINTEGER, LogicalType::UINTEGER,  LogicalType::UBIGINT,
 	                LogicalType::VARCHAR,  LogicalType::BLOB,     LogicalType::UINTEGER};
 	result->types = return_types;
+	result->AppendStages(STAGE_PACKET, return_types.size());
+	result->column_stages[NamedColumn(names, "packet_data")] = STAGE_PACKET_DATA;
 	return std::move(result);
 }
 
 static unique_ptr<FunctionData> PacketsBind(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = PcapBind(context, input, return_types, names);
-	const vector<string> decoded_names = {"src_mac",
-	                                      "dst_mac",
-	                                      "ether_type",
-	                                      "vlan_ids",
-	                                      "ip_version",
-	                                      "src_ip",
-	                                      "dst_ip",
-	                                      "ip_protocol",
-	                                      "ip_ttl",
-	                                      "ip_fragment_offset",
-	                                      "ip_more_fragments",
-	                                      "ip_id",
-	                                      "src_port",
-	                                      "dst_port",
-	                                      "tcp_flags",
-	                                      "tcp_seq",
-	                                      "tcp_ack",
-	                                      "tcp_header_length",
-	                                      "udp_length",
-	                                      "payload_offset",
-	                                      "payload_length"};
-	const vector<LogicalType> decoded_types = {LogicalType::VARCHAR,   LogicalType::VARCHAR,
-	                                           LogicalType::USMALLINT, LogicalType::LIST(LogicalType::USMALLINT),
-	                                           LogicalType::UTINYINT,  LogicalType::VARCHAR,
-	                                           LogicalType::VARCHAR,   LogicalType::UTINYINT,
-	                                           LogicalType::UTINYINT,  LogicalType::UINTEGER,
-	                                           LogicalType::BOOLEAN,   LogicalType::UINTEGER,
-	                                           LogicalType::USMALLINT, LogicalType::USMALLINT,
-	                                           LogicalType::USMALLINT, LogicalType::UINTEGER,
-	                                           LogicalType::UINTEGER,  LogicalType::UTINYINT,
-	                                           LogicalType::USMALLINT, LogicalType::UINTEGER,
-	                                           LogicalType::UINTEGER};
-	names.insert(names.end(), decoded_names.begin(), decoded_names.end());
-	return_types.insert(return_types.end(), decoded_types.begin(), decoded_types.end());
-	for (const auto *name :
-	     {"tcp_fin", "tcp_syn", "tcp_rst", "tcp_psh", "tcp_ack_flag", "tcp_urg", "tcp_ece", "tcp_cwr"}) {
-		names.push_back(name);
-		return_types.push_back(LogicalType::BOOLEAN);
+	// Grouped by the decode stage that produces them, so a column added to a group
+	// takes that group's stage and no other column's stage moves.
+	const vector<std::pair<ColumnStage, vector<std::pair<string, LogicalType>>>> decoded = {
+	    {STAGE_LINK,
+	     {{"src_mac", LogicalType::VARCHAR},
+	      {"dst_mac", LogicalType::VARCHAR},
+	      {"ether_type", LogicalType::USMALLINT},
+	      {"vlan_ids", LogicalType::LIST(LogicalType::USMALLINT)}}},
+	    {STAGE_NETWORK,
+	     {{"ip_version", LogicalType::UTINYINT},
+	      {"src_ip", LogicalType::VARCHAR},
+	      {"dst_ip", LogicalType::VARCHAR},
+	      {"ip_protocol", LogicalType::UTINYINT},
+	      {"ip_ttl", LogicalType::UTINYINT},
+	      {"ip_fragment_offset", LogicalType::UINTEGER},
+	      {"ip_more_fragments", LogicalType::BOOLEAN},
+	      {"ip_id", LogicalType::UINTEGER}}},
+	    {STAGE_TRANSPORT,
+	     {{"src_port", LogicalType::USMALLINT},
+	      {"dst_port", LogicalType::USMALLINT},
+	      {"tcp_flags", LogicalType::USMALLINT},
+	      {"tcp_seq", LogicalType::UINTEGER},
+	      {"tcp_ack", LogicalType::UINTEGER},
+	      {"tcp_header_length", LogicalType::UTINYINT},
+	      {"udp_length", LogicalType::USMALLINT},
+	      {"payload_offset", LogicalType::UINTEGER},
+	      {"payload_length", LogicalType::UINTEGER},
+	      {"tcp_fin", LogicalType::BOOLEAN},
+	      {"tcp_syn", LogicalType::BOOLEAN},
+	      {"tcp_rst", LogicalType::BOOLEAN},
+	      {"tcp_psh", LogicalType::BOOLEAN},
+	      {"tcp_ack_flag", LogicalType::BOOLEAN},
+	      {"tcp_urg", LogicalType::BOOLEAN},
+	      {"tcp_ece", LogicalType::BOOLEAN},
+	      {"tcp_cwr", LogicalType::BOOLEAN}}},
+	};
+	auto &bind = result->Cast<PcapBindData>();
+	for (const auto &group : decoded) {
+		for (const auto &column : group.second) {
+			names.push_back(column.first);
+			return_types.push_back(column.second);
+		}
+		bind.AppendStages(group.first, group.second.size());
 	}
-	result->Cast<PcapBindData>().types = return_types;
+	bind.types = return_types;
 	return result;
 }
 
@@ -1057,8 +1087,10 @@ static unique_ptr<FunctionData> DnsBind(ClientContext &context, TableFunctionBin
 	                                       LogicalType::VARCHAR};
 	names.insert(names.end(), dns_names.begin(), dns_names.end());
 	return_types.insert(return_types.end(), dns_types.begin(), dns_types.end());
-	result->Cast<PcapBindData>().types = return_types;
-	result->Cast<PcapBindData>().dns_scan = true;
+	auto &bind = result->Cast<PcapBindData>();
+	bind.AppendStages(STAGE_DNS, dns_types.size());
+	bind.types = return_types;
+	bind.dns_scan = true;
 	return result;
 }
 
@@ -1195,23 +1227,37 @@ static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, Tab
 		}
 	}
 	auto &options = result->options;
+	// Every base column of a decoding scan must carry a stage. Without this a bind
+	// that appends columns and forgets their stages would silently under-decode them.
+	if (bind.column_stages.size() != bind.base_column_count) {
+		throw InternalException("capture scan has %llu columns but %llu column stages",
+		                        static_cast<uint64_t>(bind.base_column_count),
+		                        static_cast<uint64_t>(bind.column_stages.size()));
+	}
 	options.dns_scan = bind.dns_scan;
 	if (bind.dns_scan) {
 		options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
 	}
 	// Filter-only packet columns still determine the required decode depth.
 	for (const auto column : input.column_ids) {
-		if (column == 9) {
-			options.materialize_packet_data = true;
+		if (column >= bind.base_column_count) {
+			continue;
 		}
-		if (column >= 40 && column < bind.base_column_count) {
+		const auto stage = bind.StageOf(column);
+		if (stage == STAGE_PACKET_DATA) {
+			options.materialize_packet_data = true;
+			continue;
+		}
+		if (stage == STAGE_DNS) {
 			options.decode_dns = true;
 		}
-		if (column >= 11 && column < bind.base_column_count) {
-			const auto depth = static_cast<packetquapture::DecodeDepth>(MinValue<unsigned>(3, ColumnStage(column)));
-			if (depth > options.decode_depth) {
-				options.decode_depth = depth;
-			}
+		if (stage == STAGE_PACKET) {
+			continue;
+		}
+		// Stages past the decode ladder still need the transport payload located.
+		const auto depth = static_cast<packetquapture::DecodeDepth>(MinValue<unsigned>(STAGE_TRANSPORT, stage));
+		if (depth > options.decode_depth) {
+			options.decode_depth = depth;
 		}
 	}
 	if (input.filters) {
@@ -1231,7 +1277,7 @@ static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, Tab
 				continue;
 			}
 			result->filters.push_back({column, filter.Copy()});
-			options.filter_stages[ColumnStage(column)] = true;
+			options.filter_stages[bind.StageOf(column)] = true;
 		}
 	}
 	return std::move(result);
@@ -1245,6 +1291,7 @@ static unique_ptr<LocalTableFunctionState> PcapInitLocal(ExecutionContext &conte
 	result->options = global.options;
 	for (const auto &definition : global.filters) {
 		result->filters.push_back(make_uniq<PacketFilter>(context.client, definition.column,
+		                                                  bind.StageOf(definition.column),
 		                                                  bind.types[definition.column], *definition.filter));
 	}
 	auto *state = result.get();
