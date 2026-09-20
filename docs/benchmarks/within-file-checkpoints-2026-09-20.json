@@ -1,0 +1,331 @@
+{
+  "commit": "e5ad69411b4b06e2d4b48aa03162e25bfea1fdf0",
+  "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           39 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  8\nOn-line CPU(s) list:                     0-7\nVendor ID:                               GenuineIntel\nModel name:                              12th Gen Intel(R) Core(TM) i9-12900HK\nCPU family:                              6\nModel:                                   154\nThread(s) per core:                      2\nCore(s) per socket:                      4\nSocket(s):                               1\nStepping:                                3\nBogoMIPS:                                5836.79\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology tsc_reliable nonstop_tsc cpuid tsc_known_freq pni pclmulqdq vmx ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves avx_vnni vnmi umip waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize flush_l1d arch_capabilities\nVirtualization:                          VT-x\nHypervisor vendor:                       Microsoft\nVirtualization type:                     full\nL1d cache:                               192 KiB (4 instances)\nL1i cache:                               128 KiB (4 instances)\nL2 cache:                                5 MiB (4 instances)\nL3 cache:                                24 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-7\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Mitigation; Clear Register File\nVulnerability Retbleed:                  Mitigation; Enhanced IBRS\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n",
+  "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+  "selectivity": "1/100 of each capture's time span",
+  "cache": "Warm rows repeat an already-read file. Cold rows call POSIX_FADV_DONTNEED on the capture first, which drops that file's page cache only: dentry/inode caches, the DuckDB process start, and any WSL or host storage caching remain uncontrolled. These are local synthetic observations, not certified cold-disk or cloud measurements.",
+  "method": "Timing and syscall accounting are separate passes; strace inflates elapsed time and is never used for the reported times. Each query is a fresh CLI process, so the reported times include the measured process start.",
+  "runs": [
+    {
+      "case": "large_payloads",
+      "packets": 20000,
+      "packet_bytes": 15000,
+      "file_bytes": 300320024,
+      "timestamps": "ascending",
+      "selective_query": {
+        "warm_seconds": [
+          0.044332896010018885,
+          0.05031898198649287,
+          0.04362831398611888
+        ],
+        "warm_median_seconds": 0.044332896010018885,
+        "cold_seconds": [
+          1.5899815930170007,
+          4.34365524398163,
+          3.507581815996673
+        ],
+        "cold_median_seconds": 3.507581815996673,
+        "result": "200"
+      },
+      "full_scan_query": {
+        "warm_seconds": [
+          0.04587800696026534,
+          0.048852713021915406,
+          0.04620665602851659
+        ],
+        "warm_median_seconds": 0.04620665602851659,
+        "cold_seconds": [
+          3.8097102899919264,
+          3.647632115986198,
+          3.4822102860198356
+        ],
+        "cold_median_seconds": 3.647632115986198,
+        "result": "20000"
+      },
+      "inventory_refresh": {
+        "warm_seconds": [
+          0.03481772996019572,
+          0.03349192894529551,
+          0.03372410801239312
+        ],
+        "warm_median_seconds": 0.03372410801239312,
+        "cold_seconds": [
+          3.5983507860219106,
+          3.022758100007195,
+          3.5443184709874913
+        ],
+        "cold_median_seconds": 3.5443184709874913,
+        "result": "20000"
+      },
+      "selective_io": {
+        "capture_data_bytes": 320024,
+        "capture_read_calls": 20003,
+        "capture_seek_calls": 20000,
+        "identity_calls": 5
+      },
+      "full_scan_io": {
+        "capture_data_bytes": 320024,
+        "capture_read_calls": 20003,
+        "capture_seek_calls": 20000,
+        "identity_calls": 5
+      },
+      "reference_floor_warm": {
+        "whole_file_seconds": 0.05871134699555114,
+        "one_window_seconds": 0.0007187199662439525,
+        "whole_file_bytes": 300320024,
+        "one_window_bytes": 3003200
+      },
+      "reference_floor_cold": {
+        "whole_file_seconds": 0.19626241299556568,
+        "one_window_seconds": 0.0031423920299857855,
+        "whole_file_bytes": 300320024,
+        "one_window_bytes": 3003200
+      },
+      "selective_reads_match_full_scan": true,
+      "capture_data_fraction_read": 0.0010656099308249923
+    },
+    {
+      "case": "mixed_payloads",
+      "packets": 200000,
+      "packet_bytes": 1500,
+      "file_bytes": 303200024,
+      "timestamps": "ascending",
+      "selective_query": {
+        "warm_seconds": [
+          0.3036252860329114,
+          0.32349743600934744,
+          0.3083682380383834
+        ],
+        "warm_median_seconds": 0.3083682380383834,
+        "cold_seconds": [
+          0.5526035640505143,
+          0.6178939399542287,
+          0.5049612490111031
+        ],
+        "cold_median_seconds": 0.5526035640505143,
+        "result": "2000"
+      },
+      "full_scan_query": {
+        "warm_seconds": [
+          0.23814699501963332,
+          0.23754521500086412,
+          0.24523872102145106
+        ],
+        "warm_median_seconds": 0.23814699501963332,
+        "cold_seconds": [
+          0.6294103200198151,
+          0.5831540340441279,
+          0.5816446540411562
+        ],
+        "cold_median_seconds": 0.5831540340441279,
+        "result": "200000"
+      },
+      "inventory_refresh": {
+        "warm_seconds": [
+          0.19391100096981972,
+          0.18656715098768473,
+          0.1885801000171341
+        ],
+        "warm_median_seconds": 0.1885801000171341,
+        "cold_seconds": [
+          0.49008873099228367,
+          0.42289328400511295,
+          0.4202792060095817
+        ],
+        "cold_median_seconds": 0.42289328400511295,
+        "result": "200000"
+      },
+      "selective_io": {
+        "capture_data_bytes": 3200024,
+        "capture_read_calls": 200003,
+        "capture_seek_calls": 200000,
+        "identity_calls": 5
+      },
+      "full_scan_io": {
+        "capture_data_bytes": 3200024,
+        "capture_read_calls": 200003,
+        "capture_seek_calls": 200000,
+        "identity_calls": 5
+      },
+      "reference_floor_warm": {
+        "whole_file_seconds": 0.05641438002930954,
+        "one_window_seconds": 0.0006181199569255114,
+        "whole_file_bytes": 303200024,
+        "one_window_bytes": 3032000
+      },
+      "reference_floor_cold": {
+        "whole_file_seconds": 0.19940556900110096,
+        "one_window_seconds": 0.006546631047967821,
+        "whole_file_bytes": 303200024,
+        "one_window_bytes": 3032000
+      },
+      "selective_reads_match_full_scan": true,
+      "capture_data_fraction_read": 0.010554168030013085
+    },
+    {
+      "case": "small_payloads",
+      "packets": 2000000,
+      "packet_bytes": 150,
+      "file_bytes": 332000024,
+      "timestamps": "ascending",
+      "selective_query": {
+        "warm_seconds": [
+          2.597014013037551,
+          2.623944229038898,
+          2.579137819004245
+        ],
+        "warm_median_seconds": 2.597014013037551,
+        "cold_seconds": [
+          2.665368983987719,
+          2.6419592890306376,
+          2.6889304029755294
+        ],
+        "cold_median_seconds": 2.665368983987719,
+        "result": "20000"
+      },
+      "full_scan_query": {
+        "warm_seconds": [
+          1.8767683500191197,
+          1.864592014986556,
+          1.8780869480106048
+        ],
+        "warm_median_seconds": 1.8767683500191197,
+        "cold_seconds": [
+          1.9961226590094157,
+          1.9686620259890333,
+          1.9362143730395474
+        ],
+        "cold_median_seconds": 1.9686620259890333,
+        "result": "2000000"
+      },
+      "inventory_refresh": {
+        "warm_seconds": [
+          1.5013300550053827,
+          1.4869234539801255,
+          1.4777953689917922
+        ],
+        "warm_median_seconds": 1.4869234539801255,
+        "cold_seconds": [
+          1.5542247099801898,
+          1.5383548719692044,
+          1.535366360039916
+        ],
+        "cold_median_seconds": 1.5383548719692044,
+        "result": "2000000"
+      },
+      "selective_io": {
+        "capture_data_bytes": 32000024,
+        "capture_read_calls": 2000003,
+        "capture_seek_calls": 2000000,
+        "identity_calls": 5
+      },
+      "full_scan_io": {
+        "capture_data_bytes": 32000024,
+        "capture_read_calls": 2000003,
+        "capture_seek_calls": 2000000,
+        "identity_calls": 5
+      },
+      "reference_floor_warm": {
+        "whole_file_seconds": 0.06832685897825286,
+        "one_window_seconds": 0.0008167100022546947,
+        "whole_file_bytes": 332000024,
+        "one_window_bytes": 3320000
+      },
+      "reference_floor_cold": {
+        "whole_file_seconds": 0.45189746102551,
+        "one_window_seconds": 0.005926441983319819,
+        "whole_file_bytes": 332000024,
+        "one_window_bytes": 3320000
+      },
+      "selective_reads_match_full_scan": true,
+      "capture_data_fraction_read": 0.09638560749019705
+    },
+    {
+      "case": "unsorted_control",
+      "packets": 200000,
+      "packet_bytes": 1500,
+      "file_bytes": 303200024,
+      "timestamps": "shuffled",
+      "selective_query": {
+        "warm_seconds": [
+          0.31620491796638817,
+          0.3740894850343466,
+          0.38068570697214454
+        ],
+        "warm_median_seconds": 0.3740894850343466,
+        "cold_seconds": [
+          0.6531339089851826,
+          0.758208556973841,
+          0.6541312870103866
+        ],
+        "cold_median_seconds": 0.6541312870103866,
+        "result": "2000"
+      },
+      "full_scan_query": {
+        "warm_seconds": [
+          0.2734415939776227,
+          0.27250637201359496,
+          0.29254792496794835
+        ],
+        "warm_median_seconds": 0.2734415939776227,
+        "cold_seconds": [
+          0.5338013370055705,
+          0.5321356690255925,
+          0.5601100419880822
+        ],
+        "cold_median_seconds": 0.5338013370055705,
+        "result": "200000"
+      },
+      "inventory_refresh": {
+        "warm_seconds": [
+          0.19717224402120337,
+          0.20462653698632494,
+          0.20215848903171718
+        ],
+        "warm_median_seconds": 0.20215848903171718,
+        "cold_seconds": [
+          0.5501059080124833,
+          0.5966862699715421,
+          0.478198949014768
+        ],
+        "cold_median_seconds": 0.5501059080124833,
+        "result": "200000"
+      },
+      "selective_io": {
+        "capture_data_bytes": 3200024,
+        "capture_read_calls": 200003,
+        "capture_seek_calls": 200000,
+        "identity_calls": 5
+      },
+      "full_scan_io": {
+        "capture_data_bytes": 3200024,
+        "capture_read_calls": 200003,
+        "capture_seek_calls": 200000,
+        "identity_calls": 5
+      },
+      "reference_floor_warm": {
+        "whole_file_seconds": 0.07720186904771253,
+        "one_window_seconds": 0.0009252629824914038,
+        "whole_file_bytes": 303200024,
+        "one_window_bytes": 3032000
+      },
+      "reference_floor_cold": {
+        "whole_file_seconds": 0.31693671201355755,
+        "one_window_seconds": 0.004302717978134751,
+        "whole_file_bytes": 303200024,
+        "one_window_bytes": 3032000
+      },
+      "selective_reads_match_full_scan": true,
+      "capture_data_fraction_read": 0.010554168030013085
+    }
+  ],
+  "build": [
+    "CMAKE_BUILD_TYPE:STRING=Release",
+    "CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG",
+    "ENABLE_THREAD_SANITIZER:BOOL=OFF",
+    "RELEASE_SANITIZER:BOOL=OFF"
+  ],
+  "process_start_seconds": 0.0141068059601821,
+  "observation": "A selective timestamp predicate reads the same capture bytes and issues the same syscalls as an unrestricted scan in every recorded case: whole-file selection cannot reduce work inside a retained file. Elapsed time tracks packet count rather than file size. The unsorted control shows a capture for which per-region bounds could not exclude anything."
+}
