@@ -20,6 +20,7 @@
 #include "packet_decoder.hpp"
 #include "dns_decoder.hpp"
 #include "tls_record.hpp"
+#include "tls_handshake.hpp"
 #include "tcp_reassembly.hpp"
 #include "dns_tcp_framer.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -1865,6 +1866,16 @@ struct StreamScanState : public LocalTableFunctionState {
 	std::vector<packetquapture::TcpStream> streams;
 	idx_t pending_index = 0;
 	std::vector<packetquapture::TcpDnsMessage> pending;
+
+	// read_tls pairs the two directions of a connection, which the transport core
+	// finishes independently, so rows can outlive the stream that produced them.
+	// The file they belong to is held with them.
+	packetquapture::TlsHandshakeAssembler tls_assembler;
+	std::vector<packetquapture::TlsHandshake> tls_pending;
+	idx_t tls_pending_index = 0;
+	string tls_pending_filename, tls_open_filename;
+	idx_t tls_pending_file_index = 0, tls_open_file_index = 0;
+	bool tls_drained = false;
 };
 
 static unique_ptr<LocalTableFunctionState> StreamInitLocal(ExecutionContext &, TableFunctionInitInput &,
@@ -2190,6 +2201,285 @@ static void DnsMessagesScan(ClientContext &context, TableFunctionInput &input, D
 	if (!count) {
 		std::vector<packetquapture::TcpStream>().swap(state.streams);
 		std::vector<packetquapture::TcpDnsMessage>().swap(state.pending);
+		state.reassembler = packetquapture::TcpReassembler();
+		state.reservation.reset();
+	}
+}
+
+// read_tls reports one row per handshake, pairing the two directions of a
+// connection so the offered name and the selected parameters arrive together.
+// The key is oriented client to server whichever direction was captured.
+static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBindInput &input,
+                                        vector<LogicalType> &types, vector<string> &names) {
+	auto result = PcapBind(context, input, types, names);
+	names = {"filename",
+	         "section_number",
+	         "interface_id",
+	         "ip_version",
+	         "client_ip",
+	         "server_ip",
+	         "client_port",
+	         "server_port",
+	         "client_stream_id",
+	         "server_stream_id",
+	         "handshake_number",
+	         "first_packet_number",
+	         "last_packet_number",
+	         "first_timestamp",
+	         "last_timestamp",
+	         "client_hello",
+	         "server_hello",
+	         "tls_sni",
+	         "client_version",
+	         "negotiated_version",
+	         "cipher_suite",
+	         "session_resumed",
+	         "reassembly_status",
+	         "reassembly_error",
+	         "vlan_ids"};
+	types = {LogicalType::VARCHAR,
+	         LogicalType::UINTEGER,
+	         LogicalType::UINTEGER,
+	         LogicalType::UTINYINT,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::USMALLINT,
+	         LogicalType::USMALLINT,
+	         LogicalType::UBIGINT,
+	         LogicalType::UBIGINT,
+	         LogicalType::UBIGINT,
+	         LogicalType::UBIGINT,
+	         LogicalType::UBIGINT,
+	         LogicalType::TIMESTAMP,
+	         LogicalType::TIMESTAMP,
+	         LogicalType::BOOLEAN,
+	         LogicalType::BOOLEAN,
+	         LogicalType::VARCHAR,
+	         LogicalType::USMALLINT,
+	         LogicalType::USMALLINT,
+	         LogicalType::USMALLINT,
+	         LogicalType::BOOLEAN,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::LIST(LogicalType::USMALLINT)};
+	auto &bind = result->Cast<PcapBindData>();
+	bind.types = types;
+	bind.stream_plan =
+	    context.registered_state->GetOrCreate<StreamPlanRegistry>("packetquapture_stream_plans")->Register();
+	return result;
+}
+
+static unique_ptr<GlobalTableFunctionState> TlsInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto state = make_uniq<StreamGlobalState>(context, input.bind_data->Cast<PcapBindData>());
+	state->progress.Initialize(context, input.bind_data->Cast<PcapBindData>().SelectedFiles(), true);
+	state->columns = input.column_ids;
+	state->options.reassemble_tcp = true;
+	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
+	return std::move(state);
+}
+
+static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const string &filename,
+                              const packetquapture::TlsHandshake &handshake) {
+	const auto &key = handshake.key;
+	switch (column) {
+	case 0:
+		vector.SetValue(row, filename);
+		break;
+	case 1:
+		SetDecodedScalar(vector, row, key.section);
+		break;
+	case 2:
+		SetDecodedScalar(vector, row, key.interface_id);
+		break;
+	case 3:
+		SetDecodedScalar(vector, row, key.ip_version);
+		break;
+	case 4:
+		vector.SetValue(row, IpString(key.src_ip, key.ip_version));
+		break;
+	case 5:
+		vector.SetValue(row, IpString(key.dst_ip, key.ip_version));
+		break;
+	case 6:
+		SetDecodedScalar(vector, row, key.src_port);
+		break;
+	case 7:
+		SetDecodedScalar(vector, row, key.dst_port);
+		break;
+	// A stream id is NULL when that direction of the connection was not captured.
+	case 8:
+		if (handshake.has_client_stream) {
+			SetDecodedScalar(vector, row, handshake.client_stream_id);
+		} else {
+			FlatVector::SetNull(vector, row, true);
+		}
+		break;
+	case 9:
+		if (handshake.has_server_stream) {
+			SetDecodedScalar(vector, row, handshake.server_stream_id);
+		} else {
+			FlatVector::SetNull(vector, row, true);
+		}
+		break;
+	case 10:
+		SetDecodedScalar(vector, row, handshake.handshake_number);
+		break;
+	case 11:
+		SetDecodedScalar(vector, row, handshake.first.number);
+		break;
+	case 12:
+		SetDecodedScalar(vector, row, handshake.last.number);
+		break;
+	case 13:
+	case 14: {
+		const auto &stamp = column == 13 ? handshake.first : handshake.last;
+		if (stamp.has_timestamp) {
+			vector.SetValue(row, Value::TIMESTAMP(timestamp_t(stamp.timestamp)));
+		} else {
+			FlatVector::SetNull(vector, row, true);
+		}
+		break;
+	}
+	case 15:
+		SetDecodedScalar(vector, row, handshake.has_client_hello);
+		break;
+	case 16:
+		SetDecodedScalar(vector, row, handshake.has_server_hello);
+		break;
+	case 17:
+		if (handshake.has_sni) {
+			vector.SetValue(row, handshake.sni);
+		} else {
+			FlatVector::SetNull(vector, row, true);
+		}
+		break;
+	case 18:
+		if (handshake.has_client_version) {
+			SetDecodedScalar(vector, row, handshake.client_version);
+		} else {
+			FlatVector::SetNull(vector, row, true);
+		}
+		break;
+	case 19:
+		if (handshake.has_negotiated_version) {
+			SetDecodedScalar(vector, row, handshake.negotiated_version);
+		} else {
+			FlatVector::SetNull(vector, row, true);
+		}
+		break;
+	case 20:
+		if (handshake.has_cipher_suite) {
+			SetDecodedScalar(vector, row, handshake.cipher_suite);
+		} else {
+			FlatVector::SetNull(vector, row, true);
+		}
+		break;
+	case 21:
+		// Undecidable without both directions, and meaningless in TLS 1.3.
+		if (handshake.has_resumed) {
+			SetDecodedScalar(vector, row, handshake.resumed);
+		} else {
+			FlatVector::SetNull(vector, row, true);
+		}
+		break;
+	case 22:
+		vector.SetValue(row, handshake.status);
+		break;
+	case 23:
+		if (handshake.error.empty()) {
+			FlatVector::SetNull(vector, row, true);
+		} else {
+			vector.SetValue(row, handshake.error);
+		}
+		break;
+	case 24: {
+		duckdb::vector<Value> values;
+		for (const auto vlan : key.vlans) {
+			values.push_back(Value::USMALLINT(vlan));
+		}
+		vector.SetValue(row, Value::LIST(LogicalType::USMALLINT, values));
+		break;
+	}
+	default:
+		throw InternalException("Unexpected read_tls column id %d", column);
+	}
+}
+
+static void TlsScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &bind = input.bind_data->Cast<PcapBindData>();
+	auto &global = input.global_state->Cast<StreamGlobalState>();
+	auto &state = input.local_state->Cast<StreamScanState>();
+	if (!state.initialized) {
+		state.initialized = true;
+		if (global.file_count) {
+			state.reservation = global.Admit();
+		}
+	}
+	if (!state.reservation) {
+		return;
+	}
+	idx_t count = 0, output_bytes = 0;
+	while (count < STANDARD_VECTOR_SIZE && output_bytes < STREAM_OUTPUT_BATCH_BYTES) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		if (state.tls_pending_index < state.tls_pending.size()) {
+			const auto &handshake = state.tls_pending[state.tls_pending_index++];
+			for (idx_t i = 0; i < global.columns.size(); ++i) {
+				if (!bind.SetPartition(output.data[i], count, global.columns[i], state.tls_pending_file_index)) {
+					SetHandshakeValue(output.data[i], count, global.columns[i], state.tls_pending_filename, handshake);
+				}
+			}
+			output_bytes += 1024 + state.tls_pending_filename.size() + handshake.sni.size();
+			++count;
+			continue;
+		}
+		state.tls_pending.clear();
+		state.tls_pending_index = 0;
+		if (state.tls_drained) {
+			break;
+		}
+		StreamEvent event;
+		if (!NextStreamEvent(context, bind, global, state, event)) {
+			// Directions still waiting for a peer are reported on their own.
+			state.tls_drained = true;
+			state.tls_pending = state.tls_assembler.Finish();
+			state.tls_pending_filename = state.tls_open_filename;
+			state.tls_pending_file_index = state.tls_open_file_index;
+			continue;
+		}
+		// TLS runs over TCP. DTLS frames differently and is not parsed.
+		if (!event.tcp) {
+			continue;
+		}
+		if (state.tls_open_filename != state.filename || state.tls_open_file_index != state.file_index) {
+			// A connection cannot span files, so anything still held belongs to
+			// the file just finished and is reported before moving on.
+			state.tls_pending = state.tls_assembler.Finish();
+			state.tls_pending_filename = state.tls_open_filename;
+			state.tls_pending_file_index = state.tls_open_file_index;
+			state.tls_open_filename = state.filename;
+			state.tls_open_file_index = state.file_index;
+		}
+		auto handshakes = state.tls_assembler.Add(event.stream);
+		if (!handshakes.empty()) {
+			// Nothing pairs on the first stream of a file, so these two never
+			// collide; append rather than assume it.
+			if (state.tls_pending.empty()) {
+				state.tls_pending_filename = state.filename;
+				state.tls_pending_file_index = state.file_index;
+				state.tls_pending = std::move(handshakes);
+			} else {
+				state.tls_pending.insert(state.tls_pending.end(), std::make_move_iterator(handshakes.begin()),
+				                         std::make_move_iterator(handshakes.end()));
+			}
+		}
+	}
+	output.SetCardinality(count);
+	if (!count) {
+		std::vector<packetquapture::TcpStream>().swap(state.streams);
+		std::vector<packetquapture::TlsHandshake>().swap(state.tls_pending);
+		state.tls_assembler = packetquapture::TlsHandshakeAssembler();
 		state.reassembler = packetquapture::TcpReassembler();
 		state.reservation.reset();
 	}
@@ -3609,6 +3899,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	AddCaptureOptions(messages);
 	// Segment-level predicates could remove bytes required to reconstruct a matching message.
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(messages));
+	TableFunction tls("read_tls", {LogicalType::VARCHAR}, TlsScan, BindCapture<TlsBind>, TlsInit, StreamInitLocal);
+	tls.projection_pushdown = true;
+	tls.table_scan_progress = CaptureScanProgress;
+	// File-level pruning only: a segment-level predicate could remove bytes needed
+	// to reconstruct a handshake that would have matched it.
+	tls.pushdown_complex_filter = PruneCaptureFiles;
+	AddCaptureOptions(tls);
+	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(tls));
 	TableFunction streams("read_tcp_streams", {LogicalType::VARCHAR}, TcpStreamsScan, BindCapture<TcpStreamsBind>,
 	                      TcpStreamsInit, StreamInitLocal);
 	streams.projection_pushdown = true;

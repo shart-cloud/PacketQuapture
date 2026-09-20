@@ -87,6 +87,95 @@ def main():
     # A handshake on a non-standard port: detection is by record shape, not port.
     pcap(DATA / "alt_port.pcap", [packet(hello, dst=8443)])
 
+    reassembly_fixtures()
+
+
+CLIENT_IP = bytes([192, 0, 2, 1])
+SERVER_IP = bytes([198, 51, 100, 2])
+
+
+def ip4_between(payload, src, dst):
+    """IPv4 with explicit endpoints, so both directions of a flow can be built."""
+    header = struct.pack(
+        "!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), 42, 0, 64, 6, 0, src, dst
+    )
+    return header + payload
+
+
+def segment(payload, src_port, dst_port, seq, ack=1, flags=0x18):
+    return struct.pack(
+        "!HHIIBBHHH", src_port, dst_port, seq, ack, 0x50, flags, 4096, 0, 0
+    ) + payload
+
+
+def to_client(payload, seq, port=51000, flags=0x18):
+    return eth(ip4_between(segment(payload, 443, port, seq, flags=flags), SERVER_IP, CLIENT_IP))
+
+
+def to_server(payload, seq, port=51000, flags=0x18):
+    return eth(ip4_between(segment(payload, port, 443, seq, flags=flags), CLIENT_IP, SERVER_IP))
+
+
+def connection(client_payloads, server_payloads, port=51000):
+    """A SYN-anchored connection carrying the given payloads in each direction."""
+    packets = [
+        to_server(b"", 0, port, flags=0x02),
+        to_client(b"", 0, port, flags=0x12),
+    ]
+    seq = 1
+    for payload in client_payloads:
+        packets.append(to_server(payload, seq, port))
+        seq += len(payload)
+    seq = 1
+    for payload in server_payloads:
+        packets.append(to_client(payload, seq, port))
+        seq += len(payload)
+    return packets
+
+
+def reassembly_fixtures():
+    hello = record(client_hello(server_name("example.com")))
+    reply = record(server_hello())
+
+    # A complete handshake with both directions captured.
+    pcap(DATA / "session.pcap", connection([hello], [reply]))
+
+    # Only the client direction was captured.
+    pcap(DATA / "client_only.pcap", connection([hello], []))
+
+    # Only the server direction was captured.
+    pcap(DATA / "server_only.pcap", connection([], [reply]))
+
+    # A ClientHello split across two TLS records, which in turn span two
+    # segments: the name is only recoverable after reassembly.
+    body = client_hello(server_name("split.example.com"))
+    first, second = body[:40], body[40:]
+    split = record(first) + record(second)
+    pcap(
+        DATA / "split.pcap",
+        connection([split[:30], split[30:]], [reply]),
+    )
+
+    # Two handshakes on one connection, renegotiated in the clear.
+    again = record(client_hello(server_name("second.example.com")))
+    pcap(
+        DATA / "renegotiated.pcap",
+        connection([hello + again], [reply + record(server_hello())]),
+    )
+
+    # Handshake bytes followed by change_cipher_spec and encrypted records that
+    # would otherwise parse as another ClientHello.
+    encrypted = record(b"\x01", kind=20, version=0x0303) + record(
+        client_hello(server_name("must.not.appear")), version=0x0303
+    )
+    pcap(DATA / "encrypted_after_ccs.pcap", connection([hello + encrypted], [reply]))
+
+    # TCP that is not TLS at all.
+    pcap(
+        DATA / "plain_tcp.pcap",
+        connection([b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"], [b"HTTP/1.1 200 OK\r\n\r\n"]),
+    )
+
 
 if __name__ == "__main__":
     main()
