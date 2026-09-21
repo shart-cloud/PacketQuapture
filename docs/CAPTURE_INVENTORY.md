@@ -52,6 +52,13 @@ All protocol counters are NULL in framing mode, not zero.
 
 `on_error='error'` (default) fails on a source error. `on_error='report'` returns
 `scan_status='error'` or `'changed'`, NULL statistics and an error description.
+
+`scan_status='truncated'` reports a capture that ends partway through a record,
+which is what a writer killed mid-write leaves behind. Statistics are those of
+the complete records preceding the cut, and the scan does not fail. A file whose
+headers parse but which never yields a complete record is still an error, not a
+truncated scan, because a silently empty result would be indistinguishable from
+a file that is not a capture at all.
 It never exposes partial counts as complete. Cancellation, memory exhaustion,
 invalid configuration, catalog schema errors and discovery failures always fail the
 statement. Remote provider error bodies are not persisted; rerun with error mode for

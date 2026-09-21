@@ -1,0 +1,107 @@
+# name: test/sql/truncated_tail.test
+# description: Captures cut short mid-record read up to the last complete packet
+# group: [sql]
+
+require packetquapture
+
+# A writer killed mid-write leaves the final record incomplete. Every fixture
+# below holds two complete packets before the cut, so a tolerated tail reads 2.
+
+# Record header cut mid-way.
+query I
+SELECT count(*) FROM read_pcap('test/data/truncated/record_header.pcap');
+----
+2
+
+# Header complete, payload short.
+query I
+SELECT count(*) FROM read_pcap('test/data/truncated/payload.pcap');
+----
+2
+
+# Header complete, payload absent -- the file ends exactly on the boundary.
+query I
+SELECT count(*) FROM read_pcap('test/data/truncated/payload_absent.pcap');
+----
+2
+
+# Two bytes missing, the minimum seen in the CTU corpus.
+query I
+SELECT count(*) FROM read_pcap('test/data/truncated/two_bytes.pcap');
+----
+2
+
+# PCAPNG block body cut mid-way.
+query I
+SELECT count(*) FROM read_pcap('test/data/truncated/block.pcapng');
+----
+1
+
+# PCAPNG block missing its trailing length.
+query I
+SELECT count(*) FROM read_pcap('test/data/truncated/trailer.pcapng');
+----
+1
+
+# Packets before the cut keep their full contents, so tolerance is not
+# silently dropping or blanking the rows it does return.
+query IIII
+SELECT packet_number,captured_length,original_length,octet_length(packet_data)
+FROM read_pcap('test/data/truncated/payload.pcap') ORDER BY packet_number;
+----
+1	14	14	14
+2	14	14	14
+
+# The whole point: one truncated file must not abort a glob over good ones.
+query I
+SELECT count(*) FROM read_pcap('test/data/truncated/*.pcap');
+----
+11
+
+# Truncation is reported, not hidden.
+query TI
+SELECT scan_status,packet_count FROM capture_inventory('test/data/truncated/payload.pcap');
+----
+truncated	2
+
+query TI
+SELECT scan_status,packet_count FROM capture_inventory('test/data/truncated/complete.pcap');
+----
+complete	3
+
+query TT
+SELECT regexp_extract(filename,'[^/]+$'),scan_status FROM capture_inventory('test/data/truncated/*.pcap')
+ORDER BY filename;
+----
+complete.pcap	complete
+payload.pcap	truncated
+payload_absent.pcap	truncated
+record_header.pcap	truncated
+two_bytes.pcap	truncated
+
+# A file that never establishes itself as a capture is still an error: these
+# stop inside the magic number and the global header respectively.
+statement error
+SELECT count(*) FROM read_pcap('test/data/truncated/fatal/magic.pcap');
+----
+ends inside its magic number
+
+statement error
+SELECT count(*) FROM read_pcap('test/data/truncated/fatal/global_header.pcap');
+----
+Unexpected end of
+
+# Headers are fine, but the single record is partial so no packet is ever
+# returned. Tolerance requires the file to have proven itself with at least one
+# complete record; otherwise a silently empty result would hide a file that is
+# not a capture at all.
+statement error
+SELECT count(*) FROM read_pcap('test/data/truncated/fatal/only_partial.pcap');
+----
+Unexpected end of
+
+# The same rule through a derived reader.
+statement error
+SELECT count(*) FROM read_packets('test/data/truncated/fatal/only_partial.pcap');
+----
+Unexpected end of
