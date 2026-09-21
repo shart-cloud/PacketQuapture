@@ -78,6 +78,12 @@ constexpr uint32_t PCAPNG_INTERFACE_DESCRIPTION = 0x00000001;
 constexpr uint32_t PCAPNG_SIMPLE_PACKET = 0x00000003;
 constexpr uint32_t PCAPNG_ENHANCED_PACKET = 0x00000006;
 
+// Raised when a capture ends partway through a record, which is what a writer
+// killed mid-write leaves behind. Deliberately not a std::exception: it unwinds
+// to CaptureReader::Next, which turns it into a clean end-of-capture, and must
+// never be swallowed by the generic error decorator there.
+struct TruncatedTailSignal {};
+
 enum class ByteOrder : uint8_t { LITTLE, BIG };
 enum class CaptureFormat : uint8_t { PCAP, PCAPNG };
 
@@ -245,11 +251,23 @@ public:
 	bool Next(PacketRecord &record) {
 		try {
 			const bool found = format == CaptureFormat::PCAP ? NextPcap(record) : NextPcapNg(record);
+			if (found) {
+				++complete_records;
+			}
 			if (!found && progress && progress->Enabled()) {
 				PublishProgress(true);
 				progress->CompleteFile();
 			}
 			return found;
+		} catch (const TruncatedTailSignal &) {
+			// Stop at the last complete packet. Reported through
+			// SawTruncatedTail so capture_inventory can surface it rather than
+			// the caller silently receiving a short scan.
+			if (progress && progress->Enabled()) {
+				PublishProgress(true);
+				progress->CompleteFile();
+			}
+			return false;
 		} catch (const std::exception &exception) {
 			ErrorData error(exception);
 			if (error.Type() == ExceptionType::INTERRUPT) {
@@ -271,6 +289,10 @@ public:
 	}
 	string InventoryFormat() const {
 		return format == CaptureFormat::PCAP ? "pcap" : "pcapng";
+	}
+	// True when the capture ended partway through a record.
+	bool SawTruncatedTail() const {
+		return truncated_tail;
 	}
 	uint32_t SectionNumber() const {
 		return format == CaptureFormat::PCAP ? 1 : section_number;
@@ -343,6 +365,11 @@ private:
 	void Initialize() {
 		std::array<uint8_t, 4> magic {};
 		if (!ReadMaybe(magic.data(), magic.size())) {
+			// ReadMaybe no longer throws on a short read, so separate a file
+			// that stops inside its magic number from one with no bytes at all.
+			if (truncated_tail) {
+				throw IOException("Capture file '%s' ends inside its magic number", file.path);
+			}
 			throw IOException("Capture file '%s' is empty", file.path);
 		}
 		if (magic == std::array<uint8_t, 4> {0xD4, 0xC3, 0xB2, 0xA1}) {
@@ -359,6 +386,7 @@ private:
 		} else {
 			throw InvalidInputException("File '%s' is not a PCAP or PCAPNG capture", file.path);
 		}
+		header_complete = true;
 	}
 
 	void InitializePcap(ByteOrder order_p, bool nanosecond_timestamps_p) {
@@ -420,6 +448,9 @@ private:
 	bool NextPcap(PacketRecord &record) {
 		std::array<uint8_t, 16> header {};
 		if (!ReadMaybe(header.data(), header.size())) {
+			if (truncated_tail) {
+				EndOfRecord("packet header");
+			}
 			return false;
 		}
 		const auto seconds = ReadU32(header.data(), order);
@@ -447,6 +478,9 @@ private:
 		while (true) {
 			std::array<uint8_t, 8> header {};
 			if (!ReadMaybe(header.data(), header.size())) {
+				if (truncated_tail) {
+					EndOfRecord("PCAPNG block header");
+				}
 				return false;
 			}
 			if (std::memcmp(header.data(), "\x0a\x0d\x0d\x0a", 4) == 0) {
@@ -768,10 +802,12 @@ private:
 				bytes_read = NumericCast<idx_t>(RawHandle().Read(destination, length - total));
 			}
 			if (bytes_read == 0) {
-				if (total == 0) {
-					return false;
+				if (total > 0) {
+					// Ended mid-read. Fatal inside a file or section header,
+					// tolerated once record iteration has begun.
+					truncated_tail = true;
 				}
-				throw IOException("Unexpected end of capture file '%s' at byte %d", file.path, position + total);
+				return false;
 			}
 			total += NumericCast<idx_t>(bytes_read);
 		}
@@ -782,8 +818,21 @@ private:
 
 	void ReadExact(void *buffer, idx_t length, const char *description) {
 		if (length > 0 && !ReadMaybe(buffer, length)) {
-			throw IOException("Unexpected end of '%s' while reading %s", file.path, description);
+			EndOfRecord(description);
 		}
+	}
+
+	// A capture that stops inside a record was cut short mid-write, which is
+	// ordinary for real captures -- but only once the file has proven itself by
+	// yielding a complete record. Before that, a short read is indistinguishable
+	// from a misidentified or corrupt file, and a silently empty result would
+	// hide that, so it stays a hard error.
+	[[noreturn]] void EndOfRecord(const char *description) {
+		if (header_complete && complete_records > 0) {
+			truncated_tail = true;
+			throw TruncatedTailSignal {};
+		}
+		throw IOException("Unexpected end of '%s' while reading %s", file.path, description);
 	}
 
 	void Skip(idx_t length, const char *description) {
@@ -792,7 +841,7 @@ private:
 		}
 		if (can_skip_by_seek) {
 			if (position > seekable_size || length > seekable_size - position) {
-				throw IOException("Unexpected end of '%s' while reading %s", file.path, description);
+				EndOfRecord(description);
 			}
 			if (buffer_locally) {
 				// A gap this small shares pages with the headers around it, so upcoming
@@ -839,6 +888,11 @@ private:
 	CaptureProgress *progress;
 	uint64_t published_position = 0;
 	bool can_skip_by_seek = false;
+	// Set once the file/section header is parsed; gates tail tolerance.
+	bool header_complete = false;
+	bool truncated_tail = false;
+	// Records returned in full; gates tail tolerance alongside header_complete.
+	uint64_t complete_records = 0;
 	uint64_t seekable_size = 0;
 	CaptureFormat format = CaptureFormat::PCAP;
 	ByteOrder order = ByteOrder::LITTLE;
@@ -3780,7 +3834,7 @@ static vector<Value> InventoryOne(ClientContext &context, const InventoryBindDat
 			for (idx_t i = 0; i < 8; ++i)
 				row[IC_IPV4 + i] = Value::UBIGINT(counts[i]);
 		}
-		row[IC_STATUS] = Value("complete");
+		row[IC_STATUS] = Value(reader.SawTruncatedTail() ? "truncated" : "complete");
 		row[IC_STABLE] = before.Known() ? Value(true) : Value(LogicalType::BOOLEAN);
 	} catch (const std::exception &exception) {
 		ErrorData error(exception);

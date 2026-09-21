@@ -13,6 +13,18 @@ The current vertical slice reads classic PCAP and PCAPNG through DuckDB's filesy
 `VARCHAR`, `LIST<VARCHAR>`, and glob inputs, classic microsecond and nanosecond timestamps, PCAPNG interface timestamp
 resolution, Enhanced Packet Blocks, Simple Packet Blocks, and projection pushdown for raw packet bytes.
 
+## Truncated captures
+
+A capture whose final record is incomplete -- the ordinary result of a writer
+being killed mid-write -- reads up to the last complete packet instead of
+failing. This matters for globs: without it a single cut-short file aborts the
+entire scan, so `read_pcap('captures/**/*.pcap*')` returns nothing rather than
+the packets from every intact file.
+
+`capture_inventory` reports these as `scan_status='truncated'`; see
+[capture inventory](docs/CAPTURE_INVENTORY.md). Files that never yield a
+complete record, and files whose own headers are cut short, remain errors.
+
 ## Output
 
 `read_pcap(...)` returns:
