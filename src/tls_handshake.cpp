@@ -102,7 +102,7 @@ void ParseServerName(Reader &reader, TlsHandshake &handshake) {
 			std::string name;
 			if (reader.Take(name_length, name)) {
 				handshake.has_sni = true;
-				handshake.sni = name;
+				handshake.sni = EscapeTlsText(name);
 			}
 			return;
 		}

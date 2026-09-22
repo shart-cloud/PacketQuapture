@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 namespace packetquapture {
@@ -46,6 +47,26 @@ struct TlsRecord {
 	// rather than known-absent.
 	bool truncated = false;
 };
+
+// Renders peer-supplied bytes, such as a server name, as text. Printable ASCII
+// other than backslash passes through; every other byte becomes a decimal \DDD
+// escape, as DNS names do. The result is always valid UTF-8, so a hostile name
+// cannot fail the query, and distinct inputs stay distinct.
+inline std::string EscapeTlsText(const std::string &raw) {
+	std::string text;
+	text.reserve(raw.size());
+	for (size_t i = 0; i < raw.size(); ++i) {
+		const auto ch = static_cast<unsigned char>(raw[i]);
+		if (ch >= 33 && ch <= 126 && ch != '\\') {
+			text += static_cast<char>(ch);
+		} else {
+			char escaped[5];
+			std::snprintf(escaped, sizeof(escaped), "\\%03u", static_cast<unsigned>(ch));
+			text += escaped;
+		}
+	}
+	return text;
+}
 
 // Parses the payload as a TLS record. Reads only the bytes given and never
 // throws; a payload that is not TLS yields a default-constructed result.

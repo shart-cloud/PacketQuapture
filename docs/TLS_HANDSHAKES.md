@@ -54,7 +54,7 @@ one row. That is a different shape, and it needs rules the DNS reader never had.
 | `handshake_number` | 1 for the first handshake of a connection, incrementing on renegotiation. |
 | `first_packet_number`, `last_packet_number`, `first_timestamp`, `last_timestamp` | Provenance of the packets carrying the handshake. |
 | `client_hello`, `server_hello` | Whether each side was seen. |
-| `tls_sni` | `host_name` from the ClientHello's `server_name` extension, complete across segments. |
+| `tls_sni` | `host_name` from the ClientHello's `server_name` extension, complete across segments. Escaped as in `read_packets`: bytes outside printable ASCII, and backslash, become decimal `\DDD`. |
 | `client_version` | `legacy_version` from the ClientHello, a compatibility value. |
 | `negotiated_version` | `supported_versions` from the ServerHello when present, otherwise its `legacy_version`. This is why a TLS 1.3 connection reports 0x0304 rather than the 0x0303 in its record headers. |
 | `cipher_suite` | The suite the server selected. |

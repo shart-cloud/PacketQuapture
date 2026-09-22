@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tcp_reassembly.hpp"
+#include "tls_record.hpp"
 
 namespace packetquapture {
 

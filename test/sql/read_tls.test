@@ -138,3 +138,10 @@ FROM read_tls(['test/data/tls/session.pcap', 'test/data/tls/split.pcap',
                'test/data/tls/server_only.pcap', 'test/data/tls/plain_tcp.pcap']);
 ----
 6	4
+
+# A server name that is not valid UTF-8 is escaped, not fatal: printable ASCII
+# passes through and every other byte, and backslash, becomes decimal \DDD.
+query II
+SELECT tls_sni, reassembly_status FROM read_tls('test/data/tls/hostile_sni.pcap');
+----
+a\255\254\032b\092c.example	complete

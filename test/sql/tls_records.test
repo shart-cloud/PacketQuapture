@@ -81,3 +81,9 @@ query II
 SELECT dns_valid, is_tls FROM read_dns('test/data/dns/response.pcapng');
 ----
 true	false
+
+# A server name that is not valid UTF-8 is escaped rather than failing the scan.
+query I
+SELECT tls_sni FROM read_packets('test/data/tls/hostile_sni.pcap') WHERE tls_sni IS NOT NULL;
+----
+a\255\254\032b\092c.example
