@@ -195,6 +195,15 @@ void TestHostileLengths() {
 	assert(lying.client_hello && !lying.has_server_name);
 }
 
+void TestEscapesServerName() {
+	assert(EscapeTlsText("example.com") == "example.com");
+	assert(EscapeTlsText("") == "");
+	assert(EscapeTlsText(std::string("a\xff\xfe b\\c", 7)) == "a\\255\\254\\032b\\092c");
+	assert(EscapeTlsText(std::string("\0", 1)) == "\\000");
+	// Escaping is injective: a literal "\255" in the input cannot collide with byte 255.
+	assert(EscapeTlsText("\\255") != EscapeTlsText("\xff"));
+}
+
 } // namespace
 
 int main() {
@@ -206,6 +215,7 @@ int main() {
 	TestTruncationsTerminate();
 	TestHostileLengths();
 	TestFuzz();
-	printf("TLS record parsing, truncation, hostile lengths and non-TLS rejection passed\n");
+	TestEscapesServerName();
+	printf("TLS record parsing, truncation, hostile lengths, name escaping and non-TLS rejection passed\n");
 	return 0;
 }

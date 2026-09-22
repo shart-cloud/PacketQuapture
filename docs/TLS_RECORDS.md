@@ -22,7 +22,7 @@ WHERE tls_handshake_type = 1 AND tls_truncated;
 | `tls_record_type` | Content type: 20 change_cipher_spec, 21 alert, 22 handshake, 23 application_data, 24 heartbeat. |
 | `tls_record_version` | The version in the record header. For a ClientHello this is a compatibility value, not the negotiated version. |
 | `tls_handshake_type` | First handshake message type in a handshake record, for example 1 ClientHello, 2 ServerHello. |
-| `tls_sni` | `host_name` from the `server_name` extension of a ClientHello that fits this packet. |
+| `tls_sni` | `host_name` from the `server_name` extension of a ClientHello that fits this packet. Bytes outside printable ASCII, and backslash, are written as decimal `\DDD` escapes. |
 | `tls_truncated` | For a ClientHello, whether it continues past this packet. |
 
 ## What the columns mean when they are NULL

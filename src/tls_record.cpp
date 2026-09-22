@@ -91,7 +91,7 @@ void ParseServerNameExtension(Cursor &cursor, TlsRecord &result) {
 			std::string name;
 			if (cursor.Take(name_length, name)) {
 				result.has_server_name = true;
-				result.server_name = name;
+				result.server_name = EscapeTlsText(name);
 			}
 			return;
 		}

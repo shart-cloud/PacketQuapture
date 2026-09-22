@@ -22,7 +22,8 @@ def extension(kind, body):
 
 
 def server_name(host):
-    entry = struct.pack("!BH", 0, len(host)) + host.encode()
+    raw = host if isinstance(host, bytes) else host.encode()
+    entry = struct.pack("!BH", 0, len(raw)) + raw
     return extension(0, struct.pack("!H", len(entry)) + entry)
 
 
@@ -169,6 +170,11 @@ def reassembly_fixtures():
         client_hello(server_name("must.not.appear")), version=0x0303
     )
     pcap(DATA / "encrypted_after_ccs.pcap", connection([hello + encrypted], [reply]))
+
+    # A server name that is not valid UTF-8, with a space and a backslash: it must
+    # be escaped rather than fail the query.
+    hostile = record(client_hello(server_name(b"a\xff\xfe b\\c.example")))
+    pcap(DATA / "hostile_sni.pcap", connection([hostile], [reply]))
 
     # TCP that is not TLS at all.
     pcap(
