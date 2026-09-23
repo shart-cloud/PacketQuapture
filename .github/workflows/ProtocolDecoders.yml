@@ -57,6 +57,14 @@ jobs:
             -o build/tls_handshake_test
           ./build/tls_handshake_test
 
+      - name: Build and test TLS fingerprint strings with sanitizers
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -g -O1 \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Isrc/include src/tls_fingerprint.cpp test/unit/tls_fingerprint_test.cpp \
+            -o build/tls_fingerprint_test
+          ./build/tls_fingerprint_test
+
       - name: Build and test protocol-independent TCP reassembly
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -g -O1 \

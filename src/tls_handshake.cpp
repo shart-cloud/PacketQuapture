@@ -146,6 +146,7 @@ bool ReadCodes(Reader &reader, size_t length_bytes, bool exact, ListBudget &budg
 	}
 	if (length / 2 > budget.cap) {
 		budget.exceeded = true;
+		out.over_limit = true;
 		return true;
 	}
 	out.present = true;
@@ -165,6 +166,7 @@ void ReadPointFormats(Reader &reader, ListBudget &budget, TlsList<uint8_t> &out)
 	}
 	if (length > budget.cap) {
 		budget.exceeded = true;
+		out.over_limit = true;
 		return;
 	}
 	out.present = true;
@@ -196,6 +198,7 @@ void ReadAlpn(Reader &reader, bool client, ListBudget &budget, TlsList<std::stri
 	}
 	if (protocols.size() > budget.cap) {
 		budget.exceeded = true;
+		out.over_limit = true;
 		return;
 	}
 	out.present = true;
@@ -206,7 +209,7 @@ void ReadAlpn(Reader &reader, bool client, ListBudget &budget, TlsList<std::stri
 // reported malformed rather than choosing one copy.
 template <class T>
 bool Duplicate(TlsList<T> &list) {
-	if (list.present || list.malformed) {
+	if (list.present || list.malformed || list.over_limit) {
 		list = TlsList<T>();
 		list.malformed = true;
 		return true;
@@ -297,6 +300,8 @@ bool ParseHello(const std::vector<uint8_t> &body, bool client, const TlsHandshak
 	} else {
 		handshake.has_negotiated_version = true;
 		handshake.negotiated_version = legacy_version;
+		handshake.has_server_legacy_version = true;
+		handshake.server_legacy_version = legacy_version;
 	}
 	if (!reader.Skip(32)) { // random
 		return false;
@@ -542,6 +547,8 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 			handshake.has_server_hello = true;
 			handshake.has_negotiated_version = from_server->has_negotiated_version;
 			handshake.negotiated_version = from_server->negotiated_version;
+			handshake.has_server_legacy_version = from_server->has_server_legacy_version;
+			handshake.server_legacy_version = from_server->server_legacy_version;
 			handshake.has_cipher_suite = from_server->has_cipher_suite;
 			handshake.cipher_suite = from_server->cipher_suite;
 			handshake.server_extensions = from_server->server_extensions;

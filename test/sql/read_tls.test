@@ -245,3 +245,71 @@ query I
 SELECT warnings FROM read_tls('test/data/tls/session.pcap');
 ----
 []
+
+# JA3 and JA3S. Expected values are tshark 4.2.2's tls.handshake.ja3, ja3_full,
+# ja3s and ja3s_full; the format is salesforce/ja3 at 502cc63. GREASE is
+# dropped and the version is legacy_version on both sides, even in TLS 1.3.
+query IIII
+SELECT ja3, ja3_full, ja3s, ja3s_full FROM read_tls('test/data/tls/browser_tls13.pcap');
+----
+7f805430de1e7d98b1de033adb58cf46	771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43-27,29-23-24,0	f4febc55ea12b31ae17cfb7e614afda8	771,4865,43-51
+
+query IIII
+SELECT ja3, ja3_full, ja3s, ja3s_full FROM read_tls('test/data/tls/tls12_alpn.pcap');
+----
+0d38ad16654d0b73f027fef0df13e5b6	771,49199-49195-156-47,0-10-11-13-16-23,23-29,0-1-2	27eabd2e03c903c0e38682b67d24b578	771,49199,65281-11-16-23
+
+# GREASE in the ServerHello is dropped too; a TLS 1.0 legacy_version is 769.
+query IIII
+SELECT ja3, ja3_full, ja3s, ja3s_full FROM read_tls('test/data/tls/ja3_legacy.pcap');
+----
+a6d8f68f8fe89f743b91590739d66a16	769,49171-53,0-10-11,23,0	184d532a16876b78846ae6a03f654890	769,49171,65281-11
+
+# Lists the hello did not carry are empty fields.
+query II
+SELECT ja3, ja3_full FROM read_tls('test/data/tls/no_extensions.pcap');
+----
+ea1e247991e541e39bf918cb7cfa5139	771,4865,,,
+
+query II
+SELECT ja3, ja3s FROM read_tls('test/data/tls/many_ciphers.pcap');
+----
+4d85fa801bdc55286bfbf67aa7af13de	NULL
+
+# Each renegotiated handshake has its own fingerprints.
+query III
+SELECT handshake_number, ja3, ja3s FROM read_tls('test/data/tls/renegotiated.pcap') ORDER BY handshake_number;
+----
+1	1e7c622032b0cb79401b0f7be3793a1a	e8c07683aecf9b16e8e33f10a5161e4e
+2	1e7c622032b0cb79401b0f7be3793a1a	e8c07683aecf9b16e8e33f10a5161e4e
+
+# The uncaptured side's fingerprint is NULL, never invented.
+query IIII
+SELECT ja3, ja3_full, ja3s, ja3s_full FROM read_tls('test/data/tls/client_only.pcap');
+----
+1e7c622032b0cb79401b0f7be3793a1a	771,4865,0,,	NULL	NULL
+
+query IIII
+SELECT ja3, ja3_full, ja3s, ja3s_full FROM read_tls('test/data/tls/server_only.pcap');
+----
+NULL	NULL	e8c07683aecf9b16e8e33f10a5161e4e	771,4865,
+
+# A malformed or over-limit input list makes the fingerprint NULL. tshark
+# hashes the valid prefix here instead (cf1e50cd... and 7a26e476...); a
+# fingerprint over part of a list matches nothing and looks as if it should.
+query IIII
+SELECT ja3, ja3_full, warnings, reassembly_status FROM read_tls('test/data/tls/malformed_groups.pcap');
+----
+NULL	NULL	[server_hello_missing, client_list_malformed]	one-sided
+
+query II
+SELECT ja3, reassembly_status FROM read_tls('test/data/tls/list_limit.pcap');
+----
+NULL	limit
+
+# The hash is the MD5 of the full string.
+query I
+SELECT count(*) FROM read_tls('test/data/tls/*.pcap')
+WHERE ja3 IS DISTINCT FROM md5(ja3_full) OR ja3s IS DISTINCT FROM md5(ja3s_full);
+----
+0

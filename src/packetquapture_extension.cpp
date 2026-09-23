@@ -17,10 +17,12 @@
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/common/types/interval.hpp"
+#include "duckdb/common/crypto/md5.hpp"
 #include "packet_decoder.hpp"
 #include "dns_decoder.hpp"
 #include "tls_record.hpp"
 #include "tls_handshake.hpp"
+#include "tls_fingerprint.hpp"
 #include "tcp_reassembly.hpp"
 #include "dns_tcp_framer.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -2307,7 +2309,11 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         "server_extensions",
 	         "server_extensions_no_grease",
 	         "server_alpn",
-	         "warnings"};
+	         "warnings",
+	         "ja3",
+	         "ja3_full",
+	         "ja3s",
+	         "ja3s_full"};
 	const auto codes = LogicalType::LIST(LogicalType::USMALLINT);
 	const auto text = LogicalType::LIST(LogicalType::VARCHAR);
 	types = {LogicalType::VARCHAR,
@@ -2351,7 +2357,11 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         codes,
 	         codes,
 	         LogicalType::VARCHAR,
-	         text};
+	         text,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR};
 	auto &bind = result->Cast<PcapBindData>();
 	bind.types = types;
 	bind.stream_plan =
@@ -2576,6 +2586,26 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 			values.push_back(Value(warning));
 		}
 		vector.SetValue(row, Value::LIST(LogicalType::VARCHAR, values));
+		break;
+	}
+	// Fingerprints are built only when projected, like every other column, so
+	// queries that do not ask for them pay nothing. NULL rather than a hash of
+	// partial input; see tls_fingerprint.hpp.
+	case 42:
+	case 43:
+	case 44:
+	case 45: {
+		std::string text;
+		const bool client = column == 42 || column == 43;
+		if (!(client ? packetquapture::Ja3String(handshake, text) : packetquapture::Ja3sString(handshake, text))) {
+			FlatVector::SetNull(vector, row, true);
+		} else if (column == 43 || column == 45) {
+			vector.SetValue(row, Value(text));
+		} else {
+			MD5Context md5;
+			md5.Add(text);
+			vector.SetValue(row, Value(md5.FinishHex()));
+		}
 		break;
 	}
 	default:

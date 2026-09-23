@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Compare read_tls hello lists with tshark, handshake by handshake.
+"""Compare read_tls hello lists and fingerprints with tshark, handshake by handshake.
 
-tshark is the reference implementation for the parsed lists and, later, the
+tshark is the reference implementation for the parsed lists and the JA3/JA3S
 fingerprints computed from them. Expected values in the SQL tests are literals
 taken from tshark; this script is how they were checked, and how a corpus
 sample is compared before a fingerprint PR.
@@ -33,7 +33,13 @@ LISTS = [
     ("client_alpn", "tls.handshake.extensions_alpn_str", 1, None),
     ("server_extensions", "tls.handshake.extension.type", 2, False),
     ("server_alpn", "tls.handshake.extensions_alpn_str", 2, None),
+    ("ja3", "tls.handshake.ja3", 1, None),
+    ("ja3_full", "tls.handshake.ja3_full", 1, None),
+    ("ja3s", "tls.handshake.ja3s", 2, None),
+    ("ja3s_full", "tls.handshake.ja3s_full", 2, None),
 ]
+# Columns holding one value rather than a list.
+SCALARS = {"server_alpn", "ja3", "ja3_full", "ja3s", "ja3s_full"}
 # Lists every parsed hello has: tshark shows no field for an empty one.
 ALWAYS_PRESENT = {"client_cipher_suites", "client_extensions", "server_extensions"}
 AMBIGUOUS = object()
@@ -67,7 +73,7 @@ def ours(path, duckdb):
     # The CLI's JSON mode renders lists unquoted and this build has no json
     # extension, so each list travels as a unit-separated string.
     def encode(column):
-        if column == "server_alpn":
+        if column in SCALARS:
             return column
         return f"array_to_string(list_transform({column}, lambda x: x::VARCHAR), chr(31)) AS {column}"
 
@@ -80,7 +86,7 @@ def ours(path, duckdb):
     for row in rows:
         for column, _, _, hex_values in LISTS:
             value = row[column]
-            if value is None or column == "server_alpn":
+            if value is None or column in SCALARS:
                 continue
             parts = value.split("\x1f") if value else []
             row[column] = parts if hex_values is None else [int(part) for part in parts]
@@ -118,7 +124,7 @@ def compare(path, duckdb):
             if expected is None and column in ALWAYS_PRESENT:
                 expected = []
             actual = row[column]
-            if column == "server_alpn" and expected is not None:
+            if column in SCALARS and expected is not None:
                 expected = expected[0] if len(expected) == 1 else expected
             if hex_values is None and expected is not None:
                 # tshark cannot render arbitrary bytes faithfully; compare only
@@ -161,8 +167,9 @@ def main():
         for i, value in enumerate(compare(capture, args.duckdb)):
             totals[i] += value
     checked, failures, divergences, skipped, missed = totals
-    print(f"{checked} lists compared, {failures} disagreements, "
-          f"{divergences} documented divergences (malformed or over-limit lists reported NULL), "
+    print(f"{checked} values compared, {failures} disagreements, "
+          f"{divergences} documented divergences (malformed or over-limit lists, and fingerprints over them, "
+          f"reported NULL), "
           f"{skipped} skipped (several hellos in one packet), {missed} tshark hellos without a read_tls row")
     return 1 if failures else 0
 

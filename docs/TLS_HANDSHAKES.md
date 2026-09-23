@@ -69,6 +69,8 @@ one row. That is a different shape, and it needs rules the DNS reader never had.
 | `server_alpn` | The protocol the server selected. Always NULL for TLS 1.3, which sends it encrypted. |
 | `*_no_grease` | The same list without RFC 8701 GREASE values. |
 | `warnings` | See below. |
+| `ja3`, `ja3_full` | JA3 client fingerprint and the string it hashes. See below. |
+| `ja3s`, `ja3s_full` | JA3S server fingerprint and the string it hashes. |
 
 ## Hello lists
 
@@ -124,6 +126,28 @@ whatever the status. It is `[]` when there are none and is never NULL.
 | `client_hello_invalid`, `server_hello_invalid` | That hello was seen but failed to parse. |
 | `client_list_malformed`, `server_list_malformed` | At least one of that side's lists is NULL because it was malformed. |
 
+## JA3 and JA3S
+
+The format is [salesforce/ja3](https://github.com/salesforce/ja3) at `502cc63`, and the
+expected values in `read_tls.test` come from tshark 4.2.2's `tls.handshake.ja3*` fields:
+
+```text
+ja3_full   legacy_version,cipher_suites,extensions,supported_groups,ec_point_formats
+ja3s_full  legacy_version,cipher_suite,extensions
+```
+
+Values are decimal and joined with `-`, in wire order. GREASE values are dropped, from
+the ServerHello too. A list the hello did not carry is an empty field. `ja3` and `ja3s`
+are the MD5 of those strings. The version is `legacy_version` on both sides, so a TLS
+1.3 exchange reads 771, not the `negotiated_version` 772.
+
+A fingerprint is NULL when its hello was not captured or failed to parse, or when one
+of its inputs was malformed or over `max_list_entries`. tshark hashes the valid prefix
+of such a list instead. Those rows carry `client_list_malformed` or status `limit`.
+The fingerprint is built only when a query selects it.
+
+`scripts/compare_tls_tshark.py` compares the fingerprints along with the lists.
+
 ## `session_resumed` is often NULL
 
 A server resumed a session when it echoed back a non-empty session id the client offered.
@@ -178,9 +202,9 @@ that would have matched it.
 
 ## Not yet implemented
 
-JA3/JA4/JA4S fingerprints and the certificate chain. The fingerprints are computed from
-the lists above and must match their reference implementations byte for byte. The
-certificate is in a later handshake message that this reader does not yet parse.
+JA4/JA4S fingerprints and the certificate chain. JA4 is computed from the lists above
+and must match its reference implementation byte for byte. The certificate is in a
+later handshake message that this reader does not yet parse.
 
 On busy captures most handshakes can go missing entirely. The transport core tracks
 1,024 TCP directions per file (see [TCP streams](TCP_STREAMS.md)), and once that is
