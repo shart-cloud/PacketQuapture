@@ -145,3 +145,103 @@ query II
 SELECT tls_sni, reassembly_status FROM read_tls('test/data/tls/hostile_sni.pcap');
 ----
 a\255\254\032b\092c.example	complete
+
+# Parsed hello lists. Expected values are tshark 4.2.2's, converted to decimal;
+# scripts/compare_tls_tshark.py repeats the comparison over every fixture.
+# Lists are in wire order and include GREASE; the _no_grease twins drop the
+# RFC 8701 values.
+query IIIII
+SELECT client_cipher_suites, client_extensions, client_supported_groups,
+       client_signature_algorithms, client_supported_versions
+FROM read_tls('test/data/tls/browser_tls13.pcap');
+----
+[2570, 4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392, 49171, 49172, 156, 157, 47, 53]	[6682, 0, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43, 27, 19018]	[10794, 29, 23, 24]	[1027, 2052, 1025, 1283, 2053, 1281, 2054, 1537]	[14906, 772, 771]
+
+query IIIII
+SELECT client_cipher_suites_no_grease, client_extensions_no_grease, client_supported_groups_no_grease,
+       client_signature_algorithms_no_grease, client_supported_versions_no_grease
+FROM read_tls('test/data/tls/browser_tls13.pcap');
+----
+[4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392, 49171, 49172, 156, 157, 47, 53]	[0, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43, 27]	[29, 23, 24]	[1027, 2052, 1025, 1283, 2053, 1281, 2054, 1537]	[772, 771]
+
+# TLS 1.3 encrypts ALPN, so the ServerHello carries none.
+query IIIIIII
+SELECT client_ec_point_formats, client_alpn, client_alpn_no_grease, server_extensions,
+       server_alpn, negotiated_version, warnings
+FROM read_tls('test/data/tls/browser_tls13.pcap');
+----
+[0]	[h2, http/1.1]	[h2, http/1.1]	[43, 51]	NULL	772	[]
+
+query IIIIIIII
+SELECT client_cipher_suites, client_extensions, client_supported_groups, client_signature_algorithms,
+       client_supported_versions, client_ec_point_formats, server_extensions, server_alpn
+FROM read_tls('test/data/tls/tls12_alpn.pcap');
+----
+[49199, 49195, 156, 47]	[0, 10, 11, 13, 16, 23]	[23, 29]	[1025, 1027]	NULL	[0, 1, 2]	[65281, 11, 16, 23]	http/1.1
+
+# More than 99 cipher suites and no SNI: every suite is kept.
+query IIII
+SELECT len(client_cipher_suites), client_cipher_suites[1], client_cipher_suites[-1], tls_sni
+FROM read_tls('test/data/tls/many_ciphers.pcap');
+----
+120	1	120	NULL
+
+# A list the hello did not carry is NULL; one it carried empty is []. A parsed
+# hello always has cipher suites and extension types.
+query IIII
+SELECT client_cipher_suites, client_extensions, client_supported_groups, client_alpn
+FROM read_tls('test/data/tls/no_extensions.pcap');
+----
+[4865]	[]	NULL	NULL
+
+# ALPN identifiers are peer-supplied bytes and are escaped like tls_sni. The
+# GREASE identifier 0x0A0A is two newlines, dropped from the filtered twin.
+query II
+SELECT client_alpn, client_alpn_no_grease
+FROM read_tls('test/data/tls/alpn_edges.pcap') ORDER BY client_port;
+----
+[\010\010, h2]	[h2]
+[x]	[x]
+[\171\001, h2]	[\171\001, h2]
+
+# supported_groups with an odd length. tshark reads a partial list; read_tls
+# reports it NULL with a warning, and the rest of the hello still parses.
+query IIIII
+SELECT tls_sni, client_supported_groups, client_extensions, reassembly_status, warnings
+FROM read_tls('test/data/tls/malformed_groups.pcap');
+----
+odd.example.com	NULL	[0, 10]	one-sided	[server_hello_missing, client_list_malformed]
+
+# More cipher suites than max_list_entries: the hello is reported at the limit
+# rather than with a list silently cut short.
+query III
+SELECT client_cipher_suites, reassembly_status, reassembly_error
+FROM read_tls('test/data/tls/list_limit.pcap');
+----
+NULL	limit	TLS hello list exceeds the per-list limit
+
+# One side captured: that side's lists are reported, the other side's are
+# NULL, and warnings names the missing side.
+query IIII
+SELECT client_cipher_suites, server_extensions, reassembly_status, warnings
+FROM read_tls('test/data/tls/client_only.pcap');
+----
+[4865]	NULL	one-sided	[server_hello_missing]
+
+query IIII
+SELECT client_cipher_suites, server_extensions, reassembly_status, warnings
+FROM read_tls('test/data/tls/server_only.pcap');
+----
+NULL	[]	one-sided	[client_hello_missing]
+
+# Without a SYN the status is unanchored, which outranks one-sided: warnings is
+# where the missing side is still visible.
+query II
+SELECT reassembly_status, warnings FROM read_tls('test/data/tls/no_sni.pcap');
+----
+unanchored	[server_hello_missing]
+
+query I
+SELECT warnings FROM read_tls('test/data/tls/session.pcap');
+----
+[]

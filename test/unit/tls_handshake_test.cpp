@@ -177,6 +177,7 @@ void TestOrphanClientHello() {
 	assert(!done[0].has_negotiated_version && !done[0].has_cipher_suite);
 	assert(!done[0].has_server_stream);
 	assert(done[0].status == "one-sided");
+	assert((done[0].warnings == std::vector<std::string> {"server_hello_missing"}));
 	assert(assembler.Empty());
 }
 
@@ -409,6 +410,233 @@ void TestFuzz() {
 	assert(reported * 100 < 5000);
 }
 
+std::vector<uint8_t> Extension(uint16_t type, const std::vector<uint8_t> &body) {
+	std::vector<uint8_t> out;
+	Append16(out, type);
+	Append16(out, static_cast<uint16_t>(body.size()));
+	out.insert(out.end(), body.begin(), body.end());
+	return out;
+}
+
+std::vector<uint8_t> Codes(const std::vector<uint16_t> &codes, size_t length_bytes = 2) {
+	std::vector<uint8_t> out;
+	if (length_bytes == 1) {
+		out.push_back(static_cast<uint8_t>(codes.size() * 2));
+	} else {
+		Append16(out, static_cast<uint16_t>(codes.size() * 2));
+	}
+	for (const auto code : codes) {
+		Append16(out, code);
+	}
+	return out;
+}
+
+std::vector<uint8_t> Alpn(const std::vector<std::string> &protocols) {
+	std::vector<uint8_t> list;
+	for (const auto &protocol : protocols) {
+		list.push_back(static_cast<uint8_t>(protocol.size()));
+		list.insert(list.end(), protocol.begin(), protocol.end());
+	}
+	std::vector<uint8_t> body;
+	Append16(body, static_cast<uint16_t>(list.size()));
+	body.insert(body.end(), list.begin(), list.end());
+	return Extension(16, body);
+}
+
+std::vector<uint8_t> ClientHelloWith(const std::vector<uint16_t> &ciphers, const std::vector<uint8_t> &extensions) {
+	std::vector<uint8_t> body;
+	Append16(body, 0x0303);
+	body.insert(body.end(), 32, 0xAB);
+	body.push_back(0);
+	const auto suites = Codes(ciphers);
+	body.insert(body.end(), suites.begin(), suites.end());
+	body.push_back(1);
+	body.push_back(0);
+	Append16(body, static_cast<uint16_t>(extensions.size()));
+	body.insert(body.end(), extensions.begin(), extensions.end());
+	return Message(body, 1);
+}
+
+TlsHandshake OrphanClient(const std::vector<uint8_t> &hello, TlsHandshakeLimits limits = TlsHandshakeLimits()) {
+	TlsHandshakeAssembler assembler(limits);
+	assembler.Add(Stream(Key(), 1, Record(hello), 1));
+	auto done = assembler.Finish();
+	assert(done.size() == 1);
+	return done[0];
+}
+
+bool HasWarning(const TlsHandshake &handshake, const std::string &code) {
+	for (const auto &warning : handshake.warnings) {
+		if (warning == code) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void TestGreaseValues() {
+	size_t count = 0;
+	for (uint32_t value = 0; value <= 0xFFFF; ++value) {
+		count += IsTlsGrease(static_cast<uint16_t>(value)) ? 1 : 0;
+	}
+	// RFC 8701: exactly 0x0A0A, 0x1A1A, ..., 0xFAFA.
+	assert(count == 16);
+	assert(IsTlsGrease(0x0A0A) && IsTlsGrease(0xFAFA));
+	assert(!IsTlsGrease(0x0A1A) && !IsTlsGrease(0x0B0B) && !IsTlsGrease(0x1301));
+	assert(IsTlsGreaseAlpn(std::string("\x0a\x0a", 2)) && IsTlsGreaseAlpn(std::string("\xfa\xfa", 2)));
+	assert(!IsTlsGreaseAlpn("h2") && !IsTlsGreaseAlpn(std::string("\x0a\x0a\x0a", 3)) && !IsTlsGreaseAlpn(""));
+}
+
+// Every list is kept in wire order with GREASE included; filtering is the
+// reader's job, so both forms stay available.
+void TestHelloLists() {
+	std::vector<uint8_t> extensions;
+	const std::vector<std::vector<uint8_t>> parts = {
+	    Extension(0x1A1A, {}),
+	    ServerNameExtension("lists.example"),
+	    Extension(10, Codes({0x2A2A, 0x001D, 0x0017})),
+	    Extension(11, {2, 0, 1}),
+	    Extension(13, Codes({0x0804, 0x0403})),
+	    Alpn({"h2", "http/1.1"}),
+	    Extension(43, Codes({0x3A3A, 0x0304, 0x0303}, 1)),
+	};
+	for (const auto &part : parts) {
+		extensions.insert(extensions.end(), part.begin(), part.end());
+	}
+	TlsHandshakeAssembler assembler;
+	const auto key = Key();
+	assembler.Add(Stream(key, 1, Record(ClientHelloWith({0x0A0A, 0xC02F, 0x1301}, extensions)), 1));
+	const auto server_extensions = Concat(SupportedVersions(0x0304), Alpn({"h2"}));
+	auto done = assembler.Add(Stream(key.Reverse(), 2, Record(ServerHello(0x1301, server_extensions)), 2));
+	assert(done.size() == 1);
+	const auto &h = done[0];
+	assert(h.status == "complete" && h.warnings.empty());
+	assert(h.client_cipher_suites.present);
+	assert((h.client_cipher_suites.values == std::vector<uint16_t> {0x0A0A, 0xC02F, 0x1301}));
+	assert((h.client_extensions.values == std::vector<uint16_t> {0x1A1A, 0, 10, 11, 13, 16, 43}));
+	assert((h.client_supported_groups.values == std::vector<uint16_t> {0x2A2A, 0x001D, 0x0017}));
+	assert((h.client_ec_point_formats.values == std::vector<uint8_t> {0, 1}));
+	assert((h.client_signature_algorithms.values == std::vector<uint16_t> {0x0804, 0x0403}));
+	assert((h.client_supported_versions.values == std::vector<uint16_t> {0x3A3A, 0x0304, 0x0303}));
+	assert((h.client_alpn.values == std::vector<std::string> {"h2", "http/1.1"}));
+	assert((h.server_extensions.values == std::vector<uint16_t> {43, 16}));
+	assert(h.server_alpn.present && h.server_alpn.values.size() == 1 && h.server_alpn.values[0] == "h2");
+}
+
+// Absent and empty are different answers.
+void TestAbsentAndEmptyLists() {
+	const auto bare = OrphanClient(ClientHelloWith({0x1301}, {}));
+	assert(bare.client_extensions.present && bare.client_extensions.values.empty());
+	assert(!bare.client_supported_groups.present && !bare.client_supported_groups.malformed);
+	assert(!bare.client_alpn.present);
+	const auto empty = OrphanClient(ClientHelloWith({0x1301}, Extension(10, Codes({}))));
+	assert(empty.client_supported_groups.present && empty.client_supported_groups.values.empty());
+	// One side only: the other side's lists are absent and the row says why.
+	assert(!bare.server_extensions.present);
+	assert((bare.warnings == std::vector<std::string> {"server_hello_missing"}));
+}
+
+// A malformed list is reported absent, never partial, and the rest of the
+// hello is unaffected.
+void TestMalformedLists() {
+	std::vector<uint8_t> odd_groups = {0, 3, 0, 0x1D, 0};
+	const auto odd =
+	    OrphanClient(ClientHelloWith({0x1301}, Concat(ServerNameExtension("odd"), Extension(10, odd_groups))));
+	assert(!odd.client_supported_groups.present && odd.client_supported_groups.malformed);
+	assert(odd.has_sni && odd.sni == "odd" && odd.status == "one-sided");
+	assert(HasWarning(odd, "client_list_malformed"));
+
+	// Trailing bytes after the vector inside an extension body.
+	const auto trailing = OrphanClient(ClientHelloWith({0x1301}, Extension(13, Concat(Codes({0x0403}), {0}))));
+	assert(trailing.client_signature_algorithms.malformed);
+
+	// An odd-length cipher suite vector.
+	std::vector<uint8_t> body;
+	Append16(body, 0x0303);
+	body.insert(body.end(), 32, 0);
+	body.push_back(0);
+	Append16(body, 3);
+	body.insert(body.end(), {0x13, 0x01, 0x13});
+	body.push_back(1);
+	body.push_back(0);
+	const auto odd_ciphers = OrphanClient(Message(body, 1));
+	assert(!odd_ciphers.client_cipher_suites.present && odd_ciphers.client_cipher_suites.malformed);
+	assert(HasWarning(odd_ciphers, "client_list_malformed"));
+
+	// ALPN with an empty protocol name, which RFC 7301 forbids.
+	std::vector<uint8_t> alpn_body = {0, 3, 0, 1, 'x'};
+	const auto empty_name = OrphanClient(ClientHelloWith({0x1301}, Extension(16, alpn_body)));
+	assert(!empty_name.client_alpn.present && empty_name.client_alpn.malformed);
+
+	// A repeated extension is malformed rather than resolved by picking one.
+	const auto twice = OrphanClient(ClientHelloWith({0x1301}, Concat(Alpn({"h2"}), Alpn({"h3"}))));
+	assert(!twice.client_alpn.present && twice.client_alpn.malformed);
+	assert((twice.client_extensions.values == std::vector<uint16_t> {16, 16}));
+
+	// A server must select exactly one protocol.
+	TlsHandshakeAssembler assembler;
+	assembler.Add(Stream(Key().Reverse(), 2, Record(ServerHello(0x1301, Alpn({"h2", "h3"}))), 2));
+	auto done = assembler.Finish();
+	assert(done.size() == 1 && !done[0].server_alpn.present && done[0].server_alpn.malformed);
+	assert(HasWarning(done[0], "server_list_malformed") && HasWarning(done[0], "client_hello_missing"));
+}
+
+void TestInvalidHelloReportsNoLists() {
+	// Extension framing that runs past the hello.
+	auto hello = ClientHelloWith({0x0A0A, 0x1301}, Extension(10, Codes({0x001D})));
+	hello[hello.size() - 5] = 0xFF;
+	const auto invalid = OrphanClient(hello);
+	assert(invalid.status == "invalid");
+	assert(!invalid.client_cipher_suites.present && !invalid.client_extensions.present);
+	assert(HasWarning(invalid, "client_hello_invalid"));
+}
+
+void TestListEntryLimit() {
+	TlsHandshakeLimits limits;
+	limits.max_list_entries = 4;
+	const auto within = OrphanClient(ClientHelloWith({1, 2, 3, 4}, {}), limits);
+	assert(within.client_cipher_suites.values.size() == 4 && within.status == "one-sided");
+	const auto over = OrphanClient(ClientHelloWith({1, 2, 3, 4, 5}, {}), limits);
+	assert(!over.client_cipher_suites.present && !over.client_cipher_suites.malformed);
+	assert(over.status == "limit");
+}
+
+// Random extension bodies behind valid framing: lists are bounded, and a list
+// is never both present and malformed.
+void TestListFuzz() {
+	std::mt19937 rng(20260922);
+	std::uniform_int_distribution<int> byte(0, 255);
+	std::uniform_int_distribution<size_t> length(0, 40);
+	const uint16_t types[] = {10, 11, 13, 16, 43};
+	TlsHandshakeLimits limits;
+	limits.max_list_entries = 8;
+	for (size_t round = 0; round < 20000; ++round) {
+		std::vector<uint8_t> extensions;
+		for (size_t i = 0; i < 3; ++i) {
+			std::vector<uint8_t> body(length(rng));
+			for (auto &value : body) {
+				value = static_cast<uint8_t>(byte(rng));
+			}
+			const auto part = Extension(types[rng() % 5], body);
+			extensions.insert(extensions.end(), part.begin(), part.end());
+		}
+		TlsHandshakeAssembler assembler(limits);
+		assembler.Add(Stream(Key(), 1, Record(ClientHelloWith({0x1301}, extensions)), 1));
+		for (const auto &h : assembler.Finish()) {
+			assert(!(h.client_supported_groups.present && h.client_supported_groups.malformed));
+			assert(!(h.client_alpn.present && h.client_alpn.malformed));
+			assert(h.client_supported_groups.values.size() <= 8);
+			assert(h.client_signature_algorithms.values.size() <= 8);
+			assert(h.client_supported_versions.values.size() <= 8);
+			assert(h.client_ec_point_formats.values.size() <= 8);
+			assert(h.client_alpn.values.size() <= 8);
+			for (const auto &protocol : h.client_alpn.values) {
+				assert(!protocol.empty());
+			}
+		}
+	}
+}
+
 // Every truncation of a complete two-directional exchange must terminate and
 // must never report a name it could not have read.
 void TestTruncationsTerminate() {
@@ -450,6 +678,13 @@ int main() {
 	TestHandshakeCountLimit();
 	TestTruncationsTerminate();
 	TestFuzz();
-	printf("TLS handshake pairing, orphans, renegotiation, resumption and limits passed\n");
+	TestGreaseValues();
+	TestHelloLists();
+	TestAbsentAndEmptyLists();
+	TestMalformedLists();
+	TestInvalidHelloReportsNoLists();
+	TestListEntryLimit();
+	TestListFuzz();
+	printf("TLS handshake pairing, orphans, renegotiation, resumption, limits and hello lists passed\n");
 	return 0;
 }

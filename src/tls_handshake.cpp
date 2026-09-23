@@ -113,9 +113,113 @@ void ParseServerName(Reader &reader, TlsHandshake &handshake) {
 	}
 }
 
+const uint16_t EXTENSION_SUPPORTED_GROUPS = 10;
+const uint16_t EXTENSION_EC_POINT_FORMATS = 11;
+const uint16_t EXTENSION_SIGNATURE_ALGORITHMS = 13;
+const uint16_t EXTENSION_ALPN = 16;
+
+// Set when a parsed list is longer than the per-list limit. The hello is then
+// reported with status limit rather than with a list silently cut short.
+struct ListBudget {
+	explicit ListBudget(size_t cap_p) : cap(cap_p), exceeded(false) {
+	}
+	size_t cap;
+	bool exceeded;
+};
+
+// Reads a length-prefixed vector of 16-bit code points. With exact set, the
+// vector must fill the rest of the reader, as it does in an extension body.
+// Returns false only when the reader itself overran; a vector that is
+// well-framed but internally wrong is marked malformed instead.
+bool ReadCodes(Reader &reader, size_t length_bytes, bool exact, ListBudget &budget, TlsList<uint16_t> &out) {
+	const size_t length = length_bytes == 1 ? reader.U8() : reader.U16();
+	std::vector<uint8_t> bytes;
+	if (reader.Overrun() || !reader.TakeBytes(length, bytes)) {
+		out = TlsList<uint16_t>();
+		out.malformed = true;
+		return false;
+	}
+	out = TlsList<uint16_t>();
+	if (length % 2 != 0 || (exact && reader.Remaining() != 0)) {
+		out.malformed = true;
+		return true;
+	}
+	if (length / 2 > budget.cap) {
+		budget.exceeded = true;
+		return true;
+	}
+	out.present = true;
+	for (size_t i = 0; i < length; i += 2) {
+		out.values.push_back(static_cast<uint16_t>((bytes[i] << 8U) | bytes[i + 1]));
+	}
+	return true;
+}
+
+void ReadPointFormats(Reader &reader, ListBudget &budget, TlsList<uint8_t> &out) {
+	const size_t length = reader.U8();
+	std::vector<uint8_t> bytes;
+	out = TlsList<uint8_t>();
+	if (reader.Overrun() || !reader.TakeBytes(length, bytes) || reader.Remaining() != 0) {
+		out.malformed = true;
+		return;
+	}
+	if (length > budget.cap) {
+		budget.exceeded = true;
+		return;
+	}
+	out.present = true;
+	out.values = bytes;
+}
+
+// RFC 7301: a vector of non-empty protocol names, each a one-byte length and
+// raw bytes. A server must select exactly one.
+void ReadAlpn(Reader &reader, bool client, ListBudget &budget, TlsList<std::string> &out) {
+	out = TlsList<std::string>();
+	const uint16_t list_length = reader.U16();
+	if (reader.Overrun() || reader.Remaining() != list_length) {
+		out.malformed = true;
+		return;
+	}
+	std::vector<std::string> protocols;
+	while (reader.Remaining() > 0) {
+		const size_t length = reader.U8();
+		std::string protocol;
+		if (reader.Overrun() || length == 0 || !reader.Take(length, protocol)) {
+			out.malformed = true;
+			return;
+		}
+		protocols.push_back(protocol);
+	}
+	if (protocols.empty() || (!client && protocols.size() != 1)) {
+		out.malformed = true;
+		return;
+	}
+	if (protocols.size() > budget.cap) {
+		budget.exceeded = true;
+		return;
+	}
+	out.present = true;
+	out.values = protocols;
+}
+
+// A second copy of an extension is forbidden (RFC 8446 4.2), so its list is
+// reported malformed rather than choosing one copy.
+template <class T>
+bool Duplicate(TlsList<T> &list) {
+	if (list.present || list.malformed) {
+		list = TlsList<T>();
+		list.malformed = true;
+		return true;
+	}
+	return false;
+}
+
 // A ClientHello offers a list of versions; a ServerHello names the one chosen.
-void ParseSupportedVersions(Reader &reader, bool client, TlsHandshake &handshake) {
+void ParseSupportedVersions(Reader &reader, bool client, ListBudget &budget, TlsHandshake &handshake) {
 	if (client) {
+		if (!Duplicate(handshake.client_supported_versions)) {
+			ReadCodes(reader, 1, true, budget, handshake.client_supported_versions);
+		}
 		return;
 	}
 	const uint16_t version = reader.U16();
@@ -125,12 +229,15 @@ void ParseSupportedVersions(Reader &reader, bool client, TlsHandshake &handshake
 	}
 }
 
-// Walks the extension list, reading only what this layer reports.
-bool ParseExtensions(Reader &reader, bool client, const TlsHandshakeLimits &limits, TlsHandshake &handshake) {
+// Walks the extension list, recording every type in order and reading the
+// bodies this layer reports.
+bool ParseExtensions(Reader &reader, bool client, const TlsHandshakeLimits &limits, ListBudget &budget,
+                     TlsHandshake &handshake) {
 	const uint16_t extensions_length = reader.U16();
 	if (reader.Overrun()) {
 		return false;
 	}
+	auto &types = client ? handshake.client_extensions : handshake.server_extensions;
 	size_t consumed = 0, count = 0;
 	while (consumed + 4 <= extensions_length) {
 		const uint16_t type = reader.U16();
@@ -147,11 +254,29 @@ bool ParseExtensions(Reader &reader, bool client, const TlsHandshakeLimits &limi
 			return false;
 		}
 		consumed += length;
+		types.values.push_back(type);
 		Reader inner(body.data(), body.size());
 		if (type == EXTENSION_SERVER_NAME && client) {
 			ParseServerName(inner, handshake);
 		} else if (type == EXTENSION_SUPPORTED_VERSIONS) {
-			ParseSupportedVersions(inner, client, handshake);
+			ParseSupportedVersions(inner, client, budget, handshake);
+		} else if (client && type == EXTENSION_SUPPORTED_GROUPS) {
+			if (!Duplicate(handshake.client_supported_groups)) {
+				ReadCodes(inner, 2, true, budget, handshake.client_supported_groups);
+			}
+		} else if (client && type == EXTENSION_SIGNATURE_ALGORITHMS) {
+			if (!Duplicate(handshake.client_signature_algorithms)) {
+				ReadCodes(inner, 2, true, budget, handshake.client_signature_algorithms);
+			}
+		} else if (client && type == EXTENSION_EC_POINT_FORMATS) {
+			if (!Duplicate(handshake.client_ec_point_formats)) {
+				ReadPointFormats(inner, budget, handshake.client_ec_point_formats);
+			}
+		} else if (type == EXTENSION_ALPN) {
+			auto &alpn = client ? handshake.client_alpn : handshake.server_alpn;
+			if (!Duplicate(alpn)) {
+				ReadAlpn(inner, client, budget, alpn);
+			}
 		}
 	}
 	return !reader.Overrun();
@@ -180,8 +305,9 @@ bool ParseHello(const std::vector<uint8_t> &body, bool client, const TlsHandshak
 	if (reader.Overrun() || !reader.TakeBytes(session_length, session_id)) {
 		return false;
 	}
+	ListBudget budget(limits.max_list_entries);
 	if (client) {
-		if (!reader.SkipVector(2)) { // cipher_suites
+		if (!ReadCodes(reader, 2, false, budget, handshake.client_cipher_suites)) {
 			return false;
 		}
 		if (!reader.SkipVector(1)) { // legacy_compression_methods
@@ -198,11 +324,35 @@ bool ParseHello(const std::vector<uint8_t> &body, bool client, const TlsHandshak
 			return false;
 		}
 	}
+	// The hello parsed this far, so its extension list is known: absent means
+	// it offered none.
+	auto &types = client ? handshake.client_extensions : handshake.server_extensions;
+	types.present = true;
 	// A hello with no extension list at all is legal and simply offers nothing.
-	if (reader.Remaining() == 0) {
-		return true;
+	if (reader.Remaining() != 0 && !ParseExtensions(reader, client, limits, budget, handshake)) {
+		return false;
 	}
-	return ParseExtensions(reader, client, limits, handshake);
+	if (budget.exceeded) {
+		handshake.status = "limit";
+		handshake.error = "TLS hello list exceeds the per-list limit";
+	}
+	return true;
+}
+
+// A hello that failed to parse reports none of the fields read before the
+// failure: a partial list is worse than none, since it looks complete.
+void ClearHello(TlsHandshake &handshake) {
+	handshake.has_sni = false;
+	handshake.sni.clear();
+	handshake.client_cipher_suites = TlsList<uint16_t>();
+	handshake.client_extensions = TlsList<uint16_t>();
+	handshake.client_supported_groups = TlsList<uint16_t>();
+	handshake.client_signature_algorithms = TlsList<uint16_t>();
+	handshake.client_supported_versions = TlsList<uint16_t>();
+	handshake.client_ec_point_formats = TlsList<uint8_t>();
+	handshake.client_alpn = TlsList<std::string>();
+	handshake.server_extensions = TlsList<uint16_t>();
+	handshake.server_alpn = TlsList<std::string>();
 }
 
 } // namespace
@@ -327,8 +477,7 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 			if (!ParseHello(body, client, limits, handshake, session_id)) {
 				handshake.status = "invalid";
 				handshake.error = client ? "ClientHello is malformed" : "ServerHello is malformed";
-				handshake.has_sni = false;
-				handshake.sni.clear();
+				ClearHello(handshake);
 			}
 			const auto span = locator.Locate(message_offset, length + 4);
 			if (span.second > 0) {
@@ -377,6 +526,13 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 			handshake.sni = from_client->sni;
 			handshake.has_client_version = from_client->has_client_version;
 			handshake.client_version = from_client->client_version;
+			handshake.client_cipher_suites = from_client->client_cipher_suites;
+			handshake.client_extensions = from_client->client_extensions;
+			handshake.client_supported_groups = from_client->client_supported_groups;
+			handshake.client_signature_algorithms = from_client->client_signature_algorithms;
+			handshake.client_supported_versions = from_client->client_supported_versions;
+			handshake.client_ec_point_formats = from_client->client_ec_point_formats;
+			handshake.client_alpn = from_client->client_alpn;
 			handshake.first = from_client->first;
 			handshake.last = from_client->last;
 			handshake.status = from_client->status;
@@ -388,6 +544,8 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 			handshake.negotiated_version = from_server->negotiated_version;
 			handshake.has_cipher_suite = from_server->has_cipher_suite;
 			handshake.cipher_suite = from_server->cipher_suite;
+			handshake.server_extensions = from_server->server_extensions;
+			handshake.server_alpn = from_server->server_alpn;
 			if (from_client == nullptr) {
 				handshake.first = from_server->first;
 				handshake.last = from_server->last;
@@ -432,6 +590,29 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 		// connection is often all that was captured.
 		if (handshake.status.empty()) {
 			handshake.status = from_client == nullptr || from_server == nullptr ? "one-sided" : "complete";
+		}
+		// reassembly_status holds one value and a more specific one wins, so an
+		// uncaptured side is also stated here, where no other status can hide it.
+		if (from_client == nullptr) {
+			handshake.warnings.push_back("client_hello_missing");
+		}
+		if (from_server == nullptr) {
+			handshake.warnings.push_back("server_hello_missing");
+		}
+		if (from_client != nullptr && from_client->status == "invalid") {
+			handshake.warnings.push_back("client_hello_invalid");
+		}
+		if (from_server != nullptr && from_server->status == "invalid") {
+			handshake.warnings.push_back("server_hello_invalid");
+		}
+		if (from_client != nullptr &&
+		    (from_client->client_cipher_suites.malformed || from_client->client_supported_groups.malformed ||
+		     from_client->client_signature_algorithms.malformed || from_client->client_supported_versions.malformed ||
+		     from_client->client_ec_point_formats.malformed || from_client->client_alpn.malformed)) {
+			handshake.warnings.push_back("client_list_malformed");
+		}
+		if (from_server != nullptr && from_server->server_alpn.malformed) {
+			handshake.warnings.push_back("server_list_malformed");
 		}
 		result.push_back(handshake);
 	}

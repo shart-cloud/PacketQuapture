@@ -36,6 +36,73 @@ def client_hello(extensions=b"", session_id=b"", version=0x0303):
     return handshake(body, 1)
 
 
+def u16s(values):
+    return b"".join(struct.pack("!H", v) for v in values)
+
+
+def vector16(body):
+    return struct.pack("!H", len(body)) + body
+
+
+def vector8(body):
+    return struct.pack("!B", len(body)) + body
+
+
+def alpn(protocols):
+    return extension(16, vector16(b"".join(vector8(p) for p in protocols)))
+
+
+def full_client_hello(ciphers, extensions, session_id=b"", version=0x0303):
+    """A ClientHello with explicit cipher suites, for fingerprint fixtures."""
+    body = struct.pack("!H", version) + bytes(range(32))
+    body += vector8(session_id)
+    body += vector16(u16s(ciphers))
+    body += vector8(b"\0")
+    body += vector16(b"".join(extensions))
+    return handshake(body, 1)
+
+
+def full_server_hello(cipher, extensions, version=0x0303, session_id=b""):
+    body = struct.pack("!H", version) + bytes(range(32))
+    body += vector8(session_id)
+    body += struct.pack("!HB", cipher, 0)
+    body += vector16(b"".join(extensions))
+    return handshake(body, 2)
+
+
+# RFC 8701 GREASE values used below.
+GREASE = [0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A]
+
+
+def browser_like(host, alpn_protocols=(b"h2", b"http/1.1")):
+    """A TLS 1.3 ClientHello shaped like a current browser: GREASE in every
+    list that permits it, ciphers and extensions deliberately unsorted."""
+    ciphers = [GREASE[0], 0x1301, 0x1302, 0x1303, 0xC02B, 0xC02F, 0xC02C, 0xC030,
+               0xCCA9, 0xCCA8, 0xC013, 0xC014, 0x009C, 0x009D, 0x002F, 0x0035]
+    extensions = [
+        extension(GREASE[1], b""),
+        extension(23, b""),  # extended_master_secret
+        extension(65281, b"\0"),  # renegotiation_info
+        extension(10, vector16(u16s([GREASE[2], 0x001D, 0x0017, 0x0018]))),
+        extension(11, vector8(b"\0")),  # ec_point_formats: uncompressed
+        extension(35, b""),  # session_ticket
+        alpn(list(alpn_protocols)),
+        extension(5, b"\x01\0\0\0\0"),  # status_request
+        extension(13, vector16(u16s([0x0403, 0x0804, 0x0401, 0x0503, 0x0805,
+                                     0x0501, 0x0806, 0x0601]))),
+        extension(18, b""),  # signed_certificate_timestamp
+        extension(51, vector16(struct.pack("!HH", GREASE[2], 1) + b"\0"
+                               + struct.pack("!HH", 0x001D, 32) + bytes(32))),
+        extension(45, vector8(b"\x01")),  # psk_key_exchange_modes
+        extension(43, vector8(u16s([GREASE[3], 0x0304, 0x0303]))),
+        extension(27, vector8(b"\0\x02")),  # compress_certificate: brotli
+        extension(GREASE[4], b"\0"),
+    ]
+    if host is not None:
+        extensions.insert(1, server_name(host))
+    return full_client_hello(ciphers, extensions)
+
+
 def server_hello(version=0x0303):
     body = struct.pack("!H", version) + bytes(range(32))
     body += struct.pack("!B", 0)  # legacy_session_id_echo
@@ -176,11 +243,73 @@ def reassembly_fixtures():
     hostile = record(client_hello(server_name(b"a\xff\xfe b\\c.example")))
     pcap(DATA / "hostile_sni.pcap", connection([hostile], [reply]))
 
+    fingerprint_fixtures()
+
     # TCP that is not TLS at all.
     pcap(
         DATA / "plain_tcp.pcap",
         connection([b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"], [b"HTTP/1.1 200 OK\r\n\r\n"]),
     )
+
+
+def fingerprint_fixtures():
+    """Hellos rich enough to exercise the parsed lists and, later, JA3/JA4:
+    unsorted lists, GREASE, ALPN, TLS 1.3 and the edge cases the formats name."""
+
+    # A browser-like TLS 1.3 exchange. ALPN is encrypted in TLS 1.3, so the
+    # ServerHello carries only supported_versions and key_share.
+    tls13_reply = record(full_server_hello(0x1301, [
+        extension(43, struct.pack("!H", 0x0304)),
+        extension(51, struct.pack("!HH", 0x001D, 32) + bytes(32)),
+    ]))
+    pcap(DATA / "browser_tls13.pcap",
+         connection([record(browser_like("www.example.com"))], [tls13_reply]))
+
+    # TLS 1.2 with the selected protocol in the ServerHello.
+    tls12_hello = full_client_hello(
+        [0xC02F, 0xC02B, 0x009C, 0x002F],
+        [server_name("api.example.com"),
+         extension(10, vector16(u16s([0x0017, 0x001D]))),
+         extension(11, vector8(b"\0\x01\x02")),
+         extension(13, vector16(u16s([0x0401, 0x0403]))),
+         alpn([b"h2", b"http/1.1"]),
+         extension(23, b"")],
+    )
+    tls12_reply = record(full_server_hello(0xC02F, [
+        extension(65281, b"\0"),
+        extension(11, vector8(b"\0")),
+        alpn([b"http/1.1"]),
+        extension(23, b""),
+    ]))
+    pcap(DATA / "tls12_alpn.pcap", connection([record(tls12_hello)], [tls12_reply]))
+
+    # No SNI and more than 99 cipher suites, which JA4 caps in its count field.
+    many = full_client_hello(list(range(0x0001, 0x0079)), [
+        extension(10, vector16(u16s([0x001D]))),
+        extension(43, vector8(u16s([0x0304]))),
+    ])
+    pcap(DATA / "many_ciphers.pcap", connection([record(many)], []))
+
+    # ALPN edge cases on three connections: GREASE first, a single character,
+    # and a non-alphanumeric identifier.
+    edges = []
+    for port, protocols in ((51001, [b"\x0a\x0a", b"h2"]), (51002, [b"x"]),
+                            (51003, [b"\xab\x01", b"h2"])):
+        hello = full_client_hello([0x1301], [alpn(protocols)])
+        edges += connection([record(hello)], [], port=port)
+    pcap(DATA / "alpn_edges.pcap", edges)
+
+    # supported_groups with an odd length: that list is malformed and reported
+    # NULL with a warning, while the rest of the hello still parses.
+    odd = full_client_hello([0x1301], [
+        server_name("odd.example.com"),
+        extension(10, struct.pack("!H", 3) + b"\0\x1d\0"),
+    ])
+    pcap(DATA / "malformed_groups.pcap", connection([record(odd)], []))
+
+    # More cipher suites than max_list_entries: the hello reports status limit.
+    huge = full_client_hello(list(range(0x0100, 0x0100 + 1100)), [])
+    pcap(DATA / "list_limit.pcap", connection([record(huge)], []))
 
 
 if __name__ == "__main__":
