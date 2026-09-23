@@ -13,9 +13,35 @@ struct TlsHandshakeLimits {
 	// something we can usefully report on.
 	size_t max_message_bytes = 64 * 1024;
 	size_t max_extensions = 256;
+	// Entries in one parsed list, such as cipher suites or supported groups.
+	// Real hellos carry well under a hundred; the cap bounds what a pending
+	// direction holds.
+	size_t max_list_entries = 1024;
 	// Directions held while waiting for their peer. Each holds parsed fields,
 	// not payload bytes.
 	size_t max_pending = 512;
+};
+
+// RFC 8701 reserves the same sixteen values, 0x0A0A through 0xFAFA, for GREASE
+// in cipher suites, extensions, named groups, signature algorithms and versions.
+inline bool IsTlsGrease(uint16_t value) {
+	return (value >> 8U) == (value & 0xFFU) && (value & 0x0FU) == 0x0AU;
+}
+
+// ALPN GREASE identifiers are the same values as two raw bytes.
+inline bool IsTlsGreaseAlpn(const std::string &protocol) {
+	return protocol.size() == 2 && IsTlsGrease(static_cast<uint16_t>((static_cast<unsigned char>(protocol[0]) << 8U) |
+	                                                                 static_cast<unsigned char>(protocol[1])));
+}
+
+// A list read from a hello. Absent means the hello did not carry it; a list
+// that was present but malformed is reported absent with malformed set, so an
+// empty list always means the peer sent an empty list.
+template <class T>
+struct TlsList {
+	bool present = false;
+	bool malformed = false;
+	std::vector<T> values;
 };
 
 // One reported handshake. The key is oriented client to server, whichever
@@ -33,6 +59,13 @@ struct TlsHandshake {
 	// legacy_version from the ClientHello, which is a compatibility value.
 	bool has_client_version = false;
 	uint16_t client_version = 0;
+	// Lists from the ClientHello, in wire order and including GREASE. The
+	// cipher suites and extension types are present whenever the hello parsed.
+	TlsList<uint16_t> client_cipher_suites, client_extensions, client_supported_groups, client_signature_algorithms,
+	    client_supported_versions;
+	TlsList<uint8_t> client_ec_point_formats;
+	// Raw protocol identifiers; they are peer-supplied bytes, escaped on output.
+	TlsList<std::string> client_alpn;
 
 	bool has_server_hello = false;
 	// The version actually selected: supported_versions when the server sent it,
@@ -41,11 +74,17 @@ struct TlsHandshake {
 	uint16_t negotiated_version = 0;
 	bool has_cipher_suite = false;
 	uint16_t cipher_suite = 0;
+	TlsList<uint16_t> server_extensions;
+	// The one protocol a server selects, if it sent ALPN.
+	TlsList<std::string> server_alpn;
 	// Only decidable when both sides were captured and neither is TLS 1.3.
 	bool has_resumed = false;
 	bool resumed = false;
 
 	std::string status, error;
+	// Conditions that leave some columns NULL without being a reassembly
+	// failure, such as an uncaptured side. Stable codes, in a fixed order.
+	std::vector<std::string> warnings;
 };
 
 // Pairs the two directions of a connection, which the transport core finishes

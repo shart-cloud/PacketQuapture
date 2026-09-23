@@ -60,6 +60,69 @@ one row. That is a different shape, and it needs rules the DNS reader never had.
 | `cipher_suite` | The suite the server selected. |
 | `session_resumed` | See below. |
 | `reassembly_status`, `reassembly_error` | See below. |
+| `vlan_ids` | VLAN tags of the connection. |
+| `client_cipher_suites`, `client_extensions` | Cipher suites and extension types from the ClientHello, in wire order. |
+| `client_supported_groups`, `client_signature_algorithms`, `client_supported_versions` | Code points from those ClientHello extensions, in wire order. |
+| `client_ec_point_formats` | `ec_point_formats` from the ClientHello, `LIST(UTINYINT)`. |
+| `client_alpn` | Protocols the client offered, escaped as `tls_sni` is. |
+| `server_extensions` | Extension types from the ServerHello, in wire order. |
+| `server_alpn` | The protocol the server selected. Always NULL for TLS 1.3, which sends it encrypted. |
+| `*_no_grease` | The same list without RFC 8701 GREASE values. |
+| `warnings` | See below. |
+
+## Hello lists
+
+Every list is published in wire order with GREASE values included, and again with the
+suffix `_no_grease` without them. Both forms are kept on purpose. Fingerprint formats
+filter GREASE, but whether a client sends GREASE at all is itself evidence. RFC 8701
+reserves the values 0x0A0A, 0x1A1A, and so on up to 0xFAFA for cipher suites,
+extensions, named groups, signature algorithms, versions and, as two raw bytes, ALPN.
+EC point formats have no GREASE values and no twin.
+
+NULL and an empty list mean different things:
+
+- **NULL:** the hello did not carry the list, its side was not captured, or the list
+  was malformed.
+- **`[]`:** the peer sent an empty list.
+
+A hello that parsed always has `client_cipher_suites` and `client_extensions`, or
+`server_extensions` on the server side; they are `[]` when it offered none.
+
+A list is never partial:
+
+- **Malformed:** a vector with an odd length, bytes left over inside the extension, an
+  empty ALPN name, a server selecting more than one ALPN protocol, or a repeated
+  extension. Only that list is NULL, the rest of the hello is still reported, and
+  `warnings` says so.
+- **Invalid hello:** a hello that fails to parse reports none of its lists.
+- **Over the limit:** a list longer than `max_list_entries` sets `reassembly_status` to
+  `limit`.
+
+Expected values in `read_tls.test` come from tshark 4.2.2.
+`scripts/compare_tls_tshark.py` repeats the comparison for any capture:
+
+```sh
+python3 scripts/compare_tls_tshark.py test/data/tls/*.pcap
+```
+
+It reports differences in the lists, any hello tshark decoded that no row accounts
+for, and packets holding several hellos, which it cannot split and so skips. tshark
+reads the valid prefix of a malformed list where `read_tls` reports NULL; the script
+counts those as documented divergences.
+
+## Warnings
+
+`reassembly_status` holds one value, and a more specific status outranks `one-sided`. A
+client-only handshake from a capture that began mid-connection is therefore
+`unanchored`, not `one-sided`. `warnings` states the conditions that leave columns NULL,
+whatever the status. It is `[]` when there are none and is never NULL.
+
+| Code | Meaning |
+| --- | --- |
+| `client_hello_missing` | No complete ClientHello was captured, so the client columns are NULL. |
+| `server_hello_missing` | No complete ServerHello was captured, so the server columns are NULL. |
+| `client_hello_invalid`, `server_hello_invalid` | That hello was seen but failed to parse. |
+| `client_list_malformed`, `server_list_malformed` | At least one of that side's lists is NULL because it was malformed. |
 
 ## `session_resumed` is often NULL
 
@@ -94,6 +157,7 @@ Bounded by `TlsHandshakeLimits`, alongside the transport-wide
 | `max_message_bytes` | 64 KiB | One handshake message. |
 | `max_extensions` | 256 | Extensions walked in one hello. |
 | `max_pending` | 512 | Directions held while waiting for a peer. |
+| `max_list_entries` | 1024 | Entries in one parsed hello list. |
 
 Reaching a limit sets `reassembly_status` to `limit` rather than failing the query. Directions
 waiting for a peer hold parsed fields, not payload bytes.
@@ -114,6 +178,11 @@ that would have matched it.
 
 ## Not yet implemented
 
-JA3/JA4/JA4S fingerprints, ALPN, offered cipher suites, supported groups, signature
-algorithms, and the certificate chain. Each needs more of the handshake than this reader
-parses, and fingerprints need to match their reference implementations byte for byte.
+JA3/JA4/JA4S fingerprints and the certificate chain. The fingerprints are computed from
+the lists above and must match their reference implementations byte for byte. The
+certificate is in a later handshake message that this reader does not yet parse.
+
+On busy captures most handshakes can go missing entirely. The transport core tracks
+1,024 TCP directions per file (see [TCP streams](TCP_STREAMS.md)), and once that is
+full, each new packet becomes its own one-packet stream with status `limit`. This
+reader cannot tell whether such a stream carried TLS, so it reports nothing for it.

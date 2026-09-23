@@ -2290,7 +2290,26 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         "session_resumed",
 	         "reassembly_status",
 	         "reassembly_error",
-	         "vlan_ids"};
+	         "vlan_ids",
+	         "client_cipher_suites",
+	         "client_cipher_suites_no_grease",
+	         "client_extensions",
+	         "client_extensions_no_grease",
+	         "client_supported_groups",
+	         "client_supported_groups_no_grease",
+	         "client_signature_algorithms",
+	         "client_signature_algorithms_no_grease",
+	         "client_supported_versions",
+	         "client_supported_versions_no_grease",
+	         "client_ec_point_formats",
+	         "client_alpn",
+	         "client_alpn_no_grease",
+	         "server_extensions",
+	         "server_extensions_no_grease",
+	         "server_alpn",
+	         "warnings"};
+	const auto codes = LogicalType::LIST(LogicalType::USMALLINT);
+	const auto text = LogicalType::LIST(LogicalType::VARCHAR);
 	types = {LogicalType::VARCHAR,
 	         LogicalType::UINTEGER,
 	         LogicalType::UINTEGER,
@@ -2315,7 +2334,24 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         LogicalType::BOOLEAN,
 	         LogicalType::VARCHAR,
 	         LogicalType::VARCHAR,
-	         LogicalType::LIST(LogicalType::USMALLINT)};
+	         codes,
+	         codes,
+	         codes,
+	         codes,
+	         codes,
+	         codes,
+	         codes,
+	         codes,
+	         codes,
+	         codes,
+	         codes,
+	         LogicalType::LIST(LogicalType::UTINYINT),
+	         text,
+	         text,
+	         codes,
+	         codes,
+	         LogicalType::VARCHAR,
+	         text};
 	auto &bind = result->Cast<PcapBindData>();
 	bind.types = types;
 	bind.stream_plan =
@@ -2330,6 +2366,37 @@ static unique_ptr<GlobalTableFunctionState> TlsInit(ClientContext &context, Tabl
 	state->options.reassemble_tcp = true;
 	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
 	return std::move(state);
+}
+
+// A hello list as a column value: NULL when the hello did not carry it, was not
+// captured, or carried it malformed. With skip_grease, RFC 8701 values are dropped.
+static void SetTlsCodes(Vector &vector, idx_t row, const packetquapture::TlsList<uint16_t> &list, bool skip_grease) {
+	if (!list.present) {
+		FlatVector::SetNull(vector, row, true);
+		return;
+	}
+	duckdb::vector<Value> values;
+	for (const auto code : list.values) {
+		if (!skip_grease || !packetquapture::IsTlsGrease(code)) {
+			values.push_back(Value::USMALLINT(code));
+		}
+	}
+	vector.SetValue(row, Value::LIST(LogicalType::USMALLINT, values));
+}
+
+// ALPN identifiers are peer-supplied bytes, escaped as server names are.
+static void SetTlsAlpn(Vector &vector, idx_t row, const packetquapture::TlsList<std::string> &list, bool skip_grease) {
+	if (!list.present) {
+		FlatVector::SetNull(vector, row, true);
+		return;
+	}
+	duckdb::vector<Value> values;
+	for (const auto &protocol : list.values) {
+		if (!skip_grease || !packetquapture::IsTlsGreaseAlpn(protocol)) {
+			values.push_back(Value(packetquapture::EscapeTlsText(protocol)));
+		}
+	}
+	vector.SetValue(row, Value::LIST(LogicalType::VARCHAR, values));
 }
 
 static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const string &filename,
@@ -2454,6 +2521,63 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 		vector.SetValue(row, Value::LIST(LogicalType::USMALLINT, values));
 		break;
 	}
+	case 25:
+	case 26:
+		SetTlsCodes(vector, row, handshake.client_cipher_suites, column == 26);
+		break;
+	case 27:
+	case 28:
+		SetTlsCodes(vector, row, handshake.client_extensions, column == 28);
+		break;
+	case 29:
+	case 30:
+		SetTlsCodes(vector, row, handshake.client_supported_groups, column == 30);
+		break;
+	case 31:
+	case 32:
+		SetTlsCodes(vector, row, handshake.client_signature_algorithms, column == 32);
+		break;
+	case 33:
+	case 34:
+		SetTlsCodes(vector, row, handshake.client_supported_versions, column == 34);
+		break;
+	case 35: {
+		// Point formats have no GREASE values, so there is no filtered twin.
+		const auto &list = handshake.client_ec_point_formats;
+		if (!list.present) {
+			FlatVector::SetNull(vector, row, true);
+			break;
+		}
+		duckdb::vector<Value> values;
+		for (const auto format : list.values) {
+			values.push_back(Value::UTINYINT(format));
+		}
+		vector.SetValue(row, Value::LIST(LogicalType::UTINYINT, values));
+		break;
+	}
+	case 36:
+	case 37:
+		SetTlsAlpn(vector, row, handshake.client_alpn, column == 37);
+		break;
+	case 38:
+	case 39:
+		SetTlsCodes(vector, row, handshake.server_extensions, column == 39);
+		break;
+	case 40:
+		if (handshake.server_alpn.present && !handshake.server_alpn.values.empty()) {
+			vector.SetValue(row, packetquapture::EscapeTlsText(handshake.server_alpn.values.front()));
+		} else {
+			FlatVector::SetNull(vector, row, true);
+		}
+		break;
+	case 41: {
+		duckdb::vector<Value> values;
+		for (const auto &warning : handshake.warnings) {
+			values.push_back(Value(warning));
+		}
+		vector.SetValue(row, Value::LIST(LogicalType::VARCHAR, values));
+		break;
+	}
 	default:
 		throw InternalException("Unexpected read_tls column id %d", column);
 	}
@@ -2484,7 +2608,9 @@ static void TlsScan(ClientContext &context, TableFunctionInput &input, DataChunk
 					SetHandshakeValue(output.data[i], count, global.columns[i], state.tls_pending_filename, handshake);
 				}
 			}
-			output_bytes += 1024 + state.tls_pending_filename.size() + handshake.sni.size();
+			// The hello lists are bounded by max_list_entries; a flat allowance
+			// per list keeps the batch estimate honest without walking them.
+			output_bytes += 4096 + state.tls_pending_filename.size() + handshake.sni.size();
 			++count;
 			continue;
 		}
