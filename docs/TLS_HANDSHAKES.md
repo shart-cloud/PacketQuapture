@@ -56,7 +56,7 @@ one row. That is a different shape, and it needs rules the DNS reader never had.
 | `client_hello`, `server_hello` | Whether each side was seen. |
 | `tls_sni` | `host_name` from the ClientHello's `server_name` extension, complete across segments. Escaped as in `read_packets`: bytes outside printable ASCII, and backslash, become decimal `\DDD`. |
 | `client_version` | `legacy_version` from the ClientHello, a compatibility value. |
-| `negotiated_version` | `supported_versions` from the ServerHello when present, otherwise its `legacy_version`. This is why a TLS 1.3 connection reports 0x0304 rather than the 0x0303 in its record headers. |
+| `negotiated_version` | `supported_versions` from the ServerHello when present, otherwise its `legacy_version`. This is why a TLS 1.3 connection reports 0x0304 rather than the 0x0303 in its record headers. NULL when the ServerHello's `supported_versions` is malformed (not exactly one version, or sent twice), since `legacy_version` would then misreport TLS 1.3 as 1.2; `ja4s` is NULL with it and `server_list_malformed` is set. |
 | `cipher_suite` | The suite the server selected. |
 | `session_resumed` | See below. |
 | `reassembly_status`, `reassembly_error` | See below. |
@@ -126,7 +126,7 @@ whatever the status. It is `[]` when there are none and is never NULL.
 | `client_hello_missing` | No complete ClientHello was captured, so the client columns are NULL. |
 | `server_hello_missing` | No complete ServerHello was captured, so the server columns are NULL. |
 | `client_hello_invalid`, `server_hello_invalid` | That hello was seen but failed to parse. |
-| `client_list_malformed`, `server_list_malformed` | At least one of that side's lists is NULL because it was malformed. |
+| `client_list_malformed`, `server_list_malformed` | At least one of that side's lists is NULL because it was malformed. On the server side this includes a malformed `supported_versions`, which leaves `negotiated_version` NULL. |
 
 ## JA3 and JA3S
 
@@ -205,7 +205,8 @@ start mid-connection; the script reports both separately from disagreements.
 
 A server resumed a session when it echoed back a non-empty session id the client offered.
 That question needs both directions, and in TLS 1.3 the id is echoed whether or not the
-session resumed. So `session_resumed` is NULL for a one-sided handshake and for TLS 1.3, and
+session resumed. So `session_resumed` is NULL for a one-sided handshake, for TLS 1.3 and when
+`negotiated_version` is NULL, and
 false rather than NULL when both sides were captured and the client offered no session id.
 
 ## Status values

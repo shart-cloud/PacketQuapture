@@ -619,6 +619,30 @@ void TestServerLegacyVersion() {
 	assert(done[0].negotiated_version == 0x0304);
 }
 
+// A ServerHello's supported_versions names exactly one version. Any other body,
+// or a second copy, leaves the version unknown instead of falling back to
+// legacy_version, which a TLS 1.3 server always sets to 0x0303.
+void TestMalformedServerSupportedVersions() {
+	const std::vector<uint8_t> session(32, 0x11);
+	const std::vector<std::vector<uint8_t>> cases = {
+	    Extension(43, {0x03}),
+	    Extension(43, {0x03, 0x04, 0x00}),
+	    Concat(SupportedVersions(0x0304), SupportedVersions(0x0304)),
+	};
+	for (const auto &extensions : cases) {
+		TlsHandshakeAssembler assembler;
+		assembler.Add(Stream(Key(), 1, Record(ClientHello({}, session)), 1));
+		auto done = assembler.Add(Stream(Key().Reverse(), 2, Record(ServerHello(0x1301, extensions, session)), 2));
+		const auto rest = assembler.Finish();
+		done.insert(done.end(), rest.begin(), rest.end());
+		assert(done.size() == 1 && done[0].status == "complete");
+		assert(!done[0].has_negotiated_version);
+		assert(done[0].has_server_legacy_version && done[0].server_legacy_version == 0x0303);
+		assert(!done[0].has_resumed); // resumption is undecidable without the version
+		assert(HasWarning(done[0], "server_list_malformed"));
+	}
+}
+
 // Random extension bodies behind valid framing: lists are bounded, and a list
 // is never both present and malformed.
 void TestListFuzz() {
@@ -704,6 +728,7 @@ int main() {
 	TestInvalidHelloReportsNoLists();
 	TestListEntryLimit();
 	TestServerLegacyVersion();
+	TestMalformedServerSupportedVersions();
 	TestListFuzz();
 	printf("TLS handshake pairing, orphans, renegotiation, resumption, limits and hello lists passed\n");
 	return 0;

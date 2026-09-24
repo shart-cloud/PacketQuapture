@@ -88,6 +88,9 @@ struct TlsHandshake {
 	TlsList<uint16_t> server_extensions;
 	// The one protocol a server selects, if it sent ALPN.
 	TlsList<std::string> server_alpn;
+	// The one version a server selects in supported_versions, if it sent it.
+	// Not a column; it feeds negotiated_version and the malformed warning.
+	TlsList<uint16_t> server_supported_versions;
 	// Only decidable when both sides were captured and neither is TLS 1.3.
 	bool has_resumed = false;
 	bool resumed = false;
