@@ -167,7 +167,10 @@ features evolve without requiring captures to be rewritten.
 The implementation roadmap, architectural boundaries, acceptance criteria, and licensing notes are in
 [`docs/HANDOFF.md`](docs/HANDOFF.md).
 
-PacketQuapture is licensed under the MIT License.
+PacketQuapture is licensed under the MIT License, except that the `ja4s` and `ja4s_r`
+columns of `read_tls` implement JA4S, which is patent pending and licensed by FoxIO under
+the FoxIO License 1.1. That license does not permit monetization without an OEM license
+from FoxIO. See [`NOTICE`](NOTICE).
 
 ## Session summaries
 

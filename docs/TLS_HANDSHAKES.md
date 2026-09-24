@@ -71,6 +71,8 @@ one row. That is a different shape, and it needs rules the DNS reader never had.
 | `warnings` | See below. |
 | `ja3`, `ja3_full` | JA3 client fingerprint and the string it hashes. See below. |
 | `ja3s`, `ja3s_full` | JA3S server fingerprint and the string it hashes. |
+| `ja4`, `ja4_r` | JA4 client fingerprint and its raw form. See below. |
+| `ja4s`, `ja4s_r` | JA4S server fingerprint and its raw form. **FoxIO License 1.1**, see [NOTICE](../NOTICE). |
 
 ## Hello lists
 
@@ -148,6 +150,57 @@ The fingerprint is built only when a query selects it.
 
 `scripts/compare_tls_tshark.py` compares the fingerprints along with the lists.
 
+## JA4 and JA4S
+
+The definition is [FoxIO-LLC/ja4](https://github.com/FoxIO-LLC/ja4) at `16b96d9`.
+JA4 follows `technical_details/JA4.md`. JA4S has only a diagram there, so it follows
+the FoxIO python and rust implementations, which agree on it.
+
+**Licensing.** JA4 is BSD 3-Clause. JA4S is part of JA4+, which is patent pending and
+licensed under the FoxIO License 1.1. That license does not permit monetization
+without an OEM license from FoxIO. The rest of this extension is MIT. See
+[NOTICE](../NOTICE).
+
+```text
+ja4_r   t{version}{d|i}{ciphers:02}{extensions:02}{alpn}_{sorted ciphers}_{sorted extensions}[_{signature algorithms}]
+ja4s_r  t{version}{extensions:02}{alpn}_{cipher}_{extensions}
+```
+
+`ja4` and `ja4s` replace each list after the prefix with the first 12 hex digits of
+its SHA-256, or `000000000000` when the list is empty. JA4S keeps its one cipher as is.
+
+- **Version:** for JA4, the highest non-GREASE `supported_versions` value, else
+  `legacy_version`. For JA4S, the negotiated version. Unknown values are `00`.
+- **JA4 lists:** GREASE is dropped from lists and counts. SNI (0) and ALPN (16) are
+  counted but not hashed. Ciphers and extensions are sorted; signature algorithms keep
+  wire order. Counts stop at 99.
+- **JA4S lists:** extensions stay in wire order and **include GREASE**, in both the
+  count and the hash, as both FoxIO implementations do.
+- **ALPN:** the first value as sent. If its first and last bytes are both ASCII
+  alphanumeric, those two characters; a one-character value appears twice. Otherwise
+  the first and last digit of the value's lower-case hex. `00` when there is none.
+
+A fingerprint is NULL when its hello is missing or invalid, or when an input it uses
+was malformed or over `max_list_entries`, as for JA3. JA4 does not use
+`supported_groups` or `ec_point_formats`, so a malformed one of those leaves `ja4`
+defined.
+
+The references disagree with each other, so these are the choices, in order: the
+specification text, then the implementations where the text is silent.
+
+| Case | JA4.md | tshark 4.2.2 | FoxIO python | FoxIO rust | `read_tls` |
+| --- | --- | --- | --- | --- | --- |
+| Empty list hash | `000000000000` | `e3b0c44298fc` | zeros | zeros | zeros |
+| Non-alphanumeric ALPN byte | hex digits | hex digits | `9` or the raw byte | `9` | hex digits |
+| One-character ALPN `x` | `xx` | `xx` | `xx` | `x0` | `xx` |
+| GREASE as first ALPN value | "ignore GREASE" | first value | first value | first value | first value |
+
+`scripts/compare_tls_tshark.py` compares JA4 with tshark, counting the empty-list
+difference as documented. With `--foxio <path to python/ja4.py>` it also compares
+JA4S with the FoxIO python reference. At `16b96d9` that reference misses a ServerHello
+that shares a packet with other handshake messages, and fails on some streams it saw
+start mid-connection; the script reports both separately from disagreements.
+
 ## `session_resumed` is often NULL
 
 A server resumed a session when it echoed back a non-empty session id the client offered.
@@ -202,9 +255,9 @@ that would have matched it.
 
 ## Not yet implemented
 
-JA4/JA4S fingerprints and the certificate chain. JA4 is computed from the lists above
-and must match its reference implementation byte for byte. The certificate is in a
-later handshake message that this reader does not yet parse.
+The certificate chain and JA4X. The certificate is in a later handshake message that
+this reader does not yet parse. JA4X is part of JA4+ and under the same license as
+JA4S. DTLS and QUIC hellos, the `d` and `q` JA4 variants, are not read.
 
 On busy captures most handshakes can go missing entirely. The transport core tracks
 1,024 TCP directions per file (see [TCP streams](TCP_STREAMS.md)), and once that is
