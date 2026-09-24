@@ -225,11 +225,21 @@ void ParseSupportedVersions(Reader &reader, bool client, ListBudget &budget, Tls
 		}
 		return;
 	}
+	// Exactly one version, in exactly two bytes. Otherwise the version is
+	// unknown: legacy_version is no fallback, since TLS 1.3 fixes it at 0x0303.
+	auto &selected = handshake.server_supported_versions;
 	const uint16_t version = reader.U16();
-	if (!reader.Overrun()) {
-		handshake.has_negotiated_version = true;
-		handshake.negotiated_version = version;
+	if (Duplicate(selected) || reader.Overrun() || reader.Remaining() != 0) {
+		selected = TlsList<uint16_t>();
+		selected.malformed = true;
+		handshake.has_negotiated_version = false;
+		handshake.negotiated_version = 0;
+		return;
 	}
+	selected.present = true;
+	selected.values.push_back(version);
+	handshake.has_negotiated_version = true;
+	handshake.negotiated_version = version;
 }
 
 // Walks the extension list, recording every type in order and reading the
@@ -358,6 +368,7 @@ void ClearHello(TlsHandshake &handshake) {
 	handshake.client_alpn = TlsList<std::string>();
 	handshake.server_extensions = TlsList<uint16_t>();
 	handshake.server_alpn = TlsList<std::string>();
+	handshake.server_supported_versions = TlsList<uint16_t>();
 }
 
 } // namespace
@@ -553,6 +564,7 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 			handshake.cipher_suite = from_server->cipher_suite;
 			handshake.server_extensions = from_server->server_extensions;
 			handshake.server_alpn = from_server->server_alpn;
+			handshake.server_supported_versions = from_server->server_supported_versions;
 			if (from_client == nullptr) {
 				handshake.first = from_server->first;
 				handshake.last = from_server->last;
@@ -573,9 +585,11 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 			handshake.server_stream_id = server->stream_id;
 		}
 		// A server echoing a non-empty session id resumed the session. TLS 1.3
-		// echoes the id whether or not it resumed, so the question does not apply.
+		// echoes the id whether or not it resumed, so the question does not apply,
+		// and without a known version it cannot be asked.
 		if (from_client != nullptr && from_server != nullptr && index < client.session_ids.size() &&
-		    index < server->session_ids.size() && handshake.negotiated_version != TLS_1_3) {
+		    index < server->session_ids.size() && handshake.has_negotiated_version &&
+		    handshake.negotiated_version != TLS_1_3) {
 			const auto &offered = client.session_ids[index];
 			const auto &echoed = server->session_ids[index];
 			handshake.has_resumed = true;
@@ -618,7 +632,8 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 		     from_client->client_ec_point_formats.malformed || from_client->client_alpn.malformed)) {
 			handshake.warnings.push_back("client_list_malformed");
 		}
-		if (from_server != nullptr && from_server->server_alpn.malformed) {
+		if (from_server != nullptr &&
+		    (from_server->server_alpn.malformed || from_server->server_supported_versions.malformed)) {
 			handshake.warnings.push_back("server_list_malformed");
 		}
 		result.push_back(handshake);

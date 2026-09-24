@@ -2432,6 +2432,27 @@ static void SetTlsAlpn(Vector &vector, idx_t row, const packetquapture::TlsList<
 	vector.SetValue(row, Value::LIST(LogicalType::VARCHAR, values));
 }
 
+// Estimated output bytes for one read_tls row. max_list_entries bounds how many
+// entries a list holds, not how many bytes it produces, so the lists are
+// counted: each code point lands in its list column, the no-GREASE copy and the
+// JA3/JA4 raw strings, and each ALPN name is written twice and may grow
+// fourfold when escaped.
+static idx_t TlsRowBytes(const string &filename, const packetquapture::TlsHandshake &handshake) {
+	const idx_t codes = handshake.client_cipher_suites.values.size() + handshake.client_extensions.values.size() +
+	                    handshake.client_supported_groups.values.size() +
+	                    handshake.client_signature_algorithms.values.size() +
+	                    handshake.client_supported_versions.values.size() +
+	                    handshake.client_ec_point_formats.values.size() + handshake.server_extensions.values.size();
+	idx_t alpn = 0;
+	for (const auto &protocol : handshake.client_alpn.values) {
+		alpn += 32 + 8 * protocol.size();
+	}
+	for (const auto &protocol : handshake.server_alpn.values) {
+		alpn += 32 + 4 * protocol.size();
+	}
+	return 1024 + filename.size() + handshake.sni.size() + 32 * codes + alpn;
+}
+
 static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const string &filename,
                               const packetquapture::TlsHandshake &handshake) {
 	const auto &key = handshake.key;
@@ -2679,9 +2700,7 @@ static void TlsScan(ClientContext &context, TableFunctionInput &input, DataChunk
 					SetHandshakeValue(output.data[i], count, global.columns[i], state.tls_pending_filename, handshake);
 				}
 			}
-			// The hello lists are bounded by max_list_entries; a flat allowance
-			// per list keeps the batch estimate honest without walking them.
-			output_bytes += 4096 + state.tls_pending_filename.size() + handshake.sni.size();
+			output_bytes += TlsRowBytes(state.tls_pending_filename, handshake);
 			++count;
 			continue;
 		}
