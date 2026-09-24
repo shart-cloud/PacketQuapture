@@ -725,6 +725,26 @@ void TestCertificateLimits() {
 	assert(PairedWithServer(server, size).server_certificates.over_limit);
 	size.max_certificate_bytes = leaf.size();
 	assert(PairedWithServer(server, size).server_certificates.values.size() == 2);
+
+	// A direction waiting for its peer keeps parsed certificate text, so the text
+	// one direction holds is capped too, across renegotiated handshakes.
+	const auto one = PairedWithServer(Record(Concat(ServerHello(0x009C), CertificateMessage({leaf}))));
+	const size_t text = one.server_certificates.values[0].fields.TextBytes();
+	TlsHandshakeLimits held;
+	held.max_direction_certificate_bytes = 2 * text;
+	assert(PairedWithServer(server, held).server_certificates.values.size() == 2);
+	held.max_direction_certificate_bytes = 2 * text - 1;
+	const auto over = PairedWithServer(server, held);
+	assert(over.server_certificates.over_limit && over.status == "limit");
+	// The budget spans every handshake in the direction.
+	const auto hello_and_chain = Concat(ServerHello(0x009C), CertificateMessage({leaf}));
+	const auto client_bytes = Concat(Record(ClientHello({})), Record(ClientHello({})));
+	held.max_direction_certificate_bytes = text;
+	TlsHandshakeAssembler renegotiated(held);
+	renegotiated.Add(Stream(Key(), 1, client_bytes, 1));
+	auto done = renegotiated.Add(Stream(Key().Reverse(), 2, Record(Concat(hello_and_chain, hello_and_chain)), 2));
+	assert(done.size() == 2);
+	assert(done[0].server_certificates.values.size() == 1 && done[1].server_certificates.over_limit);
 }
 
 // JA3S fingerprints the ServerHello's legacy_version, which supported_versions

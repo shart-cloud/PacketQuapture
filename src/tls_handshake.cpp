@@ -358,7 +358,10 @@ bool ParseHello(const std::vector<uint8_t> &body, bool client, const TlsHandshak
 // RFC 5246 7.4.2: a three-byte vector of certificates, each a three-byte length
 // and its DER encoding. A second Certificate message is malformed, as a repeated
 // extension is. A certificate that does not parse keeps its place in the chain.
-void ParseCertificates(const std::vector<uint8_t> &body, const TlsHandshakeLimits &limits, TlsHandshake &handshake) {
+// held counts the certificate text this direction already holds; a chain that
+// would take it past max_direction_certificate_bytes is over the limit.
+void ParseCertificates(const std::vector<uint8_t> &body, const TlsHandshakeLimits &limits, size_t &held,
+                       TlsHandshake &handshake) {
 	auto &chain = handshake.server_certificates;
 	if (Duplicate(chain)) {
 		return;
@@ -370,6 +373,7 @@ void ParseCertificates(const std::vector<uint8_t> &body, const TlsHandshakeLimit
 		return;
 	}
 	std::vector<TlsCertificate> certificates;
+	const size_t held_before = held;
 	while (reader.Remaining() > 0) {
 		const uint32_t length = reader.U24();
 		std::vector<uint8_t> der;
@@ -381,8 +385,16 @@ void ParseCertificates(const std::vector<uint8_t> &body, const TlsHandshakeLimit
 		auto result = X509Result::OVER_LIMIT;
 		if (certificates.size() < limits.max_certificates && length <= limits.max_certificate_bytes) {
 			result = ParseX509Certificate(der.data(), der.size(), limits.max_list_entries, certificate.fields);
+			const size_t text = certificate.fields.TextBytes();
+			if (result == X509Result::OK && text > limits.max_direction_certificate_bytes - held) {
+				result = X509Result::OVER_LIMIT;
+			}
+			if (result == X509Result::OK) {
+				held += text;
+			}
 		}
 		if (result == X509Result::OVER_LIMIT) {
+			held = held_before; // the chain is dropped, so it holds nothing
 			chain.over_limit = true;
 			if (handshake.status.empty()) {
 				handshake.status = "limit";
@@ -506,7 +518,7 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 	};
 	const Locator locator = {&record_spans};
 
-	size_t message_offset = 0;
+	size_t message_offset = 0, certificate_bytes = 0;
 	while (handshake_bytes.size() - message_offset >= 4) {
 		Reader reader(handshake_bytes.data() + message_offset, handshake_bytes.size() - message_offset);
 		const uint8_t type = reader.U8();
@@ -554,7 +566,7 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 			auto &handshake = direction.handshakes.back();
 			std::vector<uint8_t> body(handshake_bytes.begin() + static_cast<long>(message_offset + 4),
 			                          handshake_bytes.begin() + static_cast<long>(message_offset + 4 + length));
-			ParseCertificates(body, limits, handshake);
+			ParseCertificates(body, limits, certificate_bytes, handshake);
 			const auto span = locator.Locate(message_offset, length + 4);
 			if (span.second > 0) {
 				const auto provenance = chunk->Provenance(span.first, span.second);

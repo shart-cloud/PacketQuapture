@@ -22,8 +22,13 @@ struct TlsHandshakeLimits {
 	// one certificate. Real chains hold two to four certificates of a few KiB.
 	size_t max_certificates = 16;
 	size_t max_certificate_bytes = 32 * 1024;
+	// Parsed certificate text one direction holds, across all its handshakes.
+	// Without it a direction waiting for its peer could hold 16 handshakes of
+	// 64 KiB messages, each growing when escaped.
+	size_t max_direction_certificate_bytes = 256 * 1024;
 	// Directions held while waiting for their peer. Each holds parsed fields,
-	// not payload bytes.
+	// not payload bytes: bounded hello lists and at most
+	// max_direction_certificate_bytes of certificate text.
 	size_t max_pending = 512;
 };
 

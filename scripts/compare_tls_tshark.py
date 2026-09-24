@@ -222,13 +222,16 @@ def tshark_certificates(path):
             for der, tree in zip(ders, trees):
                 signed = tree.get("x509af.signedCertificate_element", {})
                 validity = signed.get("x509af.validity_element", {})
-                times = find(validity, "x509af.utcTime") + find(validity, "x509af.generalizedTime")
+                # Each bound may be either encoding, so read them in order, not by type.
+                times = [tshark_time(t) for bound in ("x509af.notBefore_tree", "x509af.notAfter_tree")
+                         for t in find(validity.get(bound, {}), "x509af.utcTime") +
+                         find(validity.get(bound, {}), "x509af.generalizedTime")]
                 san = [e for e in find(signed, "x509af.Extension_element")
                        if isinstance(e, dict) and e.get("x509af.extension.id") == "2.5.29.17"]
                 chain.append({
                     "der": bytes.fromhex(der.replace(":", "")),
                     "serial": "".join(find(signed, "x509af.serialNumber")[:1]).replace(":", ""),
-                    "times": [tshark_time(t) for t in times],
+                    "times": times,
                     "san_dns": find(san, "x509ce.dNSName"),
                     "san_ip": find(san, "x509ce.IPAddress.ipv4") + find(san, "x509ce.IPAddress.ipv6"),
                 })

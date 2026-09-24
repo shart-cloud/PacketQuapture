@@ -242,9 +242,11 @@ read it; tshark decodes it as T.61, so the two can differ outside ASCII.
 A certificate that does not parse keeps its place in the list as a NULL element, and the
 row gets `server_certificate_malformed`. A Certificate message whose framing is broken,
 or a second one after the same ServerHello, makes the column NULL with the same warning.
-A chain over `max_certificates`, a certificate over `max_certificate_bytes`, or one with
-more than `max_list_entries` subjectAltName entries makes the column NULL and sets
-`reassembly_status` to `limit`.
+A chain over `max_certificates`, a certificate over `max_certificate_bytes`, one with
+more than `max_list_entries` subjectAltName entries, or a chain that would take its
+direction past `max_direction_certificate_bytes` of parsed text makes the column NULL
+and sets `reassembly_status` to `limit`. The last bounds what a direction waiting for its
+peer can hold.
 
 `scripts/compare_tls_tshark.py` compares chains with tshark field by field, and names
 with OpenSSL's rendering of the DER that tshark extracted. On the whole CTU-13 Neris
@@ -287,9 +289,11 @@ Bounded by `TlsHandshakeLimits`, alongside the transport-wide
 | `max_list_entries` | 1024 | Entries in one parsed hello list, and subjectAltName entries in one certificate. |
 | `max_certificates` | 16 | Certificates in one Certificate message. |
 | `max_certificate_bytes` | 32 KiB | One certificate. |
+| `max_direction_certificate_bytes` | 256 KiB | Parsed certificate text one direction holds across its handshakes. |
 
 Reaching a limit sets `reassembly_status` to `limit` rather than failing the query. Directions
-waiting for a peer hold parsed fields, not payload bytes.
+waiting for a peer hold parsed fields, not payload bytes, and at most
+`max_direction_certificate_bytes` of certificate text each.
 
 ## Pairing and VLAN tags
 

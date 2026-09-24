@@ -22,6 +22,18 @@ struct X509Certificate {
 	// subjectAltName dNSName entries, escaped as tls_sni is, and iPAddress
 	// entries as text (dotted IPv4, RFC 5952 IPv6), in wire order.
 	std::vector<std::string> san_dns, san_ip;
+
+	// The text this certificate holds once parsed, for memory budgets.
+	size_t TextBytes() const {
+		size_t bytes = subject.size() + issuer.size() + serial.size() + sizeof(not_before) + sizeof(not_after);
+		for (const auto &name : san_dns) {
+			bytes += name.size();
+		}
+		for (const auto &address : san_ip) {
+			bytes += address.size();
+		}
+		return bytes;
+	}
 };
 
 enum class X509Result { OK, MALFORMED, OVER_LIMIT };
