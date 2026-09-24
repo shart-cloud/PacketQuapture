@@ -66,15 +66,74 @@ void TcpReassembler::Remove(const TcpFlowKey &key, std::vector<TcpStream> &outpu
 		stream.finalized_by = reason;
 	}
 	output.insert(output.end(), std::make_move_iterator(messages.begin()), std::make_move_iterator(messages.end()));
+	Unschedule(it->first, it->second);
 	buffered_bytes -= it->second.bytes;
 	buffered_segments -= it->second.segments.size();
 	flows.erase(it);
+}
+
+void TcpReassembler::Unschedule(const TcpFlowKey &key, Flow &flow) {
+	if (!flow.scheduled) {
+		return;
+	}
+	flow.scheduled = false;
+	auto scope = scopes.find(ScopeKey(key.section, key.interface_id));
+	scope->second.expiry.erase(std::make_pair(flow.deadline, key));
+	if (scope->second.expiry.empty()) {
+		scopes.erase(scope);
+	}
+}
+
+// Deadlines only move later, so a packet arriving out of timestamp order cannot
+// shorten a direction's life.
+void TcpReassembler::Schedule(const TcpFlowKey &key, Flow &flow, const PacketStamp &stamp) {
+	if (!stamp.has_timestamp) {
+		flow.untimed = true;
+	}
+	const auto timeout = limits.tcp_idle_us;
+	if (flow.untimed || timeout <= 0 || stamp.timestamp > std::numeric_limits<int64_t>::max() - timeout) {
+		Unschedule(key, flow);
+		return;
+	}
+	const auto deadline = stamp.timestamp + timeout;
+	if (flow.scheduled && flow.deadline >= deadline) {
+		return;
+	}
+	Unschedule(key, flow);
+	auto inserted = scopes.emplace(ScopeKey(key.section, key.interface_id), Scope());
+	auto &scope = inserted.first->second;
+	// A new clock starts at this packet; zero would expire pre-1970 captures at once.
+	scope.watermark = inserted.second ? stamp.timestamp : std::max(scope.watermark, stamp.timestamp);
+	scope.expiry.emplace(deadline, key);
+	flow.deadline = deadline;
+	flow.scheduled = true;
+}
+
+// Finalizes every direction on this packet's interface that has been quiet for
+// longer than the timeout, judged by the latest timestamp seen there.
+void TcpReassembler::Expire(const TcpFlowKey &key, const PacketStamp &stamp, std::vector<TcpStream> &output) {
+	if (!stamp.has_timestamp) {
+		return;
+	}
+	const ScopeKey id(key.section, key.interface_id);
+	auto scope = scopes.find(id);
+	if (scope == scopes.end()) {
+		return;
+	}
+	scope->second.watermark = std::max(scope->second.watermark, stamp.timestamp);
+	const auto watermark = scope->second.watermark;
+	while (scope != scopes.end() && scope->second.expiry.begin()->first < watermark) {
+		const auto expired = scope->second.expiry.begin()->second;
+		Remove(expired, output, "idle_timeout");
+		scope = scopes.find(id);
+	}
 }
 
 std::vector<TcpStream> TcpReassembler::Add(const TcpFlowKey &key, uint32_t sequence, uint8_t flags,
                                            const uint8_t *payload, size_t captured, uint32_t declared,
                                            PacketStamp stamp) {
 	std::vector<TcpStream> output;
+	Expire(key, stamp, output);
 	const bool syn = (flags & 2U) != 0;
 	auto it = flows.find(key);
 	const bool new_syn = syn && (it == flows.end() || (it->second.has_syn && it->second.syn_sequence != sequence));
@@ -112,6 +171,7 @@ std::vector<TcpStream> TcpReassembler::Add(const TcpFlowKey &key, uint32_t seque
 	}
 	auto &flow = it->second;
 	flow.last = stamp;
+	Schedule(it->first, flow, stamp);
 	if (syn) {
 		flow.has_syn = true;
 		flow.syn_sequence = sequence;

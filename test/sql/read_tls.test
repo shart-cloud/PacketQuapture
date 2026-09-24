@@ -412,3 +412,11 @@ WHERE ja4 IS DISTINCT FROM CASE WHEN r IS NULL THEN NULL ELSE r[1] || '_' || h[1
    OR ja4s IS DISTINCT FROM CASE WHEN s IS NULL THEN NULL ELSE s[1] || '_' || s[2] || '_' || h[3] END;
 ----
 0
+
+# 1,024 quiet connections fill every tracked TCP direction. They are evicted after
+# the 300 s idle timeout, so a later handshake is still reported rather than lost
+# to the direction limit.
+query TTT
+SELECT tls_sni, reassembly_status, warnings FROM read_tls('test/data/tls/idle_eviction.pcap');
+----
+after-idle.example	complete	[]

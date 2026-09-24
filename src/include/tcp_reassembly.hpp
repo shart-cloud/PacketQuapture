@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include <utility>
@@ -56,9 +57,12 @@ struct TcpReassemblyLimits {
 	size_t max_stream_bytes = 1024 * 1024;
 	size_t max_segments = 4096;
 	size_t max_total_segments = 65536;
+	// A direction with no packet for this long, by its interface's clock, is finalized
+	// as idle_timeout, as read_flows does. Zero disables eviction.
+	int64_t tcp_idle_us = 300000000;
 };
 
-// File-scoped offline reconstruction. Output is delayed until EOF, reset, or tuple reuse
+// File-scoped offline reconstruction. Output is delayed until EOF, reset, tuple reuse or idle timeout
 // so conflicting retransmissions can invalidate a direction before reconstructed bytes are emitted. No application
 // protocol is interpreted.
 class TcpReassembler {
@@ -86,15 +90,29 @@ private:
 		size_t bytes = 0;
 		std::string failure, failure_status;
 		std::vector<Segment> segments;
+		// Scheduled for idle eviction; a direction that ever lacks a timestamp never is.
+		bool scheduled = false, untimed = false;
+		int64_t deadline = 0;
 	};
+	// One clock per capture interface: the latest timestamp seen on it, and the
+	// directions on it in deadline order. Dropped once nothing is scheduled.
+	struct Scope {
+		int64_t watermark = 0;
+		std::set<std::pair<int64_t, TcpFlowKey>> expiry;
+	};
+	using ScopeKey = std::pair<uint32_t, uint32_t>;
 	TcpStream Diagnostic(const TcpFlowKey &key, const Flow &flow, const std::string &status,
 	                     const std::string &error) const;
 	std::vector<TcpStream> Finish(const TcpFlowKey &key, Flow &flow);
 	void Remove(const TcpFlowKey &key, std::vector<TcpStream> &output, const std::string &reason);
 	void Fail(Flow &flow, const std::string &reason, const std::string &status = "limit");
+	void Expire(const TcpFlowKey &key, const PacketStamp &stamp, std::vector<TcpStream> &output);
+	void Schedule(const TcpFlowKey &key, Flow &flow, const PacketStamp &stamp);
+	void Unschedule(const TcpFlowKey &key, Flow &flow);
 	TcpReassemblyLimits limits;
 	size_t buffered_bytes = 0, buffered_segments = 0;
 	uint64_t next_id = 1;
 	std::map<TcpFlowKey, Flow> flows;
+	std::map<ScopeKey, Scope> scopes;
 };
 } // namespace packetquapture

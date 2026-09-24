@@ -91,6 +91,7 @@ ambiguous message rows. Diagnostic rows have `dns_valid = false`, null DNS field
 Defaults are fixed for this experimental release:
 
 - 1,024 tracked TCP directions per file, including completed directions retained for overlap checking.
+  A direction idle for 300 seconds is finalized as `idle_timeout` and frees its slot.
 - 32 MiB of buffered captured TCP payload per file.
 - 1 MiB of captured payload and a 1 MiB sequence span per direction.
 - 4,096 retained segments per direction and 65,536 retained segments per file.
@@ -99,8 +100,9 @@ Defaults are fixed for this experimental release:
 Identical whole-segment retransmissions do not consume additional storage. Partial overlaps count toward
 stored-byte limits. Metadata, reconstruction buffers, and output rows use additional bounded memory beyond
 that payload budget. Exceeding a stored-byte/segment budget quarantines the affected direction until reset,
-tuple reuse, or file end; it emits an explicit diagnostic. New directions beyond the tracked-direction cap
-produce limit diagnostics. This first version favors detectable incompleteness over silent eviction.
+tuple reuse, idle timeout, or file end; it emits an explicit diagnostic. New directions beyond the
+tracked-direction cap produce limit diagnostics. Idle eviction is not silent: each evicted direction is
+finalized with `finalized_by = 'idle_timeout'`, as described in [TCP streams](TCP_STREAMS.md).
 
 All DNS-relevant transport payloads must be read for reassembly, even for `count(*)`. Payloads on other ports
 are skipped. DNS structure parsing is avoided when no DNS fields are requested. SQL filters run **after**

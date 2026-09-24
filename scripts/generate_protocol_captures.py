@@ -68,10 +68,12 @@ def eth(payload, kind=0x0800, tags=()):
 
 
 def pcap(path, packets, link=1):
+    """Each packet is bytes, stamped 1700000000, or a (seconds, bytes) pair."""
     content = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, link)
     for packet in packets:
+        seconds, packet = packet if isinstance(packet, tuple) else (1700000000, packet)
         content += (
-            struct.pack("<IIII", 1700000000, 0, len(packet), len(packet)) + packet
+            struct.pack("<IIII", seconds, 0, len(packet), len(packet)) + packet
         )
     path.write_bytes(content)
 

@@ -85,3 +85,13 @@ statement error
 SELECT * FROM read_tcp_streams('test/data/malformed/payload.pcap');
 ----
 Unexpected end
+
+# A direction quiet for longer than the 300 s idle timeout is finalized with its
+# bytes intact, and frees its slot: nothing afterwards is rejected as over the limit.
+query TTTI rowsort
+SELECT src_port, reassembly_status, finalized_by, captured_bytes
+FROM read_tcp_streams('test/data/tls/idle_eviction.pcap');
+----
+20000	contiguous	idle_timeout	5
+443	contiguous	eof	49
+51000	contiguous	eof	79
