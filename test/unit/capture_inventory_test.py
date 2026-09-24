@@ -118,7 +118,8 @@ class InventoryTests(unittest.TestCase):
             row = c.query(
                 "SELECT reused,scan_status,packet_count FROM " + self.scan(options=options + ",on_error='report'")
             )[0]
-            self.assertEqual(row, {"reused": "false", "scan_status": "error", "packet_count": None})
+            # Cutting the last byte leaves a readable, truncated tail: rescanned, not reused.
+            self.assertEqual(row, {"reused": "false", "scan_status": "truncated", "packet_count": "8"})
             self.path.unlink()
             row = c.query("SELECT scan_status,packet_count FROM " + self.scan(options=options + ",on_error='report'"))[
                 0

@@ -70,7 +70,7 @@ SELECT scan_status,packet_count FROM capture_inventory('test/data/truncated/comp
 complete	3
 
 query TT
-SELECT regexp_extract(filename,'[^/]+$'),scan_status FROM capture_inventory('test/data/truncated/*.pcap')
+SELECT parse_filename(filename),scan_status FROM capture_inventory('test/data/truncated/*.pcap')
 ORDER BY filename;
 ----
 complete.pcap	complete
