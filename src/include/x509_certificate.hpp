@@ -23,16 +23,20 @@ struct X509Certificate {
 	// entries as text (dotted IPv4, RFC 5952 IPv6), in wire order.
 	std::vector<std::string> san_dns, san_ip;
 	// The type OID of every issuer and subject attribute, and the OID of every
-	// extension, in wire order, each as lowercase hex of its DER content octets.
-	// JA4X fingerprints these.
-	std::vector<std::string> issuer_types, subject_types, extension_types;
+	// extension, in wire order, each as lowercase hex of its DER content octets
+	// and joined with commas, which is the form JA4X fingerprints. One string
+	// each, so a certificate with thousands of tiny extensions costs its text
+	// and nothing more.
+	std::string issuer_oids, subject_oids, extension_oids;
 
-	// The text this certificate holds once parsed, for memory budgets.
+	// The memory this certificate holds once parsed, for budgets: its text, and
+	// each list entry's own string.
 	size_t TextBytes() const {
-		size_t bytes = subject.size() + issuer.size() + serial.size() + sizeof(not_before) + sizeof(not_after);
-		for (const auto *list : {&san_dns, &san_ip, &issuer_types, &subject_types, &extension_types}) {
+		size_t bytes = subject.size() + issuer.size() + serial.size() + issuer_oids.size() + subject_oids.size() +
+		               extension_oids.size() + sizeof(not_before) + sizeof(not_after);
+		for (const auto *list : {&san_dns, &san_ip}) {
 			for (const auto &item : *list) {
-				bytes += item.size();
+				bytes += sizeof(std::string) + item.size();
 			}
 		}
 		return bytes;

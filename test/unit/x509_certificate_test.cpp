@@ -275,6 +275,23 @@ void TestFraming() {
 	assert(Parse({0x1F, 0x01, 0x00}, out) == X509Result::MALFORMED);
 }
 
+// What a parsed certificate holds is what the memory budget counts. Thousands
+// of one-byte extensions cost a few bytes each, not a string apiece, and
+// every list entry is charged its own overhead.
+void TestTextBytes() {
+	Spec spec;
+	const Bytes tiny = Tlv(0x30, Cat({Tlv(0x06, {0x2A}), Tlv(0x04, {})}));
+	for (int i = 0; i < 3000; ++i) {
+		spec.extensions.push_back(tiny);
+	}
+	spec.extensions.push_back(San({Text(0x82, "a"), Text(0x82, "b")}));
+	const auto cert = Ok(spec);
+	assert(cert.extension_oids.size() == 3000 * 3 + 6 && cert.extension_oids.compare(0, 6, "2a,2a,") == 0);
+	assert(cert.extension_oids.compare(cert.extension_oids.size() - 9, 9, "2a,551d11") == 0);
+	assert(cert.issuer_oids == "550406,55040a" && cert.subject_oids == "550406,55040a,550403");
+	assert(cert.TextBytes() >= cert.extension_oids.size() + 2 * sizeof(std::string));
+}
+
 // Random corruption never crashes, and never yields a partly filled result.
 void TestFuzz() {
 	std::mt19937 random(424242);
@@ -319,6 +336,7 @@ int main() {
 	TestIpv6();
 	TestExtensions();
 	TestFraming();
+	TestTextBytes();
 	TestFuzz();
 	std::printf("X.509 fields, RFC 4514 names, times, SANs, framing and fuzzing passed\n");
 }

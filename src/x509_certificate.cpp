@@ -313,7 +313,14 @@ bool DecodeString(const Element &element, std::string &out) {
 // AttributeTypeAndValue. RFC 4514 writes the last RDN first. Order inside a
 // multi-valued RDN carries no meaning; it is reversed too, as OpenSSL does, so
 // the two print the same string.
-bool DecodeName(const Element &name, std::string &out, std::vector<std::string> &types) {
+void AppendOid(const Element &oid, std::string &list) {
+	if (!list.empty()) {
+		list += ',';
+	}
+	list += Hex(oid.content, oid.length);
+}
+
+bool DecodeName(const Element &name, std::string &out, std::string &types) {
 	if (name.tag != TAG_SEQUENCE) {
 		return false;
 	}
@@ -336,7 +343,7 @@ bool DecodeName(const Element &name, std::string &out, std::vector<std::string> 
 			if (!fields.Expect(TAG_OID, type) || !fields.Next(value) || !fields.AtEnd() || !DecodeOid(type, oid)) {
 				return false;
 			}
-			types.push_back(Hex(type.content, type.length));
+			AppendOid(type, types);
 			const char *short_name = ShortName(oid);
 			if (short_name != nullptr && DecodeString(value, text)) {
 				rdn.push_back(std::string(short_name) + "=" + EscapeRfc4514(text));
@@ -511,7 +518,7 @@ X509Result DecodeExtensions(const Element &wrapper, size_t max_san_entries, X509
 		if (!fields.Expect(TAG_OID, id) || !DecodeOid(id, oid)) {
 			return X509Result::MALFORMED;
 		}
-		out.extension_types.push_back(Hex(id.content, id.length));
+		AppendOid(id, out.extension_oids);
 		if (fields.PeekTag() == TAG_BOOLEAN) {
 			Element critical;
 			fields.Next(critical);
@@ -560,7 +567,7 @@ X509Result Parse(const uint8_t *data, size_t size, size_t max_san_entries, X509C
 	}
 	out.serial = Hex(serial.content, serial.length);
 	if (!fields.Expect(TAG_SEQUENCE, element) || !fields.Next(issuer) ||
-	    !DecodeName(issuer, out.issuer, out.issuer_types)) {
+	    !DecodeName(issuer, out.issuer, out.issuer_oids)) {
 		return X509Result::MALFORMED;
 	}
 	if (!fields.Expect(TAG_SEQUENCE, validity)) {
@@ -572,7 +579,7 @@ X509Result Parse(const uint8_t *data, size_t size, size_t max_san_entries, X509C
 	    !DecodeTime(not_before, out.not_before) || !DecodeTime(not_after, out.not_after)) {
 		return X509Result::MALFORMED;
 	}
-	if (!fields.Next(subject) || !DecodeName(subject, out.subject, out.subject_types)) {
+	if (!fields.Next(subject) || !DecodeName(subject, out.subject, out.subject_oids)) {
 		return X509Result::MALFORMED;
 	}
 	if (!fields.Expect(TAG_SEQUENCE, element)) { // subjectPublicKeyInfo
