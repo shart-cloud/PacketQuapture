@@ -17,10 +17,13 @@
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/common/types/interval.hpp"
+#include "duckdb/common/crypto/md5.hpp"
+#include "mbedtls_wrapper.hpp"
 #include "packet_decoder.hpp"
 #include "dns_decoder.hpp"
 #include "tls_record.hpp"
 #include "tls_handshake.hpp"
+#include "tls_fingerprint.hpp"
 #include "tcp_reassembly.hpp"
 #include "dns_tcp_framer.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -2307,7 +2310,15 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         "server_extensions",
 	         "server_extensions_no_grease",
 	         "server_alpn",
-	         "warnings"};
+	         "warnings",
+	         "ja3",
+	         "ja3_full",
+	         "ja3s",
+	         "ja3s_full",
+	         "ja4",
+	         "ja4_r",
+	         "ja4s",
+	         "ja4s_r"};
 	const auto codes = LogicalType::LIST(LogicalType::USMALLINT);
 	const auto text = LogicalType::LIST(LogicalType::VARCHAR);
 	types = {LogicalType::VARCHAR,
@@ -2351,7 +2362,15 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         codes,
 	         codes,
 	         LogicalType::VARCHAR,
-	         text};
+	         text,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR};
 	auto &bind = result->Cast<PcapBindData>();
 	bind.types = types;
 	bind.stream_plan =
@@ -2366,6 +2385,20 @@ static unique_ptr<GlobalTableFunctionState> TlsInit(ClientContext &context, Tabl
 	state->options.reassemble_tcp = true;
 	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
 	return std::move(state);
+}
+
+// The first 12 hex digits of SHA-256, as JA4 truncates it. An empty list is
+// written as zeros rather than the hash of nothing, as the JA4 specification
+// and both FoxIO implementations do.
+static string Ja4Hash12(const string &text) {
+	if (text.empty()) {
+		return "000000000000";
+	}
+	duckdb_mbedtls::MbedTlsWrapper::SHA256State sha;
+	sha.AddString(text);
+	char hex[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT];
+	sha.FinishHex(hex);
+	return string(hex, 12);
 }
 
 // A hello list as a column value: NULL when the hello did not carry it, was not
@@ -2576,6 +2609,44 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 			values.push_back(Value(warning));
 		}
 		vector.SetValue(row, Value::LIST(LogicalType::VARCHAR, values));
+		break;
+	}
+	// Fingerprints are built only when projected, like every other column, so
+	// queries that do not ask for them pay nothing. NULL rather than a hash of
+	// partial input; see tls_fingerprint.hpp.
+	case 42:
+	case 43:
+	case 44:
+	case 45: {
+		std::string text;
+		const bool client = column == 42 || column == 43;
+		if (!(client ? packetquapture::Ja3String(handshake, text) : packetquapture::Ja3sString(handshake, text))) {
+			FlatVector::SetNull(vector, row, true);
+		} else if (column == 43 || column == 45) {
+			vector.SetValue(row, Value(text));
+		} else {
+			MD5Context md5;
+			md5.Add(text);
+			vector.SetValue(row, Value(md5.FinishHex()));
+		}
+		break;
+	}
+	// JA4 and JA4S, and their raw forms. JA4S is FoxIO License 1.1; see NOTICE.
+	case 46:
+	case 47:
+	case 48:
+	case 49: {
+		packetquapture::Ja4Parts parts;
+		const bool client = column == 46 || column == 47;
+		if (!(client ? packetquapture::Ja4Strings(handshake, parts) : packetquapture::Ja4sStrings(handshake, parts))) {
+			FlatVector::SetNull(vector, row, true);
+		} else if (column == 47 || column == 49) {
+			vector.SetValue(row, Value(parts.prefix + "_" + parts.first + "_" + parts.second));
+		} else {
+			// JA4S carries its one cipher suite as is; JA4 hashes its cipher list.
+			const auto first = client ? Ja4Hash12(parts.first) : parts.first;
+			vector.SetValue(row, Value(parts.prefix + "_" + first + "_" + Ja4Hash12(parts.second)));
+		}
 		break;
 	}
 	default:

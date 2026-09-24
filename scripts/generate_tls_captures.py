@@ -311,6 +311,21 @@ def fingerprint_fixtures():
     huge = full_client_hello(list(range(0x0100, 0x0100 + 1100)), [])
     pcap(DATA / "list_limit.pcap", connection([record(huge)], []))
 
+    # JA3 takes the version from legacy_version on both sides, never from
+    # supported_versions, and drops GREASE; here it is in the ServerHello too.
+    old_hello = full_client_hello([GREASE[0], 0xC013, 0x0035], [
+        extension(GREASE[1], b""),
+        server_name("legacy.example.com"),
+        extension(10, vector16(u16s([GREASE[2], 0x0017]))),
+        extension(11, vector8(b"\0")),
+    ], version=0x0301)
+    old_reply = full_server_hello(0xC013, [
+        extension(GREASE[3], b""),
+        extension(65281, b"\0"),
+        extension(11, vector8(b"\0")),
+    ], version=0x0301)
+    pcap(DATA / "ja3_legacy.pcap", connection([record(old_hello)], [record(old_reply)]))
+
 
 if __name__ == "__main__":
     main()

@@ -598,7 +598,25 @@ void TestListEntryLimit() {
 	assert(within.client_cipher_suites.values.size() == 4 && within.status == "one-sided");
 	const auto over = OrphanClient(ClientHelloWith({1, 2, 3, 4, 5}, {}), limits);
 	assert(!over.client_cipher_suites.present && !over.client_cipher_suites.malformed);
+	assert(over.client_cipher_suites.over_limit && !over.client_cipher_suites.Known());
 	assert(over.status == "limit");
+	// A list over the limit is not the same as a list the hello did not carry.
+	const auto groups = OrphanClient(ClientHelloWith({1}, Extension(10, Codes({1, 2, 3, 4, 5}))), limits);
+	assert(!groups.client_supported_groups.present && groups.client_supported_groups.over_limit);
+	assert(!groups.client_ec_point_formats.present && groups.client_ec_point_formats.Known());
+}
+
+// JA3S fingerprints the ServerHello's legacy_version, which supported_versions
+// replaces as the negotiated version.
+void TestServerLegacyVersion() {
+	TlsHandshakeAssembler assembler;
+	assembler.Add(Stream(Key(), 1, Record(ClientHello({})), 1));
+	auto done = assembler.Add(Stream(Key().Reverse(), 2, Record(ServerHello(0x1301, SupportedVersions(0x0304))), 2));
+	const auto rest = assembler.Finish();
+	done.insert(done.end(), rest.begin(), rest.end());
+	assert(done.size() == 1);
+	assert(done[0].has_server_legacy_version && done[0].server_legacy_version == 0x0303);
+	assert(done[0].negotiated_version == 0x0304);
 }
 
 // Random extension bodies behind valid framing: lists are bounded, and a list
@@ -625,6 +643,7 @@ void TestListFuzz() {
 		for (const auto &h : assembler.Finish()) {
 			assert(!(h.client_supported_groups.present && h.client_supported_groups.malformed));
 			assert(!(h.client_alpn.present && h.client_alpn.malformed));
+			assert(!(h.client_supported_groups.present && h.client_supported_groups.over_limit));
 			assert(h.client_supported_groups.values.size() <= 8);
 			assert(h.client_signature_algorithms.values.size() <= 8);
 			assert(h.client_supported_versions.values.size() <= 8);
@@ -684,6 +703,7 @@ int main() {
 	TestMalformedLists();
 	TestInvalidHelloReportsNoLists();
 	TestListEntryLimit();
+	TestServerLegacyVersion();
 	TestListFuzz();
 	printf("TLS handshake pairing, orphans, renegotiation, resumption, limits and hello lists passed\n");
 	return 0;

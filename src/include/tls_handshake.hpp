@@ -35,13 +35,20 @@ inline bool IsTlsGreaseAlpn(const std::string &protocol) {
 }
 
 // A list read from a hello. Absent means the hello did not carry it; a list
-// that was present but malformed is reported absent with malformed set, so an
-// empty list always means the peer sent an empty list.
+// that was present but malformed or longer than max_list_entries is reported
+// absent with malformed or over_limit set, so an empty list always means the
+// peer sent an empty list, and only a list that is neither is really missing.
 template <class T>
 struct TlsList {
 	bool present = false;
 	bool malformed = false;
+	bool over_limit = false;
 	std::vector<T> values;
+
+	// Whether the hello's value for this list is known: present, or not sent.
+	bool Known() const {
+		return !malformed && !over_limit;
+	}
 };
 
 // One reported handshake. The key is oriented client to server, whichever
@@ -72,6 +79,10 @@ struct TlsHandshake {
 	// otherwise legacy_version from the ServerHello.
 	bool has_negotiated_version = false;
 	uint16_t negotiated_version = 0;
+	// legacy_version from the ServerHello, before supported_versions. JA3S
+	// fingerprints this, not the version actually selected.
+	bool has_server_legacy_version = false;
+	uint16_t server_legacy_version = 0;
 	bool has_cipher_suite = false;
 	uint16_t cipher_suite = 0;
 	TlsList<uint16_t> server_extensions;
