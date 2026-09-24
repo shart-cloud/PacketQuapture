@@ -120,8 +120,14 @@ void TcpReassembler::Expire(const TcpFlowKey &key, const PacketStamp &stamp, std
 	if (scope == scopes.end()) {
 		return;
 	}
-	scope->second.watermark = std::max(scope->second.watermark, stamp.timestamp);
-	const auto watermark = scope->second.watermark;
+	auto &clock = scope->second.watermark;
+	// A packet further behind than the timeout means the clock stepped back. The
+	// clock restarts from it, or every direction opened since would look idle at
+	// once; directions from before the step wait until the new clock catches up.
+	const bool stepped_back =
+	    stamp.timestamp < clock && uint64_t(clock) - uint64_t(stamp.timestamp) > uint64_t(limits.tcp_idle_us);
+	clock = stepped_back ? stamp.timestamp : std::max(clock, stamp.timestamp);
+	const auto watermark = clock;
 	while (scope != scopes.end() && scope->second.expiry.begin()->first < watermark) {
 		const auto expired = scope->second.expiry.begin()->second;
 		Remove(expired, output, "idle_timeout");

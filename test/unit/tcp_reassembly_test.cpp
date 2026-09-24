@@ -120,6 +120,22 @@ static void TestIdleEviction() {
 		assert(r.FlowCount() == 2);
 	}
 	{
+		// A clock stepped back by more than the timeout (NTP, or captures appended out
+		// of order) restarts the interface's clock. Otherwise every direction opened
+		// after the step would look idle on its second packet and be cut to pieces.
+		TcpReassembler r;
+		Send(r, Client(1), 100, 2, {}, At(1, 10000));
+		Send(r, Client(1), 101, 0x18, {'o', 'l', 'd'}, At(2, 10000));
+		assert(Send(r, Client(2), 100, 2, {}, At(3, 0)).empty());
+		assert(Send(r, Client(2), 101, 0x18, {'a'}, At(4, 1)).empty());
+		assert(Send(r, Client(2), 102, 0x18, {'b'}, At(5, 2)).empty());
+		assert(r.FlowCount() == 2);
+		// Directions on the new clock still age normally.
+		auto evicted = Send(r, Client(3), 100, 2, {}, At(6, 2 + idle + 1));
+		assert(evicted.size() == 1 && evicted[0].key.src_port == 2 && evicted[0].finalized_by == "idle_timeout");
+		assert(evicted[0].status == "contiguous" && evicted[0].captured_bytes == 2);
+	}
+	{
 		// A zero timeout disables eviction.
 		TcpReassemblyLimits limits;
 		limits.tcp_idle_us = 0;

@@ -109,7 +109,9 @@ explicit diagnostics rather than silent eviction.
 
 A direction with no packet for 300 seconds is finalized with `finalized_by = 'idle_timeout'`, freeing its
 slot, as `read_flows` does with its default `tcp_idle_timeout`. Idle is judged per capture interface by the
-latest timestamp seen on it; a direction that has any packet without a timestamp is never evicted. Without
+latest timestamp seen on it; a direction that has any packet without a timestamp is never evicted.
+If that clock steps back by more than the timeout, it restarts from the earlier time, so directions opened
+afterwards age normally and those opened before wait until the clock catches up. Without
 this, connections that never close (scans, abandoned sessions) filled the 1,024 slots for good and every
 later packet became a one-packet `limit` stream. The status still describes the bytes, so an evicted
 direction is usually `contiguous`. Two costs: traffic that resumes after eviction starts a new direction,
