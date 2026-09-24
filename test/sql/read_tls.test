@@ -313,3 +313,102 @@ SELECT count(*) FROM read_tls('test/data/tls/*.pcap')
 WHERE ja3 IS DISTINCT FROM md5(ja3_full) OR ja3s IS DISTINCT FROM md5(ja3s_full);
 ----
 0
+
+# JA4 and JA4S, per FoxIO-LLC/ja4 at 16b96d9. JA4 values are tshark 4.2.2's
+# tls.handshake.ja4 and ja4_r, except that an empty list is written as
+# 000000000000, as JA4.md and both FoxIO implementations say, where tshark
+# 4.2.2 hashes the empty string (e3b0c44298fc). tshark has no JA4S; JA4S values
+# are from the FoxIO python reference, python/ja4.py.
+# JA4S is licensed under the FoxIO License 1.1; see NOTICE.
+query IIII
+SELECT ja4, ja4_r, ja4s, ja4s_r FROM read_tls('test/data/tls/browser_tls13.pcap');
+----
+t13d1514h2_8daaf6152771_bc9a4605e104	t13d1514h2_002f,0035,009c,009d,1301,1302,1303,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_0005,000a,000b,000d,0012,0017,001b,0023,002b,002d,0033,ff01_0403,0804,0401,0503,0805,0501,0806,0601	t130200_1301_a56c5b993250	t130200_1301_002b,0033
+
+query IIII
+SELECT ja4, ja4_r, ja4s, ja4s_r FROM read_tls('test/data/tls/tls12_alpn.pcap');
+----
+t12d0406h2_ec7724f63c6c_7081bc90e5b0	t12d0406h2_002f,009c,c02b,c02f_000a,000b,000d,0017_0401,0403	t1204h1_c02f_f8a64b40b891	t1204h1_c02f_ff01,000b,0010,0017
+
+# JA4S counts and hashes GREASE in the ServerHello; JA4 drops it.
+query IIII
+SELECT ja4, ja4_r, ja4s, ja4s_r FROM read_tls('test/data/tls/ja3_legacy.pcap');
+----
+t10d020300_4f212281e1ff_33a13ba74d1c	t10d020300_0035,c013_000a,000b	t100300_c013_4ada57960b35	t100300_c013_3a3a,ff01,000b
+
+# An empty list is 000000000000, not the hash of nothing.
+query IIII
+SELECT ja4, ja4_r, ja4s, ja4s_r FROM read_tls('test/data/tls/session.pcap');
+----
+t12d010100_0f2cb44170f4_000000000000	t12d010100_1301_	t120000_1301_000000000000	t120000_1301_
+
+query II
+SELECT ja4, ja4_r FROM read_tls('test/data/tls/no_extensions.pcap');
+----
+t12i010000_0f2cb44170f4_000000000000	t12i010000_1301_
+
+# No SNI is i; supported_versions sets the version.
+query II
+SELECT ja4, ja4_r FROM read_tls('test/data/tls/no_sni.pcap');
+----
+t13i010100_0f2cb44170f4_b9a491fefe05	t13i010100_1301_002b
+
+# More than 99 cipher suites count as 99.
+query I
+SELECT ja4 FROM read_tls('test/data/tls/many_ciphers.pcap');
+----
+t13i990200_0f8860b09f90_b0ac53b37fa7
+
+# ALPN edge cases, as JA4.md and tshark 4.2.2 render them: a GREASE first
+# value as sent, in hex; a single character twice; a non-alphanumeric value
+# as the first and last digit of its hex. The FoxIO implementations differ
+# from JA4.md here; see TLS_HANDSHAKES.md.
+query II
+SELECT client_port, ja4 FROM read_tls('test/data/tls/alpn_edges.pcap') ORDER BY client_port;
+----
+51001	t12i01010a_0f2cb44170f4_000000000000
+51002	t12i0101xx_0f2cb44170f4_000000000000
+51003	t12i0101a1_0f2cb44170f4_000000000000
+
+# JA4 does not use supported_groups, so a malformed one leaves it defined.
+query III
+SELECT ja3, ja4, ja4_r FROM read_tls('test/data/tls/malformed_groups.pcap');
+----
+NULL	t12d010200_0f2cb44170f4_a8f3e973773c	t12d010200_1301_000a
+
+query IIII
+SELECT ja4, ja4_r, ja4s, ja4s_r FROM read_tls('test/data/tls/list_limit.pcap');
+----
+NULL	NULL	NULL	NULL
+
+query IIII
+SELECT ja4, ja4s, ja4_r, ja4s_r FROM read_tls('test/data/tls/client_only.pcap');
+----
+t12d010100_0f2cb44170f4_000000000000	NULL	t12d010100_1301_	NULL
+
+query IIII
+SELECT ja4, ja4s, ja4_r, ja4s_r FROM read_tls('test/data/tls/server_only.pcap');
+----
+NULL	t120000_1301_000000000000	NULL	t120000_1301_
+
+query III
+SELECT handshake_number, ja4, ja4s FROM read_tls('test/data/tls/renegotiated.pcap') ORDER BY handshake_number;
+----
+1	t12d010100_0f2cb44170f4_000000000000	t120000_1301_000000000000
+2	t12d010100_0f2cb44170f4_000000000000	t120000_1301_000000000000
+
+# Each hash is the first 12 hex digits of SHA-256 over the matching raw part,
+# or zeros for an empty part.
+query I
+WITH parts AS (
+    SELECT ja4, string_split(ja4_r, '_') AS r, ja4s, string_split(ja4s_r, '_') AS s
+    FROM read_tls('test/data/tls/*.pcap') WHERE ja4 IS NOT NULL OR ja4s IS NOT NULL),
+hashed AS (
+    SELECT *, list_transform([r[2], array_to_string(r[3:], '_'), s[3]],
+                             lambda p: CASE WHEN p = '' THEN '000000000000' ELSE left(sha256(p), 12) END) AS h
+    FROM parts)
+SELECT count(*) FROM hashed
+WHERE ja4 IS DISTINCT FROM CASE WHEN r IS NULL THEN NULL ELSE r[1] || '_' || h[1] || '_' || h[2] END
+   OR ja4s IS DISTINCT FROM CASE WHEN s IS NULL THEN NULL ELSE s[1] || '_' || s[2] || '_' || h[3] END;
+----
+0

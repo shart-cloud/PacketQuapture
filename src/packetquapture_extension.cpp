@@ -18,6 +18,7 @@
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/common/crypto/md5.hpp"
+#include "mbedtls_wrapper.hpp"
 #include "packet_decoder.hpp"
 #include "dns_decoder.hpp"
 #include "tls_record.hpp"
@@ -2313,7 +2314,11 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         "ja3",
 	         "ja3_full",
 	         "ja3s",
-	         "ja3s_full"};
+	         "ja3s_full",
+	         "ja4",
+	         "ja4_r",
+	         "ja4s",
+	         "ja4s_r"};
 	const auto codes = LogicalType::LIST(LogicalType::USMALLINT);
 	const auto text = LogicalType::LIST(LogicalType::VARCHAR);
 	types = {LogicalType::VARCHAR,
@@ -2361,6 +2366,10 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         LogicalType::VARCHAR,
 	         LogicalType::VARCHAR,
 	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
 	         LogicalType::VARCHAR};
 	auto &bind = result->Cast<PcapBindData>();
 	bind.types = types;
@@ -2376,6 +2385,20 @@ static unique_ptr<GlobalTableFunctionState> TlsInit(ClientContext &context, Tabl
 	state->options.reassemble_tcp = true;
 	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
 	return std::move(state);
+}
+
+// The first 12 hex digits of SHA-256, as JA4 truncates it. An empty list is
+// written as zeros rather than the hash of nothing, as the JA4 specification
+// and both FoxIO implementations do.
+static string Ja4Hash12(const string &text) {
+	if (text.empty()) {
+		return "000000000000";
+	}
+	duckdb_mbedtls::MbedTlsWrapper::SHA256State sha;
+	sha.AddString(text);
+	char hex[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT];
+	sha.FinishHex(hex);
+	return string(hex, 12);
 }
 
 // A hello list as a column value: NULL when the hello did not carry it, was not
@@ -2605,6 +2628,24 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 			MD5Context md5;
 			md5.Add(text);
 			vector.SetValue(row, Value(md5.FinishHex()));
+		}
+		break;
+	}
+	// JA4 and JA4S, and their raw forms. JA4S is FoxIO License 1.1; see NOTICE.
+	case 46:
+	case 47:
+	case 48:
+	case 49: {
+		packetquapture::Ja4Parts parts;
+		const bool client = column == 46 || column == 47;
+		if (!(client ? packetquapture::Ja4Strings(handshake, parts) : packetquapture::Ja4sStrings(handshake, parts))) {
+			FlatVector::SetNull(vector, row, true);
+		} else if (column == 47 || column == 49) {
+			vector.SetValue(row, Value(parts.prefix + "_" + parts.first + "_" + parts.second));
+		} else {
+			// JA4S carries its one cipher suite as is; JA4 hashes its cipher list.
+			const auto first = client ? Ja4Hash12(parts.first) : parts.first;
+			vector.SetValue(row, Value(parts.prefix + "_" + first + "_" + Ja4Hash12(parts.second)));
 		}
 		break;
 	}

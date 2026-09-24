@@ -20,4 +20,37 @@ namespace packetquapture {
 bool Ja3String(const TlsHandshake &handshake, std::string &out);
 bool Ja3sString(const TlsHandshake &handshake, std::string &out);
 
+// The pieces of a JA4 or JA4S fingerprint, as defined by FoxIO-LLC/ja4 at
+// 16b96d9 (technical_details/JA4.md, and the python and rust reference
+// implementations for JA4S, whose only specification is a diagram). The
+// fingerprint is prefix_hash12(first)_hash12(second) and the raw form
+// prefix_first_second, where hash12 is the first 12 hex digits of SHA-256,
+// or 000000000000 for an empty string. For JA4S, first is the selected
+// cipher, which is not hashed.
+//
+// JA4S and the rest of JA4+ are licensed under the FoxIO License 1.1, not
+// the MIT license of this project; see NOTICE. JA4 itself is BSD 3-Clause.
+struct Ja4Parts {
+	std::string prefix, first, second;
+};
+
+// As with JA3, each returns false when its hello is missing or invalid, or
+// when an input it uses is malformed or over the list limit.
+//
+// JA4: t, version (highest non-GREASE supported_versions, else
+// legacy_version), d or i for SNI, cipher and extension counts without
+// GREASE capped at 99, and the first ALPN value's first and last characters.
+// first: sorted cipher suites. second: sorted extension types without GREASE,
+// SNI or ALPN, then _ and the signature algorithms in wire order, if any.
+bool Ja4Strings(const TlsHandshake &handshake, Ja4Parts &out);
+// JA4S: t, the negotiated version, the extension count including GREASE, and
+// the selected ALPN value's characters. first: the selected cipher suite.
+// second: extension types in wire order, GREASE included.
+bool Ja4sStrings(const TlsHandshake &handshake, Ja4Parts &out);
+
+// The two ALPN characters of a JA4 prefix, per JA4.md: the first and last
+// byte when both are ASCII alphanumeric, otherwise the first and last digit
+// of the value's lower-case hex. 00 for no value.
+std::string Ja4Alpn(const std::string &protocol);
+
 } // namespace packetquapture
