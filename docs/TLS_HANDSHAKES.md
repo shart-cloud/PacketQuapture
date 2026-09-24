@@ -260,7 +260,12 @@ The certificate chain and JA4X. The certificate is in a later handshake message 
 this reader does not yet parse. JA4X is part of JA4+ and under the same license as
 JA4S. DTLS and QUIC hellos, the `d` and `q` JA4 variants, are not read.
 
-On busy captures most handshakes can go missing entirely. The transport core tracks
-1,024 TCP directions per file (see [TCP streams](TCP_STREAMS.md)), and once that is
-full, each new packet becomes its own one-packet stream with status `limit`. This
-reader cannot tell whether such a stream carried TLS, so it reports nothing for it.
+Handshakes can still go missing on very busy captures. The transport core tracks
+1,024 TCP directions per file and evicts those idle for 300 seconds (see
+[TCP streams](TCP_STREAMS.md)). If more than 1,024 are active at once, each new packet
+becomes its own one-packet stream with status `limit`. This reader cannot tell whether
+such a stream carried TLS, so it reports nothing for it.
+
+TLS carried inside another protocol, such as a SOCKS tunnel, is not read: a stream
+must begin with a TLS record. tshark does decode these, so they show up in
+`compare_tls_tshark.py` as tshark hellos without a `read_tls` row.

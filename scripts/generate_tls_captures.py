@@ -244,6 +244,7 @@ def reassembly_fixtures():
     pcap(DATA / "hostile_sni.pcap", connection([hostile], [reply]))
 
     fingerprint_fixtures()
+    idle_fixtures()
 
     # TCP that is not TLS at all.
     pcap(
@@ -325,6 +326,21 @@ def fingerprint_fixtures():
         extension(11, vector8(b"\0")),
     ], version=0x0301)
     pcap(DATA / "ja3_legacy.pcap", connection([record(old_hello)], [record(old_reply)]))
+
+
+def idle_fixtures():
+    # 1,024 connections fill every tracked TCP direction and then go quiet, as
+    # scans and abandoned sessions do. The first carries data, so its eviction is
+    # visible as a stream. A handshake after the 300 s idle timeout must still be
+    # reported rather than rejected as over the direction limit.
+    start = 1700000000
+    quiet = connection([b"quiet"], [], port=20000)[::2]
+    for port in range(20001, 20000 + 1024):  # one direction each, 1,024 in all
+        quiet.append(to_server(b"", 0, port, flags=0x02))
+    hello = record(client_hello(server_name("after-idle.example")))
+    late = connection([hello], [record(server_hello())])
+    packets = [(start, p) for p in quiet] + [(start + 301, p) for p in late]
+    pcap(DATA / "idle_eviction.pcap", packets)
 
 
 if __name__ == "__main__":

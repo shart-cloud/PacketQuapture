@@ -81,7 +81,7 @@ no row, except resource diagnostics; this function is not a connection inventory
 | `stream_id` | `UBIGINT` | Scan-local directional identifier |
 | `tcp_sequence` | `UINTEGER` | Absolute TCP sequence corresponding to offset zero |
 | `syn_seen`, `fin_seen`, `reset_seen` | `BOOLEAN` | Observed lifecycle markers |
-| `finalized_by` | `VARCHAR` | `eof`, `reset`, `tuple_reuse`, or immediate `limit` rejection |
+| `finalized_by` | `VARCHAR` | `eof`, `reset`, `tuple_reuse`, `idle_timeout`, or immediate `limit` rejection |
 | `reassembly_status` | `VARCHAR` | `contiguous`, `gapped`, `unanchored`, `conflict`, or `limit` |
 | `reassembly_error` | `VARCHAR` | Diagnostic text, otherwise null |
 | `first_packet_number`, `last_packet_number` | `UBIGINT` | First/last observed packet of the direction, including control packets |
@@ -105,7 +105,19 @@ of each byte, so retransmissions do not move its packet range.
 The core retains the existing limits: 1,024 tracked directions per file, 32 MiB stored payload per file,
 1 MiB stored payload and sequence span per direction, 4,096 segments per direction, and 65,536 segments
 per file. Metadata, reconstruction, and output use additional bounded memory. Quarantined directions emit
-explicit diagnostics rather than silent eviction. Long-lived or high-flow-count captures may hit these limits.
+explicit diagnostics rather than silent eviction.
+
+A direction with no packet for 300 seconds is finalized with `finalized_by = 'idle_timeout'`, freeing its
+slot, as `read_flows` does with its default `tcp_idle_timeout`. Idle is judged per capture interface by the
+latest timestamp seen on it; a direction that has any packet without a timestamp is never evicted.
+If that clock steps back by more than the timeout, it restarts from the earlier time, so directions opened
+afterwards age normally and those opened before wait until the clock catches up. Without
+this, connections that never close (scans, abandoned sessions) filled the 1,024 slots for good and every
+later packet became a one-packet `limit` stream. The status still describes the bytes, so an evicted
+direction is usually `contiguous`. Two costs: traffic that resumes after eviction starts a new direction,
+reported `unanchored` because its SYN belonged to the old one, and a retransmission that arrives after
+eviction can no longer be checked against the bytes already emitted. Only more than 1,024 directions active
+within 300 seconds of each other still produce direction-limit rows.
 The DNS framer independently limits messages per direction to 4,096.
 
 All transport payloads selected by the stream function are needed for reconstruction, including for count-only
