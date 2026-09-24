@@ -216,4 +216,21 @@ bool Ja4sStrings(const TlsHandshake &handshake, Ja4Parts &out) {
 	return true;
 }
 
+namespace {
+std::string JoinOids(const std::vector<std::string> &oids) {
+	std::string out;
+	for (size_t i = 0; i < oids.size(); ++i) {
+		out += (i ? "," : "") + oids[i];
+	}
+	return out;
+}
+} // namespace
+
+// JA4X (FoxIO License 1.1): see tls_fingerprint.hpp and NOTICE.
+void Ja4xStrings(const X509Certificate &certificate, Ja4xParts &out) {
+	out.issuer = JoinOids(certificate.issuer_types);
+	out.subject = JoinOids(certificate.subject_types);
+	out.extensions = JoinOids(certificate.extension_types);
+}
+
 } // namespace packetquapture

@@ -2276,6 +2276,9 @@ static LogicalType TlsCertificateType() {
 	fields.emplace_back("not_after", LogicalType::TIMESTAMP);
 	fields.emplace_back("san_dns", LogicalType::LIST(LogicalType::VARCHAR));
 	fields.emplace_back("san_ip", LogicalType::LIST(LogicalType::VARCHAR));
+	// JA4X and its raw form. FoxIO License 1.1; see NOTICE.
+	fields.emplace_back("ja4x", LogicalType::VARCHAR);
+	fields.emplace_back("ja4x_r", LogicalType::VARCHAR);
 	return LogicalType::STRUCT(std::move(fields));
 }
 
@@ -2476,11 +2479,8 @@ static idx_t TlsRowBytes(const string &filename, const packetquapture::TlsHandsh
 	idx_t certificates = 0;
 	for (const auto &certificate : handshake.server_certificates.values) {
 		const auto &fields = certificate.fields;
-		certificates += 128 + fields.subject.size() + fields.issuer.size() + fields.serial.size();
-		for (const auto &name : fields.san_dns) {
-			certificates += 32 + name.size();
-		}
-		certificates += 48 * fields.san_ip.size();
+		certificates += 256 + fields.TextBytes();
+		certificates += 32 * (fields.san_dns.size() + fields.san_ip.size());
 	}
 	return 1024 + filename.size() + handshake.sni.size() + 32 * codes + alpn + certificates;
 }
@@ -2718,10 +2718,15 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 				continue;
 			}
 			const auto &fields = certificate.fields;
-			values.push_back(Value::STRUCT(type, {Value(fields.subject), Value(fields.issuer), Value(fields.serial),
-			                                      Value::TIMESTAMP(timestamp_t(fields.not_before)),
-			                                      Value::TIMESTAMP(timestamp_t(fields.not_after)),
-			                                      TextList(fields.san_dns), TextList(fields.san_ip)}));
+			packetquapture::Ja4xParts ja4x;
+			packetquapture::Ja4xStrings(fields, ja4x);
+			values.push_back(Value::STRUCT(
+			    type,
+			    {Value(fields.subject), Value(fields.issuer), Value(fields.serial),
+			     Value::TIMESTAMP(timestamp_t(fields.not_before)), Value::TIMESTAMP(timestamp_t(fields.not_after)),
+			     TextList(fields.san_dns), TextList(fields.san_ip),
+			     Value(Ja4Hash12(ja4x.issuer) + "_" + Ja4Hash12(ja4x.subject) + "_" + Ja4Hash12(ja4x.extensions)),
+			     Value(ja4x.issuer + "_" + ja4x.subject + "_" + ja4x.extensions)}));
 		}
 		vector.SetValue(row, Value::LIST(type, values));
 		break;

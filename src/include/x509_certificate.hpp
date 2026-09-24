@@ -22,15 +22,18 @@ struct X509Certificate {
 	// subjectAltName dNSName entries, escaped as tls_sni is, and iPAddress
 	// entries as text (dotted IPv4, RFC 5952 IPv6), in wire order.
 	std::vector<std::string> san_dns, san_ip;
+	// The type OID of every issuer and subject attribute, and the OID of every
+	// extension, in wire order, each as lowercase hex of its DER content octets.
+	// JA4X fingerprints these.
+	std::vector<std::string> issuer_types, subject_types, extension_types;
 
 	// The text this certificate holds once parsed, for memory budgets.
 	size_t TextBytes() const {
 		size_t bytes = subject.size() + issuer.size() + serial.size() + sizeof(not_before) + sizeof(not_after);
-		for (const auto &name : san_dns) {
-			bytes += name.size();
-		}
-		for (const auto &address : san_ip) {
-			bytes += address.size();
+		for (const auto *list : {&san_dns, &san_ip, &issuer_types, &subject_types, &extension_types}) {
+			for (const auto &item : *list) {
+				bytes += item.size();
+			}
 		}
 		return bytes;
 	}

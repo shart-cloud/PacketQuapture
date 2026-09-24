@@ -341,8 +341,27 @@ void TestJa4sRules() {
 
 } // namespace
 
+// JA4X joins each list's hex OIDs with commas; hashing is the extension's job.
+// Values from the FoxIO rust reference at 16b96d9 for the fixture chain.
+void TestJa4xStrings() {
+	X509Certificate leaf;
+	leaf.issuer_types = {"550406", "55040a", "55040b", "550403"};
+	leaf.subject_types = {"550406", "550407", "55040a"};
+	leaf.extension_types = {"551d11"};
+	Ja4xParts parts;
+	Ja4xStrings(leaf, parts);
+	assert(parts.issuer == "550406,55040a,55040b,550403" && parts.subject == "550406,550407,55040a");
+	assert(parts.extensions == "551d11");
+	// A version 1 certificate has no extensions; the empty part is empty, not absent.
+	X509Certificate v1;
+	v1.issuer_types = {"550403"};
+	Ja4xStrings(v1, parts);
+	assert(parts.issuer == "550403" && parts.subject.empty() && parts.extensions.empty());
+}
+
 int main() {
 	TestSpecExamples();
+	TestJa4xStrings();
 	TestGreaseAndOrder();
 	TestUnknownInputs();
 	TestServerVersion();

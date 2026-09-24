@@ -19,6 +19,9 @@ Server certificate chains are matched on the connection and the nth Certificate
 message. tshark has no whole-name field, so subject and issuer are compared with
 OpenSSL's RFC 4514 rendering (-nameopt RFC2253,-esc_msb) of the DER tshark
 extracted; serials, validity and subjectAltName entries are compared with tshark.
+With --ja4x, each certificate's ja4x and ja4x_r are compared with the FoxIO rust
+reference (FoxIO-LLC/ja4 at 16b96d9, rust/ja4x, built with cargo); the python
+reference misaligns multi-valued RDNs and hashes empty parts differently.
 Exits non-zero on any disagreement that is not a documented divergence.
 """
 
@@ -30,6 +33,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -257,7 +261,7 @@ def our_certificates(path, duckdb):
     # Nested values travel as control-character-separated strings, as the lists do.
     field = ("CASE WHEN c IS NULL THEN chr(1) ELSE concat_ws(chr(30), c.subject, c.issuer, c.serial, "
              "epoch(c.not_before)::BIGINT, epoch(c.not_after)::BIGINT, array_to_string(c.san_dns, chr(29)), "
-             "array_to_string(c.san_ip, chr(29))) END")
+             "array_to_string(c.san_ip, chr(29)), c.ja4x, c.ja4x_r) END")
     query = (f"SELECT client_ip, client_port, server_ip, server_port, reassembly_status, "
              f"array_to_string(warnings, ',') AS warnings, "
              f"array_to_string(list_transform(server_certificates, lambda c: {field}), chr(31)) AS chain, "
@@ -274,8 +278,8 @@ def our_certificates(path, duckdb):
                 if item == "\x01":
                     chain.append(None)
                     continue
-                subject, issuer, serial, before, after, dns, ips = item.split("\x1e")
-                chain.append({"subject": subject, "issuer": issuer, "serial": serial,
+                subject, issuer, serial, before, after, dns, ips, ja4x, ja4x_r = item.split("\x1e")
+                chain.append({"subject": subject, "issuer": issuer, "serial": serial, "ja4x": ja4x, "ja4x_r": ja4x_r,
                               "times": [int(before), int(after)],
                               "san_dns": dns.split("\x1d") if dns else [],
                               "san_ip": ips.split("\x1d") if ips else []})
@@ -283,7 +287,19 @@ def our_certificates(path, duckdb):
     return chains
 
 
-def compare_certificates(path, duckdb):
+def rust_ja4x(binary, der):
+    with tempfile.NamedTemporaryFile(suffix=".der") as handle:
+        handle.write(der)
+        handle.flush()
+        output = subprocess.run([binary, "-j", "-r", handle.name], capture_output=True, text=True).stdout
+    try:
+        record = json.loads(output)
+    except ValueError:
+        return None, None
+    return record.get("ja4x"), record.get("ja4x_r")
+
+
+def compare_certificates(path, duckdb, ja4x=None):
     reference = tshark_certificates(path)
     ours_by_key = our_certificates(path, duckdb)
     checked = failures = divergences = missed = 0
@@ -316,6 +332,9 @@ def compare_certificates(path, duckdb):
                          ("san_dns", expected["san_dns"], actual["san_dns"]),
                          ("san_ip", [ipaddress.ip_address(a) for a in expected["san_ip"]],
                           [ipaddress.ip_address(a) for a in actual["san_ip"]])]
+                if ja4x:
+                    hashed, raw = rust_ja4x(ja4x, expected["der"])
+                    pairs += [("ja4x", hashed, actual["ja4x"]), ("ja4x_r", raw, actual["ja4x_r"])]
                 for field, want, got in pairs:
                     checked += 1
                     # RFC 4514's table spells 2.5.4.9 STREET; OpenSSL prints street.
@@ -383,6 +402,7 @@ def main():
     parser.add_argument("captures", nargs="+")
     parser.add_argument("--duckdb", default=str(ROOT / "build/release/duckdb"))
     parser.add_argument("--foxio", help="path to FoxIO-LLC/ja4 python/ja4.py, to compare JA4S")
+    parser.add_argument("--ja4x", help="path to the FoxIO-LLC/ja4 rust ja4x binary, to compare JA4X")
     args = parser.parse_args()
     totals = [0, 0, 0, 0, 0]
     certificate_totals = [0, 0, 0, 0]
@@ -390,7 +410,7 @@ def main():
     for capture in args.captures:
         for i, value in enumerate(compare(capture, args.duckdb)):
             totals[i] += value
-        for i, value in enumerate(compare_certificates(capture, args.duckdb)):
+        for i, value in enumerate(compare_certificates(capture, args.duckdb, args.ja4x)):
             certificate_totals[i] += value
         if args.foxio:
             checked, failures, skipped, uncovered = compare_foxio(capture, args.duckdb, args.foxio)
