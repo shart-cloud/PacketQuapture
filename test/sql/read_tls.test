@@ -420,3 +420,41 @@ query TTT
 SELECT tls_sni, reassembly_status, warnings FROM read_tls('test/data/tls/idle_eviction.pcap');
 ----
 after-idle.example	complete	[]
+
+# The server's certificate chain, leaf first. Names are the RFC 4514 strings
+# OpenSSL 3.0.13 prints with -nameopt RFC2253,-esc_msb. Serials, times and SANs
+# are tshark 4.2.2's x509af.serialNumber, x509af.utcTime/generalizedTime,
+# x509ce.dNSName and x509ce.iPAddress. The fixture's Teletex locality is read
+# as Latin-1, as OpenSSL does; tshark decodes it as T.61.
+query IT
+SELECT i, s.subject FROM (SELECT unnest(server_certificates) AS s, generate_subscripts(server_certificates, 1) AS i
+FROM read_tls('test/data/tls/certificates.pcap')) ORDER BY i;
+----
+1	CN=\ #www.example.test\ ,1.3.6.1.4.1.55555.1=#0C0770726976617465,emailAddress=ops@example.test,O=été,O=Beispiel\, \"Grün\" \+ Co \<AG\>\;,L=München,C=DE
+2	CN=Fixture Issuing CA 1+OU=Issuing,O=Fixture Trust,C=US
+
+query TTTTT
+SELECT s.issuer, s.serial, s.not_before, s.not_after, s.san_dns
+FROM (SELECT unnest(server_certificates) AS s FROM read_tls('test/data/tls/certificates.pcap'));
+----
+CN=Fixture Issuing CA 1+OU=Issuing,O=Fixture Trust,C=US	008f3a1042	2025-03-01 12:00:00	2026-03-01 12:00:00	[www.example.test, example.test, *.cdn.example.test]
+CN=Fixture Root CA,O=Fixture Trust,C=US	01	2020-01-01 00:00:00	2050-12-31 23:59:59	[]
+
+query TT
+SELECT server_certificates[1].san_ip, warnings FROM read_tls('test/data/tls/certificates.pcap');
+----
+[192.0.2.44, '2001:db8::44']	[]
+
+# A certificate that does not parse is a NULL element, so the chain keeps its
+# length and order, and the row says so.
+query IITT
+SELECT len(server_certificates), server_certificates[1].serial IS NOT NULL, server_certificates[2] IS NULL, warnings
+FROM read_tls('test/data/tls/certificate_malformed.pcap');
+----
+2	1	1	[server_certificate_malformed]
+
+# TLS 1.3 encrypts the Certificate message, and a hello-only capture has none.
+query II
+SELECT count(*), count(server_certificates) FROM read_tls(['test/data/tls/browser_tls13.pcap', 'test/data/tls/session.pcap']);
+----
+2	0

@@ -2,6 +2,7 @@
 
 #include "tcp_reassembly.hpp"
 #include "tls_record.hpp"
+#include "x509_certificate.hpp"
 
 namespace packetquapture {
 
@@ -17,6 +18,10 @@ struct TlsHandshakeLimits {
 	// Real hellos carry well under a hundred; the cap bounds what a pending
 	// direction holds.
 	size_t max_list_entries = 1024;
+	// The server's Certificate message: certificates in the chain, and bytes in
+	// one certificate. Real chains hold two to four certificates of a few KiB.
+	size_t max_certificates = 16;
+	size_t max_certificate_bytes = 32 * 1024;
 	// Directions held while waiting for their peer. Each holds parsed fields,
 	// not payload bytes.
 	size_t max_pending = 512;
@@ -49,6 +54,13 @@ struct TlsList {
 	bool Known() const {
 		return !malformed && !over_limit;
 	}
+};
+
+// One certificate from a Certificate message. One that did not parse is kept,
+// unparsed, so the chain keeps its length and order.
+struct TlsCertificate {
+	bool parsed = false;
+	X509Certificate fields;
 };
 
 // One reported handshake. The key is oriented client to server, whichever
@@ -91,6 +103,9 @@ struct TlsHandshake {
 	// The one version a server selects in supported_versions, if it sent it.
 	// Not a column; it feeds negotiated_version and the malformed warning.
 	TlsList<uint16_t> server_supported_versions;
+	// The Certificate message that followed the ServerHello, in wire order, leaf
+	// first. TLS 1.3 encrypts it, so it is only read in TLS 1.2 and earlier.
+	TlsList<TlsCertificate> server_certificates;
 	// Only decidable when both sides were captured and neither is TLS 1.3.
 	bool has_resumed = false;
 	bool resumed = false;

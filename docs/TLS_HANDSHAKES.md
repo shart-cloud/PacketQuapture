@@ -73,6 +73,7 @@ one row. That is a different shape, and it needs rules the DNS reader never had.
 | `ja3s`, `ja3s_full` | JA3S server fingerprint and the string it hashes. |
 | `ja4`, `ja4_r` | JA4 client fingerprint and its raw form. See below. |
 | `ja4s`, `ja4s_r` | JA4S server fingerprint and its raw form. **FoxIO License 1.1**, see [NOTICE](../NOTICE). |
+| `server_certificates` | The server's certificate chain, `LIST(STRUCT(subject, issuer, serial, not_before, not_after, san_dns, san_ip))`, leaf first. NULL when no Certificate message was read, which includes every TLS 1.3 handshake. See below. |
 
 ## Hello lists
 
@@ -127,6 +128,7 @@ whatever the status. It is `[]` when there are none and is never NULL.
 | `server_hello_missing` | No complete ServerHello was captured, so the server columns are NULL. |
 | `client_hello_invalid`, `server_hello_invalid` | That hello was seen but failed to parse. |
 | `client_list_malformed`, `server_list_malformed` | At least one of that side's lists is NULL because it was malformed. On the server side this includes a malformed `supported_versions`, which leaves `negotiated_version` NULL. |
+| `server_certificate_malformed` | The Certificate message was malformed, so `server_certificates` is NULL, or at least one certificate in it did not parse and is a NULL element. |
 
 ## JA3 and JA3S
 
@@ -201,6 +203,53 @@ JA4S with the FoxIO python reference. At `16b96d9` that reference misses a Serve
 that shares a packet with other handshake messages, and fails on some streams it saw
 start mid-connection; the script reports both separately from disagreements.
 
+## Certificates
+
+In TLS 1.2 and earlier the server sends its Certificate message in the clear, right
+after the ServerHello. `server_certificates` lists it in wire order, so
+`server_certificates[1]` is the leaf. Nothing is verified: not the signatures, the
+chain, the host name or the validity period. These are the certificates the server
+presented, not a judgement of them. TLS 1.3 encrypts the message, so the column is NULL
+there. A client certificate is not reported.
+
+```sql
+SELECT server_ip, tls_sni, server_certificates[1].subject AS leaf,
+       server_certificates[1].not_after AS expires
+FROM read_tls('capture.pcap')
+WHERE server_certificates IS NOT NULL;
+```
+
+| Field | Content |
+| --- | --- |
+| `subject`, `issuer` | RFC 4514 strings, most specific first: `CN=www.example.com,O=Example Inc.,C=US`. |
+| `serial` | The serial number's content octets as lowercase hex, including a leading `00` octet, as tshark shows it. |
+| `not_before`, `not_after` | The validity period, UTC. |
+| `san_dns` | subjectAltName DNS names, escaped as `tls_sni` is. |
+| `san_ip` | subjectAltName IP addresses: dotted IPv4, RFC 5952 IPv6. |
+
+Names follow RFC 4514 and match `openssl x509 -nameopt RFC2253,-esc_msb` character for
+character, with one exception. Attribute types in RFC 4514's own table use its short
+names (`CN`, `O`, `OU`, `C`, `L`, `ST`, `STREET`, `DC`, `UID`), where OpenSSL prints
+`street` in lower case. Other registered types use the names OpenSSL prints, such as
+`emailAddress`, `serialNumber`, `organizationIdentifier` and `jurisdictionC`. Any other
+type is written as its dotted OID with the value as `#` and uppercase hex of its DER
+encoding. Inside a multi-valued RDN the attributes are also reversed, as OpenSSL does;
+RFC 4514 gives that order no meaning. Special characters are escaped with a backslash.
+Control characters and bytes that are not valid UTF-8 become `\XX` hex pairs, so a
+hostile name cannot fail the query. TeletexString is read as Latin-1, as OpenSSL and Go
+read it; tshark decodes it as T.61, so the two can differ outside ASCII.
+
+A certificate that does not parse keeps its place in the list as a NULL element, and the
+row gets `server_certificate_malformed`. A Certificate message whose framing is broken,
+or a second one after the same ServerHello, makes the column NULL with the same warning.
+A chain over `max_certificates`, a certificate over `max_certificate_bytes`, or one with
+more than `max_list_entries` subjectAltName entries makes the column NULL and sets
+`reassembly_status` to `limit`.
+
+`scripts/compare_tls_tshark.py` compares chains with tshark field by field, and names
+with OpenSSL's rendering of the DER that tshark extracted. On the whole CTU-13 Neris
+capture it compared 832 values with no disagreements.
+
 ## `session_resumed` is often NULL
 
 A server resumed a session when it echoed back a non-empty session id the client offered.
@@ -235,7 +284,9 @@ Bounded by `TlsHandshakeLimits`, alongside the transport-wide
 | `max_message_bytes` | 64 KiB | One handshake message. |
 | `max_extensions` | 256 | Extensions walked in one hello. |
 | `max_pending` | 512 | Directions held while waiting for a peer. |
-| `max_list_entries` | 1024 | Entries in one parsed hello list. |
+| `max_list_entries` | 1024 | Entries in one parsed hello list, and subjectAltName entries in one certificate. |
+| `max_certificates` | 16 | Certificates in one Certificate message. |
+| `max_certificate_bytes` | 32 KiB | One certificate. |
 
 Reaching a limit sets `reassembly_status` to `limit` rather than failing the query. Directions
 waiting for a peer hold parsed fields, not payload bytes.
@@ -256,9 +307,10 @@ that would have matched it.
 
 ## Not yet implemented
 
-The certificate chain and JA4X. The certificate is in a later handshake message that
-this reader does not yet parse. JA4X is part of JA4+ and under the same license as
-JA4S. DTLS and QUIC hellos, the `d` and `q` JA4 variants, are not read.
+JA4X, the certificate fingerprint. It is part of JA4+ and under the same license as
+JA4S. Other certificate fields, such as the public key, extensions beyond
+subjectAltName, and client certificates. DTLS and QUIC hellos, the `d` and `q` JA4
+variants, are not read.
 
 Handshakes can still go missing on very busy captures. The transport core tracks
 1,024 TCP directions per file and evicts those idle for 300 seconds (see
