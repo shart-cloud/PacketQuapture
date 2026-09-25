@@ -9,6 +9,7 @@ namespace {
 
 const uint8_t TAG_BOOLEAN = 0x01;
 const uint8_t TAG_INTEGER = 0x02;
+const uint8_t TAG_BIT_STRING = 0x03;
 const uint8_t TAG_OCTET_STRING = 0x04;
 const uint8_t TAG_OID = 0x06;
 const uint8_t TAG_UTF8_STRING = 0x0C;
@@ -471,6 +472,234 @@ std::string FormatIp(const uint8_t *p, size_t size) {
 
 namespace {
 
+// Algorithm and curve names as `openssl x509 -text` prints them, which is
+// OpenSSL's long name for each object. Anything else is printed by number.
+const char *AlgorithmName(const std::string &oid) {
+	static const char *const names[][2] = {
+	    {"1.2.840.113549.1.1.1", "rsaEncryption"},
+	    {"1.2.840.113549.1.1.2", "md2WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.4", "md5WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.5", "sha1WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.7", "rsaesOaep"},
+	    {"1.2.840.113549.1.1.10", "rsassaPss"},
+	    {"1.2.840.113549.1.1.11", "sha256WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.12", "sha384WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.13", "sha512WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.14", "sha224WithRSAEncryption"},
+	    {"1.3.14.3.2.29", "sha1WithRSA"},
+	    {"1.2.840.10040.4.1", "dsaEncryption"},
+	    {"1.2.840.10040.4.3", "dsaWithSHA1"},
+	    {"2.16.840.1.101.3.4.3.1", "dsa_with_SHA224"},
+	    {"2.16.840.1.101.3.4.3.2", "dsa_with_SHA256"},
+	    {"1.2.840.10045.2.1", "id-ecPublicKey"},
+	    {"1.2.840.10045.4.1", "ecdsa-with-SHA1"},
+	    {"1.2.840.10045.4.3.1", "ecdsa-with-SHA224"},
+	    {"1.2.840.10045.4.3.2", "ecdsa-with-SHA256"},
+	    {"1.2.840.10045.4.3.3", "ecdsa-with-SHA384"},
+	    {"1.2.840.10045.4.3.4", "ecdsa-with-SHA512"},
+	    {"1.3.101.110", "X25519"},
+	    {"1.3.101.111", "X448"},
+	    {"1.3.101.112", "ED25519"},
+	    {"1.3.101.113", "ED448"},
+	};
+	for (const auto &entry : names) {
+		if (oid == entry[0]) {
+			return entry[1];
+		}
+	}
+	return nullptr;
+}
+
+struct NamedCurve {
+	const char *oid, *name;
+	uint32_t bits;
+};
+
+const NamedCurve *FindCurve(const std::string &oid) {
+	static const NamedCurve curves[] = {
+	    {"1.2.840.10045.3.1.1", "prime192v1", 192},
+	    {"1.3.132.0.33", "secp224r1", 224},
+	    {"1.2.840.10045.3.1.7", "prime256v1", 256},
+	    {"1.3.132.0.34", "secp384r1", 384},
+	    {"1.3.132.0.35", "secp521r1", 521},
+	    {"1.3.132.0.10", "secp256k1", 256},
+	    {"1.3.36.3.3.2.8.1.1.7", "brainpoolP256r1", 256},
+	    {"1.3.36.3.3.2.8.1.1.11", "brainpoolP384r1", 384},
+	    {"1.3.36.3.3.2.8.1.1.13", "brainpoolP512r1", 512},
+	};
+	for (const auto &curve : curves) {
+		if (oid == curve.oid) {
+			return &curve;
+		}
+	}
+	return nullptr;
+}
+
+// RFC 5280 4.2.1.12 and the purposes CAs commonly assert beside them.
+const char *PurposeName(const std::string &oid) {
+	static const char *const names[][2] = {
+	    {"2.5.29.37.0", "anyExtendedKeyUsage"},   {"1.3.6.1.5.5.7.3.1", "serverAuth"},
+	    {"1.3.6.1.5.5.7.3.2", "clientAuth"},      {"1.3.6.1.5.5.7.3.3", "codeSigning"},
+	    {"1.3.6.1.5.5.7.3.4", "emailProtection"}, {"1.3.6.1.5.5.7.3.8", "timeStamping"},
+	    {"1.3.6.1.5.5.7.3.9", "OCSPSigning"},
+	};
+	for (const auto &entry : names) {
+		if (oid == entry[0]) {
+			return entry[1];
+		}
+	}
+	return nullptr;
+}
+
+// The name OpenSSL prints for an algorithm, or its dotted OID.
+bool AlgorithmOf(const Element &identifier, std::string &oid, std::string &out) {
+	Der fields(identifier.content, identifier.length);
+	Element id;
+	if (!fields.Expect(TAG_OID, id) || !DecodeOid(id, oid)) {
+		return false;
+	}
+	const char *name = AlgorithmName(oid);
+	out = name != nullptr ? name : oid;
+	return true;
+}
+
+// Significant bits of a DER INTEGER's magnitude, as OpenSSL's BN_num_bits.
+uint32_t IntegerBits(const Element &integer) {
+	size_t i = 0;
+	while (i < integer.length && integer.content[i] == 0) {
+		++i;
+	}
+	if (i == integer.length) {
+		return 0;
+	}
+	uint32_t bits = static_cast<uint32_t>((integer.length - i - 1) * 8);
+	for (uint8_t top = integer.content[i]; top != 0; top >>= 1U) {
+		++bits;
+	}
+	return bits;
+}
+
+// SubjectPublicKeyInfo: the algorithm, and the key's size where it has one. A
+// key body that does not parse leaves its size unknown rather than failing the
+// certificate; nothing here verifies the key.
+bool DecodePublicKey(const Element &info, X509Certificate &out) {
+	Der fields(info.content, info.length);
+	Element algorithm, key;
+	std::string oid;
+	if (!fields.Expect(TAG_SEQUENCE, algorithm) || !fields.Expect(TAG_BIT_STRING, key) || !fields.AtEnd() ||
+	    !AlgorithmOf(algorithm, oid, out.public_key_algorithm)) {
+		return false;
+	}
+	Der parameters(algorithm.content, algorithm.length);
+	Element skipped, parameter;
+	parameters.Next(skipped);
+	const bool has_parameter = !parameters.AtEnd() && parameters.Next(parameter);
+	if (oid == "1.2.840.10045.2.1") {
+		std::string curve;
+		if (has_parameter && parameter.tag == TAG_OID && DecodeOid(parameter, curve)) {
+			const NamedCurve *known = FindCurve(curve);
+			out.public_key_curve = known != nullptr ? known->name : curve;
+			out.public_key_bits = known != nullptr ? known->bits : 0;
+		}
+	} else if (oid == "1.2.840.10040.4.1") {
+		Element prime;
+		if (has_parameter && parameter.tag == TAG_SEQUENCE) {
+			Der values(parameter.content, parameter.length);
+			if (values.Expect(TAG_INTEGER, prime)) {
+				out.public_key_bits = IntegerBits(prime);
+			}
+		}
+	} else if (oid == "1.2.840.113549.1.1.1" && key.length > 1 && key.content[0] == 0) {
+		Der body(key.content + 1, key.length - 1);
+		Element sequence, modulus;
+		if (body.Expect(TAG_SEQUENCE, sequence)) {
+			Der values(sequence.content, sequence.length);
+			if (values.Expect(TAG_INTEGER, modulus)) {
+				out.public_key_bits = IntegerBits(modulus);
+			}
+		}
+	}
+	return true;
+}
+
+// basicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+//                                 pathLenConstraint INTEGER (0..MAX) OPTIONAL }
+bool DecodeBasicConstraints(const Element &value, X509Certificate &out) {
+	Der outer(value.content, value.length);
+	Element sequence, element;
+	if (!outer.Expect(TAG_SEQUENCE, sequence) || !outer.AtEnd()) {
+		return false;
+	}
+	Der fields(sequence.content, sequence.length);
+	out.has_basic_constraints = true;
+	if (fields.PeekTag() == TAG_BOOLEAN) {
+		if (!fields.Next(element) || element.length != 1) {
+			return false;
+		}
+		out.is_ca = element.content[0] != 0;
+	}
+	if (fields.PeekTag() == TAG_INTEGER) {
+		// Non-negative, and small enough for a UINTEGER after any sign octet.
+		if (!fields.Next(element) || element.length == 0 || (element.content[0] & 0x80U) ||
+		    element.length - (element.content[0] == 0 ? 1 : 0) > 4) {
+			return false;
+		}
+		uint64_t length = 0;
+		for (size_t i = 0; i < element.length; ++i) {
+			length = (length << 8U) | element.content[i];
+		}
+		out.has_path_length = true;
+		out.path_length = static_cast<uint32_t>(length);
+	}
+	return fields.AtEnd();
+}
+
+// keyUsage ::= BIT STRING, bit 0 first.
+bool DecodeKeyUsage(const Element &value, X509Certificate &out) {
+	static const char *const bits[] = {"digitalSignature", "nonRepudiation", "keyEncipherment",
+	                                   "dataEncipherment", "keyAgreement",   "keyCertSign",
+	                                   "cRLSign",          "encipherOnly",   "decipherOnly"};
+	Der outer(value.content, value.length);
+	Element string;
+	if (!outer.Expect(TAG_BIT_STRING, string) || !outer.AtEnd() || string.length == 0 || string.content[0] > 7 ||
+	    (string.length == 1 && string.content[0] != 0)) {
+		return false;
+	}
+	const size_t unused = string.content[0];
+	const size_t total = (string.length - 1) * 8 - unused;
+	out.has_key_usage = true;
+	for (size_t bit = 0; bit < total && bit < sizeof(bits) / sizeof(bits[0]); ++bit) {
+		if (string.content[1 + bit / 8] & (0x80U >> (bit % 8))) {
+			out.key_usage.push_back(bits[bit]);
+		}
+	}
+	return true;
+}
+
+// ExtKeyUsageSyntax ::= SEQUENCE SIZE (1..MAX) OF KeyPurposeId
+X509Result DecodeExtendedKeyUsage(const Element &value, size_t max_entries, X509Certificate &out) {
+	Der outer(value.content, value.length);
+	Element sequence;
+	if (!outer.Expect(TAG_SEQUENCE, sequence) || !outer.AtEnd()) {
+		return X509Result::MALFORMED;
+	}
+	Der list(sequence.content, sequence.length);
+	out.has_extended_key_usage = true;
+	while (!list.AtEnd()) {
+		Element id;
+		std::string oid;
+		if (!list.Expect(TAG_OID, id) || !DecodeOid(id, oid)) {
+			return X509Result::MALFORMED;
+		}
+		if (out.extended_key_usage.size() >= max_entries) {
+			return X509Result::OVER_LIMIT;
+		}
+		const char *name = PurposeName(oid);
+		out.extended_key_usage.push_back(name != nullptr ? name : oid);
+	}
+	return out.extended_key_usage.empty() ? X509Result::MALFORMED : X509Result::OK;
+}
+
 // SubjectAltName ::= GeneralNames, a SEQUENCE OF GeneralName. Only dNSName and
 // iPAddress are kept; the other forms are skipped.
 X509Result DecodeSubjectAltName(const Element &value, size_t max_entries, X509Certificate &out) {
@@ -504,13 +733,15 @@ X509Result DecodeSubjectAltName(const Element &value, size_t max_entries, X509Ce
 	return X509Result::OK;
 }
 
-X509Result DecodeExtensions(const Element &wrapper, size_t max_san_entries, X509Certificate &out) {
+X509Result DecodeExtensions(const Element &wrapper, size_t max_entries, X509Certificate &out) {
 	Der explicit_tag(wrapper.content, wrapper.length);
 	Element extensions;
 	if (!explicit_tag.Expect(TAG_SEQUENCE, extensions) || !explicit_tag.AtEnd()) {
 		return X509Result::MALFORMED;
 	}
-	bool seen_san = false;
+	// RFC 5280 4.2: a certificate must not carry an extension twice. Only the
+	// extensions read here are checked.
+	bool seen_san = false, seen_basic = false, seen_usage = false, seen_purposes = false;
 	Der list(extensions.content, extensions.length);
 	while (!list.AtEnd()) {
 		Element extension, id, value;
@@ -530,22 +761,36 @@ X509Result DecodeExtensions(const Element &wrapper, size_t max_san_entries, X509
 		if (!fields.Expect(TAG_OCTET_STRING, value) || !fields.AtEnd()) {
 			return X509Result::MALFORMED;
 		}
-		if (oid == "2.5.29.17") {
-			// RFC 5280 4.2: a certificate must not carry an extension twice.
-			if (seen_san) {
-				return X509Result::MALFORMED;
-			}
-			seen_san = true;
-			const auto result = DecodeSubjectAltName(value, max_san_entries, out);
-			if (result != X509Result::OK) {
-				return result;
-			}
+		bool *seen = oid == "2.5.29.17"   ? &seen_san
+		             : oid == "2.5.29.19" ? &seen_basic
+		             : oid == "2.5.29.15" ? &seen_usage
+		             : oid == "2.5.29.37" ? &seen_purposes
+		                                  : nullptr;
+		if (seen == nullptr) {
+			continue;
+		}
+		if (*seen) {
+			return X509Result::MALFORMED;
+		}
+		*seen = true;
+		X509Result result = X509Result::MALFORMED;
+		if (seen == &seen_san) {
+			result = DecodeSubjectAltName(value, max_entries, out);
+		} else if (seen == &seen_basic) {
+			result = DecodeBasicConstraints(value, out) ? X509Result::OK : X509Result::MALFORMED;
+		} else if (seen == &seen_usage) {
+			result = DecodeKeyUsage(value, out) ? X509Result::OK : X509Result::MALFORMED;
+		} else {
+			result = DecodeExtendedKeyUsage(value, max_entries, out);
+		}
+		if (result != X509Result::OK) {
+			return result;
 		}
 	}
 	return X509Result::OK;
 }
 
-X509Result Parse(const uint8_t *data, size_t size, size_t max_san_entries, X509Certificate &out) {
+X509Result Parse(const uint8_t *data, size_t size, size_t max_entries, X509Certificate &out) {
 	Der top(data, size);
 	Element certificate, tbs;
 	if (!top.Expect(TAG_SEQUENCE, certificate) || !top.AtEnd()) {
@@ -555,9 +800,12 @@ X509Result Parse(const uint8_t *data, size_t size, size_t max_san_entries, X509C
 	if (!outer.Expect(TAG_SEQUENCE, tbs)) {
 		return X509Result::MALFORMED;
 	}
-	// signatureAlgorithm and signatureValue follow; they are framed but not read.
+	// signatureAlgorithm and signatureValue follow. The value is framed but not
+	// read, since nothing is verified.
 	Element algorithm, signature;
-	if (!outer.Expect(TAG_SEQUENCE, algorithm) || !outer.Next(signature) || !outer.AtEnd()) {
+	std::string signature_oid;
+	if (!outer.Expect(TAG_SEQUENCE, algorithm) || !outer.Next(signature) || !outer.AtEnd() ||
+	    !AlgorithmOf(algorithm, signature_oid, out.signature_algorithm)) {
 		return X509Result::MALFORMED;
 	}
 
@@ -586,7 +834,7 @@ X509Result Parse(const uint8_t *data, size_t size, size_t max_san_entries, X509C
 	if (!fields.Next(subject) || !DecodeName(subject, out.subject, out.subject_oids)) {
 		return X509Result::MALFORMED;
 	}
-	if (!fields.Expect(TAG_SEQUENCE, element)) { // subjectPublicKeyInfo
+	if (!fields.Expect(TAG_SEQUENCE, element) || !DecodePublicKey(element, out)) { // subjectPublicKeyInfo
 		return X509Result::MALFORMED;
 	}
 	for (const uint8_t optional : {TAG_ISSUER_UID, TAG_SUBJECT_UID}) {
@@ -598,7 +846,7 @@ X509Result Parse(const uint8_t *data, size_t size, size_t max_san_entries, X509C
 		if (!fields.Expect(TAG_EXTENSIONS, element) || !fields.AtEnd()) {
 			return X509Result::MALFORMED;
 		}
-		const auto result = DecodeExtensions(element, max_san_entries, out);
+		const auto result = DecodeExtensions(element, max_entries, out);
 		if (result != X509Result::OK) {
 			return result;
 		}
@@ -608,9 +856,9 @@ X509Result Parse(const uint8_t *data, size_t size, size_t max_san_entries, X509C
 
 } // namespace
 
-X509Result ParseX509Certificate(const uint8_t *data, size_t size, size_t max_san_entries, X509Certificate &out) {
+X509Result ParseX509Certificate(const uint8_t *data, size_t size, size_t max_entries, X509Certificate &out) {
 	X509Certificate parsed;
-	const auto result = Parse(data, size, max_san_entries, parsed);
+	const auto result = Parse(data, size, max_entries, parsed);
 	out = result == X509Result::OK ? parsed : X509Certificate();
 	return result;
 }

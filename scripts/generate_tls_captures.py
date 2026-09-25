@@ -246,6 +246,7 @@ def reassembly_fixtures():
     fingerprint_fixtures()
     idle_fixtures()
     certificate_fixtures()
+    certificate_detail_fixtures()
     tunnel_fixtures()
 
     # TCP that is not TLS at all.
@@ -363,16 +364,29 @@ def name(*rdns):
         der(0x31, b"".join(sorted(der(0x30, oid(o) + der(t, v)) for o, t, v in rdn))) for rdn in rdns))
 
 
-def certificate(serial, issuer, subject, not_before, not_after, dns=(), ips=()):
-    algorithm = der(0x30, oid("1.2.840.10045.4.3.2"))
-    key = der(0x30, der(0x30, oid("1.2.840.10045.2.1") + oid("1.2.840.10045.3.1.7"))
-              + der(0x03, b"\0\x04" + bytes(range(64))))
+# The P-256 base point, a valid public key that OpenSSL can load. The fixtures
+# verify nothing, so any valid point will do.
+P256_G = bytes.fromhex(
+    "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+    "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+EC_KEY = der(0x30, der(0x30, oid("1.2.840.10045.2.1") + oid("1.2.840.10045.3.1.7")) + der(0x03, b"\0" + P256_G))
+ECDSA_SHA256 = der(0x30, oid("1.2.840.10045.4.3.2"))
+
+
+def x509_extension(oid_text, value, critical=False):
+    return der(0x30, oid(oid_text) + (der(0x01, b"\xff") if critical else b"") + der(0x04, value))
+
+
+def certificate(serial, issuer, subject, not_before, not_after, dns=(), ips=(), key=EC_KEY,
+                algorithm=ECDSA_SHA256, extensions=()):
     tbs = der(0xA0, der(0x02, b"\x02")) + der(0x02, serial) + algorithm + issuer
     tbs += der(0x30, not_before + not_after) + subject + key
     names = b"".join(der(0x82, d) for d in dns) + b"".join(der(0x87, ip) for ip in ips)
+    items = list(extensions)
     if names:
-        san = der(0x30, oid("2.5.29.17") + der(0x04, der(0x30, names)))
-        tbs += der(0xA3, der(0x30, san))
+        items.append(x509_extension("2.5.29.17", der(0x30, names)))
+    if items:
+        tbs += der(0xA3, der(0x30, b"".join(items)))
     return der(0x30, der(0x30, tbs) + algorithm + der(0x03, b"\0" + der(0x30, bytes(8))))
 
 
@@ -481,6 +495,42 @@ def tunnel_fixtures():
         (False, b"HTTP/1.1 200 Connection established\r\n\r\n"),
         (True, hello("login.example")), (False, reply)], port=51007)
     pcap(DATA / "tunnels.pcap", packets)
+
+
+def certificate_detail_fixtures():
+    """Key types, basicConstraints, keyUsage and extendedKeyUsage, and a client
+    certificate. The RSA modulus is not a real key; OpenSSL reads it anyway."""
+    rsa = der(0x30, der(0x30, oid("1.2.840.113549.1.1.1") + b"\x05\x00") + der(0x03, b"\0" + der(0x30,
+              der(0x02, b"\x00\xc3" + bytes(range(1, 255)) + b"\x01") + der(0x02, b"\x01\x00\x01"))))
+    rsa_sha256 = der(0x30, oid("1.2.840.113549.1.1.11") + b"\x05\x00")
+    ed25519 = der(0x30, der(0x30, oid("1.3.101.112")) + der(0x03, b"\0" + bytes(range(32))))
+    ca = name([(C, PRINTABLE, b"US")], [(CN, UTF8, b"Detail Root")])
+    issuing = name([(C, PRINTABLE, b"US")], [(CN, UTF8, b"Detail Issuing")])
+    intermediate = certificate(
+        b"\x0a", ca, issuing, der(0x17, b"240101000000Z"), der(0x17, b"340101000000Z"),
+        extensions=[x509_extension("2.5.29.19", der(0x30, der(0x01, b"\xff") + der(0x02, b"\x00")), critical=True),
+                    x509_extension("2.5.29.15", der(0x03, b"\x01\x06"), critical=True)])
+    # digitalSignature and keyEncipherment; serverAuth, clientAuth and a
+    # purpose with no RFC 5280 name.
+    leaf = certificate(
+        b"\x0b", issuing, name([(CN, UTF8, b"rsa.example.test")]),
+        der(0x17, b"250101000000Z"), der(0x17, b"260101000000Z"), dns=[b"rsa.example.test"], key=rsa,
+        algorithm=rsa_sha256,
+        extensions=[x509_extension("2.5.29.19", der(0x30, b"")),
+                    x509_extension("2.5.29.15", der(0x03, b"\x05\xa0"), critical=True),
+                    x509_extension("2.5.29.37", der(0x30, oid("1.3.6.1.5.5.7.3.1") + oid("1.3.6.1.5.5.7.3.2")
+                                              + oid("1.3.6.1.4.1.311.10.3.3")))])
+    client_leaf = certificate(
+        b"\x0c", issuing, name([(CN, UTF8, b"client.example.test")]),
+        der(0x17, b"250101000000Z"), der(0x17, b"260101000000Z"), key=ed25519,
+        extensions=[x509_extension("2.5.29.37", der(0x30, oid("1.3.6.1.5.5.7.3.2")))])
+    hello = record(client_hello(server_name("rsa.example.test")))
+    reply = record(server_hello() + certificate_message([leaf, intermediate]))
+    # The client answers the server's request with its own Certificate message
+    # after its hello. Nothing checks that a CertificateRequest was sent.
+    pcap(DATA / "certificate_details.pcap",
+         exchange([(True, hello), (False, reply), (True, record(certificate_message([client_leaf])))], port=51000)
+         + exchange([(True, hello), (False, reply), (True, record(certificate_message([])))], port=51001))
 
 
 def idle_fixtures():

@@ -1912,6 +1912,28 @@ struct StreamGlobalState : public CaptureGlobalState {
 	bool decode_dns = false;
 };
 
+// SHA-1 and SHA-256 of a certificate's DER, for the parser, which has no hash
+// of its own.
+static void TlsCertificateDigest(const uint8_t *der, size_t size, packetquapture::X509Certificate &out) {
+	const std::string bytes(reinterpret_cast<const char *>(der), size);
+	duckdb_mbedtls::MbedTlsWrapper::SHA1State sha1;
+	sha1.AddString(bytes);
+	char sha1_hex[duckdb_mbedtls::MbedTlsWrapper::SHA1_HASH_LENGTH_TEXT];
+	sha1.FinishHex(sha1_hex);
+	out.sha1.assign(sha1_hex, sizeof(sha1_hex));
+	duckdb_mbedtls::MbedTlsWrapper::SHA256State sha256;
+	sha256.AddString(bytes);
+	char sha256_hex[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT];
+	sha256.FinishHex(sha256_hex);
+	out.sha256.assign(sha256_hex, sizeof(sha256_hex));
+}
+
+static packetquapture::TlsHandshakeAssembler NewTlsAssembler() {
+	packetquapture::TlsHandshakeLimits limits;
+	limits.certificate_digest = TlsCertificateDigest;
+	return packetquapture::TlsHandshakeAssembler(limits);
+}
+
 struct StreamScanState : public LocalTableFunctionState {
 	// Destroy all worker buffers before releasing the reservation.
 	unique_ptr<StreamReservation> reservation;
@@ -1927,7 +1949,7 @@ struct StreamScanState : public LocalTableFunctionState {
 	// read_tls pairs the two directions of a connection, which the transport core
 	// finishes independently, so rows can outlive the stream that produced them.
 	// The file they belong to is held with them.
-	packetquapture::TlsHandshakeAssembler tls_assembler;
+	packetquapture::TlsHandshakeAssembler tls_assembler = NewTlsAssembler();
 	std::vector<packetquapture::TlsHandshake> tls_pending;
 	idx_t tls_pending_index = 0;
 	string tls_pending_filename, tls_open_filename;
@@ -2279,6 +2301,16 @@ static LogicalType TlsCertificateType() {
 	// JA4X and its raw form. FoxIO License 1.1; see NOTICE.
 	fields.emplace_back("ja4x", LogicalType::VARCHAR);
 	fields.emplace_back("ja4x_r", LogicalType::VARCHAR);
+	fields.emplace_back("sha1", LogicalType::VARCHAR);
+	fields.emplace_back("sha256", LogicalType::VARCHAR);
+	fields.emplace_back("signature_algorithm", LogicalType::VARCHAR);
+	fields.emplace_back("public_key_algorithm", LogicalType::VARCHAR);
+	fields.emplace_back("public_key_bits", LogicalType::UINTEGER);
+	fields.emplace_back("public_key_curve", LogicalType::VARCHAR);
+	fields.emplace_back("is_ca", LogicalType::BOOLEAN);
+	fields.emplace_back("path_length", LogicalType::UINTEGER);
+	fields.emplace_back("key_usage", LogicalType::LIST(LogicalType::VARCHAR));
+	fields.emplace_back("extended_key_usage", LogicalType::LIST(LogicalType::VARCHAR));
 	return LogicalType::STRUCT(std::move(fields));
 }
 
@@ -2346,7 +2378,8 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         "ja4s",
 	         "ja4s_r",
 	         "server_certificates",
-	         "tunnel"};
+	         "tunnel",
+	         "client_certificates"};
 	const auto codes = LogicalType::LIST(LogicalType::USMALLINT);
 	const auto text = LogicalType::LIST(LogicalType::VARCHAR);
 	types = {LogicalType::VARCHAR,
@@ -2400,7 +2433,8 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         LogicalType::VARCHAR,
 	         LogicalType::VARCHAR,
 	         LogicalType::LIST(TlsCertificateType()),
-	         TlsTunnelType()};
+	         TlsTunnelType(),
+	         LogicalType::LIST(TlsCertificateType())};
 	auto &bind = result->Cast<PcapBindData>();
 	bind.types = types;
 	bind.stream_plan =
@@ -2489,13 +2523,54 @@ static idx_t TlsRowBytes(const string &filename, const packetquapture::TlsHandsh
 		alpn += 32 + 4 * protocol.size();
 	}
 	idx_t certificates = 0;
-	for (const auto &certificate : handshake.server_certificates.values) {
-		const auto &fields = certificate.fields;
-		certificates += 256 + fields.TextBytes();
-		certificates += 32 * (fields.san_dns.size() + fields.san_ip.size());
+	for (const auto *chain : {&handshake.server_certificates, &handshake.client_certificates}) {
+		for (const auto &certificate : chain->values) {
+			const auto &fields = certificate.fields;
+			certificates += 512 + fields.TextBytes();
+			certificates += 32 * (fields.san_dns.size() + fields.san_ip.size() + fields.key_usage.size() +
+			                      fields.extended_key_usage.size());
+		}
 	}
 	return 1024 + filename.size() + handshake.sni.size() + 32 * codes + alpn + certificates +
 	       handshake.tunnel_destination.size();
+}
+
+static Value OptionalText(const std::string &text) {
+	return text.empty() ? Value(LogicalType::VARCHAR) : Value(text);
+}
+
+static void SetTlsCertificates(Vector &vector, idx_t row,
+                               const packetquapture::TlsList<packetquapture::TlsCertificate> &chain) {
+	if (!chain.present) {
+		FlatVector::SetNull(vector, row, true);
+		return;
+	}
+	const auto type = TlsCertificateType();
+	duckdb::vector<Value> values;
+	for (const auto &certificate : chain.values) {
+		if (!certificate.parsed) {
+			values.push_back(Value(type));
+			continue;
+		}
+		const auto &fields = certificate.fields;
+		packetquapture::Ja4xParts ja4x;
+		packetquapture::Ja4xStrings(fields, ja4x);
+		values.push_back(Value::STRUCT(
+		    type, {Value(fields.subject), Value(fields.issuer), Value(fields.serial),
+		           Value::TIMESTAMP(timestamp_t(fields.not_before)), Value::TIMESTAMP(timestamp_t(fields.not_after)),
+		           TextList(fields.san_dns), TextList(fields.san_ip),
+		           Value(Ja4Hash12(ja4x.issuer) + "_" + Ja4Hash12(ja4x.subject) + "_" + Ja4Hash12(ja4x.extensions)),
+		           Value(ja4x.issuer + "_" + ja4x.subject + "_" + ja4x.extensions), OptionalText(fields.sha1),
+		           OptionalText(fields.sha256), Value(fields.signature_algorithm), Value(fields.public_key_algorithm),
+		           fields.public_key_bits != 0 ? Value::UINTEGER(fields.public_key_bits) : Value(LogicalType::UINTEGER),
+		           OptionalText(fields.public_key_curve),
+		           fields.has_basic_constraints ? Value::BOOLEAN(fields.is_ca) : Value(LogicalType::BOOLEAN),
+		           fields.has_path_length ? Value::UINTEGER(fields.path_length) : Value(LogicalType::UINTEGER),
+		           fields.has_key_usage ? TextList(fields.key_usage) : Value(LogicalType::LIST(LogicalType::VARCHAR)),
+		           fields.has_extended_key_usage ? TextList(fields.extended_key_usage)
+		                                         : Value(LogicalType::LIST(LogicalType::VARCHAR))}));
+	}
+	vector.SetValue(row, Value::LIST(type, values));
 }
 
 static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const string &filename,
@@ -2715,35 +2790,14 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 		}
 		break;
 	}
-	// The chain from the Certificate message, leaf first. An entry that did not
-	// parse is a NULL element, so positions still match the chain.
-	case 50: {
-		const auto &chain = handshake.server_certificates;
-		if (!chain.present) {
-			FlatVector::SetNull(vector, row, true);
-			break;
-		}
-		const auto type = TlsCertificateType();
-		duckdb::vector<Value> values;
-		for (const auto &certificate : chain.values) {
-			if (!certificate.parsed) {
-				values.push_back(Value(type));
-				continue;
-			}
-			const auto &fields = certificate.fields;
-			packetquapture::Ja4xParts ja4x;
-			packetquapture::Ja4xStrings(fields, ja4x);
-			values.push_back(Value::STRUCT(
-			    type,
-			    {Value(fields.subject), Value(fields.issuer), Value(fields.serial),
-			     Value::TIMESTAMP(timestamp_t(fields.not_before)), Value::TIMESTAMP(timestamp_t(fields.not_after)),
-			     TextList(fields.san_dns), TextList(fields.san_ip),
-			     Value(Ja4Hash12(ja4x.issuer) + "_" + Ja4Hash12(ja4x.subject) + "_" + Ja4Hash12(ja4x.extensions)),
-			     Value(ja4x.issuer + "_" + ja4x.subject + "_" + ja4x.extensions)}));
-		}
-		vector.SetValue(row, Value::LIST(type, values));
+	// The chain from each side's Certificate message, leaf first. An entry that
+	// did not parse is a NULL element, so positions still match the chain.
+	case 50:
+		SetTlsCertificates(vector, row, handshake.server_certificates);
 		break;
-	}
+	case 52:
+		SetTlsCertificates(vector, row, handshake.client_certificates);
+		break;
 	// NULL unless a prefix came before TLS in a captured direction. The protocol
 	// is the client's reading of its own prefix when it has one, since only the
 	// client's request names the destination; otherwise the server's.
@@ -2842,7 +2896,7 @@ static void TlsScan(ClientContext &context, TableFunctionInput &input, DataChunk
 	if (!count) {
 		std::vector<packetquapture::TcpStream>().swap(state.streams);
 		std::vector<packetquapture::TlsHandshake>().swap(state.tls_pending);
-		state.tls_assembler = packetquapture::TlsHandshakeAssembler();
+		state.tls_assembler = NewTlsAssembler();
 		state.reassembler = packetquapture::TcpReassembler();
 		state.reservation.reset();
 	}

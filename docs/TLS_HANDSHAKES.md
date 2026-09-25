@@ -73,7 +73,8 @@ one row. That is a different shape, and it needs rules the DNS reader never had.
 | `ja3s`, `ja3s_full` | JA3S server fingerprint and the string it hashes. |
 | `ja4`, `ja4_r` | JA4 client fingerprint and its raw form. See below. |
 | `ja4s`, `ja4s_r` | JA4S server fingerprint and its raw form. **FoxIO License 1.1**, see [NOTICE](../NOTICE). |
-| `server_certificates` | The server's certificate chain, `LIST(STRUCT(subject, issuer, serial, not_before, not_after, san_dns, san_ip, ja4x, ja4x_r))`, leaf first. NULL when no Certificate message was read, which includes every TLS 1.3 handshake. See below. |
+| `server_certificates` | The server's certificate chain, a `LIST(STRUCT)` with the fields below, leaf first. NULL when no Certificate message was read, which includes every TLS 1.3 handshake. See below. |
+| `client_certificates` | The client's certificates, the same type, when the server asked for them in TLS 1.2 or earlier. `[]` when the client was asked and had none; NULL when it sent no Certificate message. |
 | `tunnel` | `STRUCT(protocol, destination, client_prefix_bytes, server_prefix_bytes)` when bytes came before TLS in a captured direction, such as a SOCKS or HTTP CONNECT exchange; NULL when TLS began every captured stream. See below. |
 
 ## Hello lists
@@ -129,7 +130,7 @@ whatever the status. It is `[]` when there are none and is never NULL.
 | `server_hello_missing` | No complete ServerHello was captured, so the server columns are NULL. |
 | `client_hello_invalid`, `server_hello_invalid` | That hello was seen but failed to parse. |
 | `client_list_malformed`, `server_list_malformed` | At least one of that side's lists is NULL because it was malformed. On the server side this includes a malformed `supported_versions`, which leaves `negotiated_version` NULL. |
-| `server_certificate_malformed` | The Certificate message was malformed, so `server_certificates` is NULL, or at least one certificate in it did not parse and is a NULL element. |
+| `server_certificate_malformed`, `client_certificate_malformed` | That side's Certificate message was malformed, so its column is NULL, or at least one certificate in it did not parse and is a NULL element. |
 | `client_tunnel_unrecognized`, `server_tunnel_unrecognized` | Bytes came before TLS in that direction but did not parse exactly as a known tunnel. The TLS columns are still sound; see below. |
 | `tunnel_mismatch` | Each side's prefix parsed as a different tunnel; `tunnel.protocol` is the client's. |
 
@@ -213,7 +214,8 @@ after the ServerHello. `server_certificates` lists it in wire order, so
 `server_certificates[1]` is the leaf. Nothing is verified: not the signatures, the
 chain, the host name or the validity period. These are the certificates the server
 presented, not a judgement of them. TLS 1.3 encrypts the message, so the column is NULL
-there. A client certificate is not reported.
+there. A client that the server asks for a certificate sends its own Certificate message
+after its ClientHello, and `client_certificates` lists it the same way.
 
 ```sql
 SELECT server_ip, tls_sni, server_certificates[1].subject AS leaf,
@@ -230,6 +232,18 @@ WHERE server_certificates IS NOT NULL;
 | `san_dns` | subjectAltName DNS names, escaped as `tls_sni` is. |
 | `san_ip` | subjectAltName IP addresses: dotted IPv4, RFC 5952 IPv6. |
 | `ja4x`, `ja4x_r` | JA4X certificate fingerprint and its raw form. **FoxIO License 1.1**, see [NOTICE](../NOTICE). See below. |
+| `sha1`, `sha256` | The whole DER certificate's hashes as lowercase hex, which is what certificate blocklists such as abuse.ch SSLBL key on. |
+| `signature_algorithm`, `public_key_algorithm` | As `openssl x509 -text` prints them: `sha256WithRSAEncryption`, `ecdsa-with-SHA256`, `rsaEncryption`, `id-ecPublicKey`, `ED25519`. An algorithm OpenSSL would print by number is its dotted OID. |
+| `public_key_bits` | RSA modulus or DSA prime size, or an EC curve's size, as OpenSSL's `Public-Key: (N bit)`. NULL for other keys, an unknown curve, or a key body that does not parse. |
+| `public_key_curve` | An EC key's named curve as OpenSSL's `ASN1 OID` line prints it, such as `prime256v1` or `secp384r1`; an unknown curve is its OID. |
+| `is_ca`, `path_length` | basicConstraints' cA flag and pathLenConstraint. `is_ca` is NULL without the extension; `path_length` is NULL without a constraint. |
+| `key_usage` | keyUsage bits by their RFC 5280 names, in bit order: `digitalSignature`, `nonRepudiation`, `keyEncipherment`, `dataEncipherment`, `keyAgreement`, `keyCertSign`, `cRLSign`, `encipherOnly`, `decipherOnly`. NULL without the extension. |
+| `extended_key_usage` | extendedKeyUsage purposes by their RFC 5280 names (`serverAuth`, `clientAuth`, `codeSigning`, `emailProtection`, `timeStamping`, `OCSPSigning`, `anyExtendedKeyUsage`), others as dotted OIDs, in wire order. NULL without the extension. |
+
+The algorithms and curve use OpenSSL's names so they can be read beside `openssl x509
+-text`; the usage lists use RFC 5280's, which are identifiers rather than prose (OpenSSL
+prints `TLS Web Server Authentication` for `serverAuth`). None of this is verified: a key
+is described, not checked, and an RSA modulus is sized without being tested.
 
 Names follow RFC 4514 and match `openssl x509 -nameopt RFC2253,-esc_msb` character for
 character, with one exception. Attribute types in RFC 4514's own table use its short
@@ -247,14 +261,16 @@ A certificate that does not parse keeps its place in the list as a NULL element,
 row gets `server_certificate_malformed`. A Certificate message whose framing is broken,
 or a second one after the same ServerHello, makes the column NULL with the same warning.
 A chain over `max_certificates`, a certificate over `max_certificate_bytes`, one with
-more than `max_list_entries` subjectAltName entries, or a chain that would take its
+more than `max_list_entries` subjectAltName entries or extendedKeyUsage purposes, or a chain that would take its
 direction past `max_direction_certificate_bytes` of parsed text makes the column NULL
 and sets `reassembly_status` to `limit`. The last bounds what a direction waiting for its
 peer can hold.
 
-`scripts/compare_tls_tshark.py` compares chains with tshark field by field, and names
-with OpenSSL's rendering of the DER that tshark extracted. On the whole CTU-13 Neris
-capture it compared 832 values with no disagreements.
+`scripts/compare_tls_tshark.py` compares chains with tshark field by field, and names,
+hashes, algorithms, keys and usage with OpenSSL's reading of the DER that tshark
+extracted. Client certificates are compared the same way. On the whole CTU-13 Neris
+capture it compared 4,244 certificate values, and on a capture carrying this machine's
+121 CA certificates 1,952, with no disagreements.
 
 ## JA4X
 
@@ -358,7 +374,7 @@ Bounded by `TlsHandshakeLimits`, alongside the transport-wide
 | `max_message_bytes` | 64 KiB | One handshake message. |
 | `max_extensions` | 256 | Extensions walked in one hello. |
 | `max_pending` | 512 | Directions held while waiting for a peer. |
-| `max_list_entries` | 1024 | Entries in one parsed hello list, and subjectAltName entries in one certificate. |
+| `max_list_entries` | 1024 | Entries in one parsed hello list, and subjectAltName entries or extendedKeyUsage purposes in one certificate. |
 | `max_certificates` | 16 | Certificates in one Certificate message. |
 | `max_certificate_bytes` | 32 KiB | One certificate. |
 | `max_direction_certificate_bytes` | 256 KiB | Parsed certificate text one direction holds across its handshakes. |
@@ -384,8 +400,9 @@ that would have matched it.
 
 ## Not yet implemented
 
-Other certificate fields, such as the public key, extensions beyond subjectAltName,
-and client certificates. DTLS and QUIC hellos, the `d` and `q` JA4
+Certificate extensions beyond subjectAltName, basicConstraints, keyUsage and
+extendedKeyUsage, such as the key identifiers, CRL and OCSP locations, and policies, and
+the public key's own bytes. DTLS and QUIC hellos, the `d` and `q` JA4
 variants, are not read.
 
 Handshakes can still go missing on very busy captures. The transport core tracks

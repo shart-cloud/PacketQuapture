@@ -35,6 +35,10 @@ struct TlsHandshakeLimits {
 	// proxy login with a 407 page or a Negotiate token can take a few KiB. The
 	// cap bounds the search for a hello in a stream that does not begin with one.
 	size_t max_tunnel_prefix_bytes = 8 * 1024;
+	// Fills a parsed certificate's sha1 and sha256 from its DER. This library has
+	// no hash of its own; the extension supplies DuckDB's. Left unset, they stay
+	// empty. Not a limit, but it travels with them to every certificate parse.
+	void (*certificate_digest)(const uint8_t *der, size_t size, X509Certificate &out) = nullptr;
 };
 
 // RFC 8701 reserves the same sixteen values, 0x0A0A through 0xFAFA, for GREASE
@@ -116,6 +120,10 @@ struct TlsHandshake {
 	// The Certificate message that followed the ServerHello, in wire order, leaf
 	// first. TLS 1.3 encrypts it, so it is only read in TLS 1.2 and earlier.
 	TlsList<TlsCertificate> server_certificates;
+	// The client's Certificate message, sent when the server asked for one, read
+	// the same way and with the same TLS 1.3 limitation. An empty list means the
+	// client was asked and had none to send.
+	TlsList<TlsCertificate> client_certificates;
 	// Only decidable when both sides were captured and neither is TLS 1.3.
 	bool has_resumed = false;
 	bool resumed = false;
