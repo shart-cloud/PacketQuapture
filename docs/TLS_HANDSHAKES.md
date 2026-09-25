@@ -297,7 +297,7 @@ byte left over:
 | --- | --- | --- |
 | `socks5` | RFC 1928 greeting, RFC 1929 username and password if offered, CONNECT request | Method choice, RFC 1929 status if it chose that method, success reply |
 | `socks4`, `socks4a` | CONNECT request, and for 4a (address `0.0.0.x`) a name | Granted reply; always `socks4`, since the reply cannot tell 4 from 4a |
-| `http_connect` | One or more `CONNECT target HTTP/1.x` heads to one target, as a client sends when a proxy asks it to log in | Refusals such as `407`, each body framed by `Content-Length`, then a `2xx` head |
+| `http_connect` | One or more `CONNECT target HTTP/1.x` heads to one target, as a client sends when a proxy asks it to log in | Refusals such as `407`, each body framed by `Content-Length`, then a `2xx` head, which has no body whatever it declares |
 
 - `protocol` is the client's reading when its prefix was recognised, since only the
   client's request names the destination, and otherwise the server's. It is NULL when
@@ -310,8 +310,9 @@ byte left over:
   in full. The row gets `client_tunnel_unrecognized` or `server_tunnel_unrecognized`.
 - Sides that recognise different tunnels get `tunnel_mismatch`; a `socks4a` request and
   its `socks4` reply agree.
-- Only a connection's first handshake has a tunnel. A renegotiation follows TLS, not a
-  prefix.
+- Every handshake on a tunnelled connection reports its tunnel, including the second
+  ClientHello after a TLS 1.3 HelloRetryRequest and a renegotiation. The prefix lengths
+  count the bytes before the connection's first TLS record.
 - SOCKS5 with GSSAPI authentication is not recognised: after the login its requests may
   be encapsulated, so they cannot be read.
 

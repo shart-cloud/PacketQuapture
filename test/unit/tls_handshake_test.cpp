@@ -1020,7 +1020,15 @@ void TestTunnelEdges() {
 	limited.Add(Stream(Key(), 1, Concat(Bytes("xx"), Record(ClientHello({}))), 1));
 	assert(limited.Finish().empty());
 
-	// A renegotiation follows TLS, so only the first handshake has a prefix.
+	// A 2xx to CONNECT has no body whatever it declares, and header whitespace
+	// may be a tab.
+	handshake = Tunnelled(Bytes("CONNECT c2.example:443 HTTP/1.1\r\n\r\n"),
+	                      Bytes("HTTP/1.1 407 No\r\nContent-Length:\t2\r\n\r\nxxHTTP/1.1 200 OK\r\n"
+	                            "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"));
+	assert(handshake.server_tunnel == "http_connect" && handshake.warnings.empty());
+
+	// Every handshake on a tunnelled connection reports the tunnel: a
+	// HelloRetryRequest's second ClientHello is the one that completes.
 	TlsHandshakeAssembler assembler;
 	const auto key = Key();
 	const std::vector<uint8_t> socks = {5, 1, 0, 5, 1, 0, 1, 1, 2, 3, 4, 1, 187};
@@ -1028,7 +1036,7 @@ void TestTunnelEdges() {
 	const auto done = assembler.Finish();
 	assert(done.size() == 2);
 	assert(done[0].client_prefix_bytes == socks.size() && done[0].client_tunnel == "socks5");
-	assert(done[1].client_prefix_bytes == 0 && done[1].client_tunnel.empty() && done[1].tunnel_destination.empty());
+	assert(done[1].client_prefix_bytes == socks.size() && done[1].client_tunnel == "socks5");
 }
 
 void TestTunnelFuzz() {

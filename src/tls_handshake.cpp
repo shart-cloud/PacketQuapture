@@ -527,14 +527,16 @@ bool NextHttpHead(const std::string &text, size_t &pos, std::string &first_line,
 			c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 		}
 		if (header.compare(0, 15, "content-length:") == 0) {
+			// Optional whitespace is spaces or tabs (RFC 9110 5.6.3).
 			const std::string value = header.substr(15);
-			const size_t digits = value.find_first_not_of(' ');
-			if (digits == std::string::npos || value.find_first_not_of("0123456789 ", digits) != std::string::npos ||
-			    value.size() - digits > 9) {
+			const size_t digits = value.find_first_not_of(" \t");
+			const size_t last = value.find_last_not_of(" \t");
+			if (digits == std::string::npos || value.find_first_not_of("0123456789", digits) <= last ||
+			    last - digits >= 9) {
 				return false;
 			}
-			content_length = static_cast<size_t>(std::stoul(value.substr(digits)));
-		} else if (header.compare(0, 18, "transfer-encoding:") == 0) {
+			content_length = static_cast<size_t>(std::stoul(value.substr(digits, last - digits + 1)));
+		} else if (header.compare(0, 18, "transfer-encoding:") == 0 && header.find("chunked") != std::string::npos) {
 			chunked = true;
 		}
 		line = next + 2;
@@ -596,13 +598,14 @@ bool HttpServerPrefix(const std::string &text) {
 		size_t body = 0;
 		bool chunked = false;
 		const int status = NextHttpHead(text, pos, line, body, chunked) ? StatusCode(line) : 0;
-		if (status == 0 || chunked) {
+		if (status == 0) {
 			return false;
 		}
+		// A 2xx to CONNECT has no body whatever its headers say (RFC 9110 9.3.6).
 		if (status / 100 == 2) {
-			return body == 0 && pos == text.size();
+			return pos == text.size();
 		}
-		if (body > text.size() - pos) {
+		if (chunked || body > text.size() - pos) {
 			return false;
 		}
 		pos += body;
@@ -942,12 +945,12 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 			handshake.last = from_client->last;
 			handshake.status = from_client->status;
 			handshake.error = from_client->error;
-			// A prefix comes before the first hello only; a renegotiation follows TLS.
-			if (index == 0) {
-				handshake.client_prefix_bytes = client.prefix_bytes;
-				handshake.client_tunnel = client.tunnel;
-				handshake.tunnel_destination = client.tunnel_destination;
-			}
+			// The tunnel carried the whole connection, so every handshake on it
+			// reports it: a HelloRetryRequest's second ClientHello, or a
+			// renegotiation. The prefix is what came before the first record.
+			handshake.client_prefix_bytes = client.prefix_bytes;
+			handshake.client_tunnel = client.tunnel;
+			handshake.tunnel_destination = client.tunnel_destination;
 		}
 		if (from_server != nullptr) {
 			handshake.has_server_hello = true;
@@ -961,10 +964,8 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 			handshake.server_alpn = from_server->server_alpn;
 			handshake.server_supported_versions = from_server->server_supported_versions;
 			handshake.server_certificates = from_server->server_certificates;
-			if (index == 0) {
-				handshake.server_prefix_bytes = server->prefix_bytes;
-				handshake.server_tunnel = server->tunnel;
-			}
+			handshake.server_prefix_bytes = server->prefix_bytes;
+			handshake.server_tunnel = server->tunnel;
 			if (from_client == nullptr) {
 				handshake.first = from_server->first;
 				handshake.last = from_server->last;
