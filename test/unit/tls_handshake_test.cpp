@@ -973,6 +973,64 @@ void TestTunnelSearchIsStrict() {
 	assert(done.size() == 1 && done[0].client_prefix_bytes == 0 && done[0].client_tunnel.empty());
 }
 
+// Review findings on the first version of the tunnel search.
+void TestTunnelEdges() {
+	// A proxy that wants a login refuses the first CONNECT with a 407 whose page
+	// is longer than a SOCKS exchange would ever be; the client asks again.
+	const std::string page(3000, 'x');
+	auto handshake =
+	    Tunnelled(Bytes("CONNECT c2.example:443 HTTP/1.1\r\n\r\n"
+	                    "CONNECT c2.example:443 HTTP/1.1\r\nProxy-Authorization: Basic dTpw\r\n\r\n"),
+	              Bytes("HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: " + std::to_string(page.size()) +
+	                    "\r\n\r\n" + page + "HTTP/1.1 200 OK\r\n\r\n"));
+	assert(handshake.client_tunnel == "http_connect" && handshake.server_tunnel == "http_connect");
+	assert(handshake.tunnel_destination == "c2.example:443" && handshake.warnings.empty());
+	// A second request to another target is not the same tunnel.
+	handshake = Tunnelled(Bytes("CONNECT a:443 HTTP/1.1\r\n\r\nCONNECT b:443 HTTP/1.1\r\n\r\n"),
+	                      Bytes("HTTP/1.1 200 OK\r\n\r\n"));
+	assert(handshake.client_tunnel.empty() && handshake.server_tunnel == "http_connect");
+
+	// Bytes that frame as a non-handshake record are a prefix, not TLS.
+	handshake = Tunnelled({0x17, 0x03, 0x03, 0x00, 0x02, 0xAA, 0xBB}, {5, 0, 5, 0, 0, 1, 1, 2, 3, 4, 1, 187});
+	assert(handshake.client_prefix_bytes == 7 && HasWarning(handshake, "client_tunnel_unrecognized"));
+
+	// Sides that recognise different tunnels say so.
+	handshake = Tunnelled({5, 1, 0, 5, 1, 0, 1, 1, 2, 3, 4, 1, 187}, Bytes("HTTP/1.1 200 OK\r\n\r\n"));
+	assert(handshake.client_tunnel == "socks5" && handshake.server_tunnel == "http_connect");
+	assert((handshake.warnings == std::vector<std::string> {"tunnel_mismatch"}));
+
+	// A stream that begins with a handshake record is not searched, even when
+	// its first record is cut short and holds something hello-shaped.
+	TlsHandshakeAssembler cut;
+	cut.Add(Stream(Key(), 1, Concat({0x16, 0x03, 0x01, 0x40, 0x00}, Record(ClientHello({}))), 1));
+	assert(cut.Finish().empty());
+
+	// Without its SYN a stream begins mid-conversation, so a hello past its start
+	// is data, not a tunnel. On CTU-13 Neris one sat inside a binary mail body.
+	auto midstream = Stream(Key(), 1, Concat(Bytes("DATA body "), Record(ClientHello({}))), 1, "unanchored");
+	midstream.syn_seen = false;
+	TlsHandshakeAssembler unanchored;
+	unanchored.Add(midstream);
+	assert(unanchored.Finish().empty());
+
+	// The search applies the per-message limit that the stream-start parse does.
+	TlsHandshakeLimits small;
+	small.max_message_bytes = 16;
+	TlsHandshakeAssembler limited(small);
+	limited.Add(Stream(Key(), 1, Concat(Bytes("xx"), Record(ClientHello({}))), 1));
+	assert(limited.Finish().empty());
+
+	// A renegotiation follows TLS, so only the first handshake has a prefix.
+	TlsHandshakeAssembler assembler;
+	const auto key = Key();
+	const std::vector<uint8_t> socks = {5, 1, 0, 5, 1, 0, 1, 1, 2, 3, 4, 1, 187};
+	assembler.Add(Stream(key, 1, Concat(socks, Concat(Record(ClientHello({})), Record(ClientHello({})))), 1));
+	const auto done = assembler.Finish();
+	assert(done.size() == 2);
+	assert(done[0].client_prefix_bytes == socks.size() && done[0].client_tunnel == "socks5");
+	assert(done[1].client_prefix_bytes == 0 && done[1].client_tunnel.empty() && done[1].tunnel_destination.empty());
+}
+
 void TestTunnelFuzz() {
 	std::mt19937 rng(20260925);
 	std::uniform_int_distribution<int> byte(0, 255);
@@ -1046,6 +1104,7 @@ int main() {
 	TestSocks4AndHttpTunnels();
 	TestTunnelPrefixLimit();
 	TestTunnelSearchIsStrict();
+	TestTunnelEdges();
 	TestTunnelFuzz();
 	printf("TLS handshake pairing, orphans, renegotiation, resumption, limits, hello lists and tunnels passed\n");
 	return 0;

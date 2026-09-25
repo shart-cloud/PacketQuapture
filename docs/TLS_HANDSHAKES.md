@@ -131,6 +131,7 @@ whatever the status. It is `[]` when there are none and is never NULL.
 | `client_list_malformed`, `server_list_malformed` | At least one of that side's lists is NULL because it was malformed. On the server side this includes a malformed `supported_versions`, which leaves `negotiated_version` NULL. |
 | `server_certificate_malformed` | The Certificate message was malformed, so `server_certificates` is NULL, or at least one certificate in it did not parse and is a NULL element. |
 | `client_tunnel_unrecognized`, `server_tunnel_unrecognized` | Bytes came before TLS in that direction but did not parse exactly as a known tunnel. The TLS columns are still sound; see below. |
+| `tunnel_mismatch` | Each side's prefix parsed as a different tunnel; `tunnel.protocol` is the client's. |
 
 ## JA3 and JA3S
 
@@ -278,11 +279,16 @@ an error on the Neris capture.
 
 ## Tunnels
 
-A stream that does not begin with a hello is searched for one in its first 1 KiB
+A stream whose first bytes are a TLS handshake record header is read as it stands and
+never searched. Neither is a stream without its SYN: it begins mid-conversation, so its
+first byte is not where a tunnel would start, and a hello-shaped run inside ordinary data
+is not TLS. On CTU-13 Neris that is exactly what an unanchored SMTP direction held, a
+complete ClientHello inside a binary mail body. Any other stream is searched for a hello
+in its first 8 KiB
 (`max_tunnel_prefix_bytes`). Past the start the test is stricter than at it: a whole
-ClientHello or ServerHello must sit inside the first record found, and must parse.
-Bytes that merely look like a record header are not TLS, and parsing one record per
-candidate bounds the search.
+ClientHello or ServerHello must sit inside the first record found, within
+`max_message_bytes`, and must parse. Bytes that merely look like a record header are not
+TLS, and parsing one record per candidate bounds the search.
 
 The bytes before the hello are then read as a tunnel, and must parse exactly, with no
 byte left over:
@@ -291,7 +297,7 @@ byte left over:
 | --- | --- | --- |
 | `socks5` | RFC 1928 greeting, RFC 1929 username and password if offered, CONNECT request | Method choice, RFC 1929 status if it chose that method, success reply |
 | `socks4`, `socks4a` | CONNECT request, and for 4a (address `0.0.0.x`) a name | Granted reply; always `socks4`, since the reply cannot tell 4 from 4a |
-| `http_connect` | `CONNECT target HTTP/1.x` and headers, ending in a blank line | A `2xx` HTTP/1.x status line and headers |
+| `http_connect` | One or more `CONNECT target HTTP/1.x` heads to one target, as a client sends when a proxy asks it to log in | Refusals such as `407`, each body framed by `Content-Length`, then a `2xx` head |
 
 - `protocol` is the client's reading when its prefix was recognised, since only the
   client's request names the destination, and otherwise the server's. It is NULL when
@@ -302,12 +308,20 @@ byte left over:
   direction: 0 when TLS began it, NULL when that direction was not captured.
 - A prefix that is not recognised still leaves the row sound, because its hello parsed
   in full. The row gets `client_tunnel_unrecognized` or `server_tunnel_unrecognized`.
+- Sides that recognise different tunnels get `tunnel_mismatch`; a `socks4a` request and
+  its `socks4` reply agree.
+- Only a connection's first handshake has a tunnel. A renegotiation follows TLS, not a
+  prefix.
+- SOCKS5 with GSSAPI authentication is not recognised: after the login its requests may
+  be encapsulated, so they cannot be read.
 
-On the CTU-13 Neris capture this reads all 63 handshakes tunnelled through
-`212.117.171.138:65500`, which was the last gap against tshark there. The server side is
-standard SOCKS5. The client sends one stray byte, `0x7e`, before an otherwise standard
-greeting, so its prefix is unrecognised and no destination is claimed. Other stream-start
-checks are unchanged: a stream that begins with a TLS record is never searched.
+On the CTU-13 Neris capture this reads all 63 handshakes on connections between the
+infected host `147.32.84.165` and `212.117.171.138:65500`, which was the last gap against
+tshark there. They are a backconnect proxy: the bot opens the TCP connection, then acts as
+the SOCKS5 server for the far end, which sends a ClientHello for `login.live.com` through
+it. `read_tls` orients rows by TLS role, so `client_ip` is `212.117.171.138`. The bot's
+side is standard SOCKS5. The far end sends one extra byte, `0x7e`, before an otherwise
+standard greeting, so its prefix is unrecognised and no destination is claimed.
 
 ## `session_resumed` is often NULL
 
@@ -347,7 +361,7 @@ Bounded by `TlsHandshakeLimits`, alongside the transport-wide
 | `max_certificates` | 16 | Certificates in one Certificate message. |
 | `max_certificate_bytes` | 32 KiB | One certificate. |
 | `max_direction_certificate_bytes` | 256 KiB | Parsed certificate text one direction holds across its handshakes. |
-| `max_tunnel_prefix_bytes` | 1 KiB | Bytes searched for a hello in a stream that does not begin with one. |
+| `max_tunnel_prefix_bytes` | 8 KiB | Bytes searched for a hello in a stream that does not begin with a handshake record. |
 
 Reaching a limit sets `reassembly_status` to `limit` rather than failing the query. Directions
 waiting for a peer hold parsed fields, not payload bytes, and at most
@@ -381,5 +395,5 @@ such a stream carried TLS, so it reports nothing for it.
 
 Tunnels other than SOCKS and HTTP CONNECT are read, but not named. STARTTLS, where TLS
 follows a plaintext SMTP, IMAP or similar exchange, is found the same way when that
-exchange fits in 1 KiB, and is reported with an unrecognised prefix. TLS after a longer
+exchange fits in 8 KiB, and is reported with an unrecognised prefix. TLS after a longer
 prefix is not found.

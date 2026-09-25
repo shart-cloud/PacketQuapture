@@ -470,6 +470,16 @@ def tunnel_fixtures():
     packets += exchange([
         (True, b"\x05\x01\x00\x05\x01\x00" + socks5_address([192, 0, 2, 9])),
         (True, hello("one-sided.example"))], port=51006)
+    # An HTTP proxy that wants a login: 407 with a page, then CONNECT again.
+    page = b"<html>" + b"login required " * 200 + b"</html>"
+    packets += exchange([
+        (True, b"CONNECT login.example:443 HTTP/1.1\r\nHost: login.example:443\r\n\r\n"),
+        (False, b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n"
+                b"Content-Length: " + str(len(page)).encode() + b"\r\n\r\n" + page),
+        (True, b"CONNECT login.example:443 HTTP/1.1\r\nHost: login.example:443\r\n"
+               b"Proxy-Authorization: Basic dXNlcjpwdw==\r\n\r\n"),
+        (False, b"HTTP/1.1 200 Connection established\r\n\r\n"),
+        (True, hello("login.example")), (False, reply)], port=51007)
     pcap(DATA / "tunnels.pcap", packets)
 
 

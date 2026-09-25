@@ -98,7 +98,8 @@ def ours(path, duckdb):
 
     columns = ", ".join(encode(column) for column, _, _, _ in LISTS)
     query = (f"SELECT client_ip, client_port, server_ip, server_port, client_hello, server_hello, "
-             f"array_to_string(warnings, ',') AS warnings, reassembly_status, {columns} "
+             f"array_to_string(warnings, ',') AS warnings, reassembly_status, tunnel IS NOT NULL AS tunnelled, "
+             f"{columns} "
              f"FROM read_tls('{path}') ORDER BY client_ip, client_port, handshake_number")
     output = subprocess.run([duckdb, "-json", "-c", query], check=True, capture_output=True, cwd=ROOT).stdout
     rows = json.loads(output.strip() or b"[]")
@@ -124,6 +125,9 @@ def compare(path, duckdb):
     reference = tshark_hellos(path)
     seen = collections.Counter()
     failures = divergences = checked = skipped = 0
+    # Hellos read_tls found behind a tunnel that tshark does not follow, such as
+    # TLS after an HTTP 407 login. Coverage tshark lacks, not a wrong value.
+    undecoded = set()
     for row in ours(path, duckdb):
         key = (row["client_ip"], row["client_port"], row["server_ip"], row["server_port"])
         for column, field, kind, hex_values in LISTS:
@@ -133,6 +137,9 @@ def compare(path, duckdb):
             seen[(key, kind, column)] += 1
             candidates = reference.get((key, kind), [])
             if index >= len(candidates):
+                if row["tunnelled"]:
+                    undecoded.add((key, kind, index))
+                    continue
                 print(f"{path}: {key} hello {kind}: tshark has no matching hello")
                 failures += 1
                 continue
@@ -177,7 +184,7 @@ def compare(path, duckdb):
         if extra > 0:
             missed += extra
             print(f"{path}: {key} hello {kind}: {extra} decoded by tshark, not reported by read_tls")
-    return checked, failures, divergences, skipped, missed
+    return checked, failures, divergences, skipped, missed, len(undecoded)
 
 
 def find(tree, key, found=None):
@@ -404,7 +411,7 @@ def main():
     parser.add_argument("--foxio", help="path to FoxIO-LLC/ja4 python/ja4.py, to compare JA4S")
     parser.add_argument("--ja4x", help="path to the FoxIO-LLC/ja4 rust ja4x binary, to compare JA4X")
     args = parser.parse_args()
-    totals = [0, 0, 0, 0, 0]
+    totals = [0, 0, 0, 0, 0, 0]
     certificate_totals = [0, 0, 0, 0]
     foxio_checked = foxio_failures = foxio_skipped = foxio_uncovered = 0
     for capture in args.captures:
@@ -418,7 +425,7 @@ def main():
             foxio_checked += checked
             foxio_failures += failures
             foxio_skipped += skipped
-    checked, failures, divergences, skipped, missed = totals
+    checked, failures, divergences, skipped, missed, undecoded = totals
     certificate_checked, certificate_failures, certificate_divergences, certificate_missed = certificate_totals
     print(f"Certificates: {certificate_checked} values compared, {certificate_failures} disagreements, "
           f"{certificate_divergences} documented divergences (malformed or over-limit chains reported NULL, "
@@ -432,7 +439,8 @@ def main():
     print(f"{checked} values compared, {failures} disagreements, "
           f"{divergences} documented divergences (malformed or over-limit lists and fingerprints over them "
           f"reported NULL, or an empty JA4 list written as zeros), "
-          f"{skipped} skipped (several hellos in one packet), {missed} tshark hellos without a read_tls row")
+          f"{skipped} skipped (several hellos in one packet), {missed} tshark hellos without a read_tls row, "
+          f"{undecoded} tunnelled hellos tshark does not decode")
     return 1 if failures else 0
 
 

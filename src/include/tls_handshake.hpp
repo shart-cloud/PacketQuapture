@@ -31,9 +31,10 @@ struct TlsHandshakeLimits {
 	// max_direction_certificate_bytes of certificate text.
 	size_t max_pending = 512;
 	// Bytes a tunnel, such as a SOCKS or HTTP CONNECT exchange, may put before
-	// the first TLS record of a direction. Real exchanges are far shorter; the
+	// the first TLS record of a direction. SOCKS takes tens of bytes; an HTTP
+	// proxy login with a 407 page or a Negotiate token can take a few KiB. The
 	// cap bounds the search for a hello in a stream that does not begin with one.
-	size_t max_tunnel_prefix_bytes = 1024;
+	size_t max_tunnel_prefix_bytes = 8 * 1024;
 };
 
 // RFC 8701 reserves the same sixteen values, 0x0A0A through 0xFAFA, for GREASE
