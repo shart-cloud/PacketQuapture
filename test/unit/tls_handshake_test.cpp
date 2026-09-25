@@ -606,6 +606,147 @@ void TestListEntryLimit() {
 	assert(!groups.client_ec_point_formats.present && groups.client_ec_point_formats.Known());
 }
 
+// A leaf certificate made with OpenSSL: O=Test, CN=leaf.example, serial 0x1234,
+// SAN DNS:leaf.example and IP:192.0.2.9.
+std::vector<uint8_t> LeafCertificate() {
+	const std::string hex =
+	    "308201ad30820154a00302010202021234300a06082a8648ce3d0403023026310d300b060355040a0c04546573743115"
+	    "301306035504030c0c6c6561662e6578616d706c65301e170d3236303932343134353935355a170d3236313032343134"
+	    "353935355a3026310d300b060355040a0c04546573743115301306035504030c0c6c6561662e6578616d706c65305930"
+	    "1306072a8648ce3d020106082a8648ce3d03010703420004941e5ca118bc25fdd41a92fb1bde7a10b30767c5f84424dd"
+	    "bd6f72382f14f7e7d25c48ba446ff4fea2d9fe4523f87e4cd02940e27b4b2018cdd31753c242f1d6a3723070301d0603"
+	    "551d0e04160414d20c8d8d1ac5dd2979b267e313efa302dfda63e0301f0603551d23041830168014d20c8d8d1ac5dd29"
+	    "79b267e313efa302dfda63e0300f0603551d130101ff040530030101ff301d0603551d1104163014820c6c6561662e65"
+	    "78616d706c658704c0000209300a06082a8648ce3d040302034700304402204c7b37b03816d03cc64692b082ed4e2990"
+	    "d39b26b76b96ab049885b16b4f3b5e02201839562bc98f84a9e1da5d3e1b163c65607e6fa69b310e05fddae02b64d09c"
+	    "fb";
+	std::vector<uint8_t> out;
+	for (size_t i = 0; i < hex.size(); i += 2) {
+		out.push_back(static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+	}
+	return out;
+}
+
+void Append24(std::vector<uint8_t> &out, size_t value) {
+	out.push_back(static_cast<uint8_t>(value >> 16U));
+	Append16(out, static_cast<uint16_t>(value & 0xFFFFU));
+}
+
+std::vector<uint8_t> CertificateMessage(const std::vector<std::vector<uint8_t>> &certificates) {
+	std::vector<uint8_t> list;
+	for (const auto &der : certificates) {
+		Append24(list, der.size());
+		list.insert(list.end(), der.begin(), der.end());
+	}
+	std::vector<uint8_t> body;
+	Append24(body, list.size());
+	body.insert(body.end(), list.begin(), list.end());
+	return Message(body, 11);
+}
+
+TlsHandshake PairedWithServer(const std::vector<uint8_t> &server_bytes, TlsHandshakeLimits limits = {}) {
+	TlsHandshakeAssembler assembler(limits);
+	assembler.Add(Stream(Key(), 1, Record(ClientHello({})), 1));
+	auto done = assembler.Add(Stream(Key().Reverse(), 2, server_bytes, 2));
+	const auto rest = assembler.Finish();
+	done.insert(done.end(), rest.begin(), rest.end());
+	assert(done.size() == 1);
+	return done[0];
+}
+
+// The server's Certificate message follows its ServerHello in TLS 1.2, often in
+// the same record. The chain is reported in wire order, leaf first.
+void TestServerCertificates() {
+	const auto leaf = LeafCertificate();
+	const auto chain = PairedWithServer(Record(Concat(ServerHello(0x009C), CertificateMessage({leaf, leaf}))));
+	assert(chain.status == "complete" && chain.warnings.empty());
+	assert(chain.server_certificates.present && chain.server_certificates.values.size() == 2);
+	const auto &first = chain.server_certificates.values[0];
+	assert(first.parsed && first.fields.subject == "CN=leaf.example,O=Test" &&
+	       first.fields.issuer == first.fields.subject);
+	assert(first.fields.serial == "1234");
+	assert((first.fields.san_dns == std::vector<std::string> {"leaf.example"}));
+	assert((first.fields.san_ip == std::vector<std::string> {"192.0.2.9"}));
+	assert(first.fields.not_after - first.fields.not_before == 30LL * 86400 * 1000000);
+
+	// In its own record, and with an empty chain.
+	const auto separate = PairedWithServer(Concat(Record(ServerHello(0x009C)), Record(CertificateMessage({leaf}))));
+	assert(separate.server_certificates.values.size() == 1 && separate.server_certificates.values[0].parsed);
+	const auto empty = PairedWithServer(Record(Concat(ServerHello(0x009C), CertificateMessage({}))));
+	assert(empty.server_certificates.present && empty.server_certificates.values.empty());
+
+	// No Certificate message: TLS 1.3 encrypts it after the ServerHello.
+	const auto thirteen =
+	    PairedWithServer(Concat(Record(ServerHello(0x1301, SupportedVersions(0x0304))), Record({1}, 20)));
+	assert(!thirteen.server_certificates.present && thirteen.server_certificates.Known());
+}
+
+void TestMalformedCertificates() {
+	const auto leaf = LeafCertificate();
+	// A certificate that does not parse keeps its place, unparsed, and is flagged.
+	const auto bad_entry =
+	    PairedWithServer(Record(Concat(ServerHello(0x009C), CertificateMessage({leaf, {0x30, 0x01}}))));
+	assert(bad_entry.server_certificates.values.size() == 2);
+	assert(bad_entry.server_certificates.values[0].parsed && !bad_entry.server_certificates.values[1].parsed);
+	assert(bad_entry.status == "complete" && HasWarning(bad_entry, "server_certificate_malformed"));
+
+	// A list length that disagrees with the message.
+	auto framing = CertificateMessage({leaf});
+	framing[6] ^= 0x01;
+	const auto bad_list = PairedWithServer(Record(Concat(ServerHello(0x009C), framing)));
+	assert(bad_list.server_certificates.malformed && bad_list.server_certificates.values.empty());
+	assert(HasWarning(bad_list, "server_certificate_malformed"));
+
+	// Two Certificate messages for one ServerHello.
+	const auto twice = PairedWithServer(
+	    Record(Concat(Concat(ServerHello(0x009C), CertificateMessage({leaf})), CertificateMessage({leaf}))));
+	assert(twice.server_certificates.malformed && !twice.server_certificates.present);
+
+	// A client certificate, and a Certificate with no ServerHello before it, are not reported.
+	TlsHandshakeAssembler assembler;
+	assembler.Add(Stream(Key(), 1, Record(Concat(ClientHello({}), CertificateMessage({leaf}))), 1));
+	auto done = assembler.Add(Stream(Key().Reverse(), 2, Record(ServerHello(0x009C)), 2));
+	assert(done.size() == 1 && !done[0].server_certificates.present);
+	TlsHandshakeAssembler orphan;
+	assert(orphan.Add(Stream(Key().Reverse(), 2, Record(CertificateMessage({leaf})), 2)).empty());
+	assert(orphan.Finish().empty());
+}
+
+void TestCertificateLimits() {
+	const auto leaf = LeafCertificate();
+	const auto server = Record(Concat(ServerHello(0x009C), CertificateMessage({leaf, leaf})));
+	TlsHandshakeLimits count;
+	count.max_certificates = 1;
+	const auto long_chain = PairedWithServer(server, count);
+	assert(long_chain.server_certificates.over_limit && !long_chain.server_certificates.present);
+	assert(long_chain.status == "limit" && !HasWarning(long_chain, "server_certificate_malformed"));
+	TlsHandshakeLimits size;
+	size.max_certificate_bytes = leaf.size() - 1;
+	assert(PairedWithServer(server, size).server_certificates.over_limit);
+	size.max_certificate_bytes = leaf.size();
+	assert(PairedWithServer(server, size).server_certificates.values.size() == 2);
+
+	// A direction waiting for its peer keeps parsed certificate text, so the text
+	// one direction holds is capped too, across renegotiated handshakes.
+	const auto one = PairedWithServer(Record(Concat(ServerHello(0x009C), CertificateMessage({leaf}))));
+	const size_t text = one.server_certificates.values[0].fields.TextBytes();
+	TlsHandshakeLimits held;
+	held.max_direction_certificate_bytes = 2 * text;
+	assert(PairedWithServer(server, held).server_certificates.values.size() == 2);
+	held.max_direction_certificate_bytes = 2 * text - 1;
+	const auto over = PairedWithServer(server, held);
+	assert(over.server_certificates.over_limit && over.status == "limit");
+	// The budget spans every handshake in the direction.
+	const auto hello_and_chain = Concat(ServerHello(0x009C), CertificateMessage({leaf}));
+	const auto client_bytes = Concat(Record(ClientHello({})), Record(ClientHello({})));
+	held.max_direction_certificate_bytes = text;
+	TlsHandshakeAssembler renegotiated(held);
+	renegotiated.Add(Stream(Key(), 1, client_bytes, 1));
+	auto done = renegotiated.Add(Stream(Key().Reverse(), 2, Record(Concat(hello_and_chain, hello_and_chain)), 2));
+	assert(done.size() == 2);
+	assert(done[0].server_certificates.values.size() == 1 && done[1].server_certificates.over_limit);
+}
+
 // JA3S fingerprints the ServerHello's legacy_version, which supported_versions
 // replaces as the negotiated version.
 void TestServerLegacyVersion() {
@@ -729,6 +870,9 @@ int main() {
 	TestListEntryLimit();
 	TestServerLegacyVersion();
 	TestMalformedServerSupportedVersions();
+	TestServerCertificates();
+	TestMalformedCertificates();
+	TestCertificateLimits();
 	TestListFuzz();
 	printf("TLS handshake pairing, orphans, renegotiation, resumption, limits and hello lists passed\n");
 	return 0;

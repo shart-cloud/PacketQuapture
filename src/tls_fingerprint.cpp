@@ -216,4 +216,11 @@ bool Ja4sStrings(const TlsHandshake &handshake, Ja4Parts &out) {
 	return true;
 }
 
+// JA4X (FoxIO License 1.1): see tls_fingerprint.hpp and NOTICE.
+void Ja4xStrings(const X509Certificate &certificate, Ja4xParts &out) {
+	out.issuer = certificate.issuer_oids;
+	out.subject = certificate.subject_oids;
+	out.extensions = certificate.extension_oids;
+}
+
 } // namespace packetquapture

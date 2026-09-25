@@ -2266,6 +2266,22 @@ static void DnsMessagesScan(ClientContext &context, TableFunctionInput &input, D
 // read_tls reports one row per handshake, pairing the two directions of a
 // connection so the offered name and the selected parameters arrive together.
 // The key is oriented client to server whichever direction was captured.
+// One element of server_certificates.
+static LogicalType TlsCertificateType() {
+	child_list_t<LogicalType> fields;
+	fields.emplace_back("subject", LogicalType::VARCHAR);
+	fields.emplace_back("issuer", LogicalType::VARCHAR);
+	fields.emplace_back("serial", LogicalType::VARCHAR);
+	fields.emplace_back("not_before", LogicalType::TIMESTAMP);
+	fields.emplace_back("not_after", LogicalType::TIMESTAMP);
+	fields.emplace_back("san_dns", LogicalType::LIST(LogicalType::VARCHAR));
+	fields.emplace_back("san_ip", LogicalType::LIST(LogicalType::VARCHAR));
+	// JA4X and its raw form. FoxIO License 1.1; see NOTICE.
+	fields.emplace_back("ja4x", LogicalType::VARCHAR);
+	fields.emplace_back("ja4x_r", LogicalType::VARCHAR);
+	return LogicalType::STRUCT(std::move(fields));
+}
+
 static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBindInput &input,
                                         vector<LogicalType> &types, vector<string> &names) {
 	auto result = PcapBind(context, input, types, names);
@@ -2318,7 +2334,8 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         "ja4",
 	         "ja4_r",
 	         "ja4s",
-	         "ja4s_r"};
+	         "ja4s_r",
+	         "server_certificates"};
 	const auto codes = LogicalType::LIST(LogicalType::USMALLINT);
 	const auto text = LogicalType::LIST(LogicalType::VARCHAR);
 	types = {LogicalType::VARCHAR,
@@ -2370,7 +2387,8 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         LogicalType::VARCHAR,
 	         LogicalType::VARCHAR,
 	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR};
+	         LogicalType::VARCHAR,
+	         LogicalType::LIST(TlsCertificateType())};
 	auto &bind = result->Cast<PcapBindData>();
 	bind.types = types;
 	bind.stream_plan =
@@ -2432,6 +2450,14 @@ static void SetTlsAlpn(Vector &vector, idx_t row, const packetquapture::TlsList<
 	vector.SetValue(row, Value::LIST(LogicalType::VARCHAR, values));
 }
 
+static Value TextList(const std::vector<std::string> &items) {
+	duckdb::vector<Value> values;
+	for (const auto &item : items) {
+		values.push_back(Value(item));
+	}
+	return Value::LIST(LogicalType::VARCHAR, values);
+}
+
 // Estimated output bytes for one read_tls row. max_list_entries bounds how many
 // entries a list holds, not how many bytes it produces, so the lists are
 // counted: each code point lands in its list column, the no-GREASE copy and the
@@ -2450,7 +2476,13 @@ static idx_t TlsRowBytes(const string &filename, const packetquapture::TlsHandsh
 	for (const auto &protocol : handshake.server_alpn.values) {
 		alpn += 32 + 4 * protocol.size();
 	}
-	return 1024 + filename.size() + handshake.sni.size() + 32 * codes + alpn;
+	idx_t certificates = 0;
+	for (const auto &certificate : handshake.server_certificates.values) {
+		const auto &fields = certificate.fields;
+		certificates += 256 + fields.TextBytes();
+		certificates += 32 * (fields.san_dns.size() + fields.san_ip.size());
+	}
+	return 1024 + filename.size() + handshake.sni.size() + 32 * codes + alpn + certificates;
 }
 
 static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const string &filename,
@@ -2668,6 +2700,35 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 			const auto first = client ? Ja4Hash12(parts.first) : parts.first;
 			vector.SetValue(row, Value(parts.prefix + "_" + first + "_" + Ja4Hash12(parts.second)));
 		}
+		break;
+	}
+	// The chain from the Certificate message, leaf first. An entry that did not
+	// parse is a NULL element, so positions still match the chain.
+	case 50: {
+		const auto &chain = handshake.server_certificates;
+		if (!chain.present) {
+			FlatVector::SetNull(vector, row, true);
+			break;
+		}
+		const auto type = TlsCertificateType();
+		duckdb::vector<Value> values;
+		for (const auto &certificate : chain.values) {
+			if (!certificate.parsed) {
+				values.push_back(Value(type));
+				continue;
+			}
+			const auto &fields = certificate.fields;
+			packetquapture::Ja4xParts ja4x;
+			packetquapture::Ja4xStrings(fields, ja4x);
+			values.push_back(Value::STRUCT(
+			    type,
+			    {Value(fields.subject), Value(fields.issuer), Value(fields.serial),
+			     Value::TIMESTAMP(timestamp_t(fields.not_before)), Value::TIMESTAMP(timestamp_t(fields.not_after)),
+			     TextList(fields.san_dns), TextList(fields.san_ip),
+			     Value(Ja4Hash12(ja4x.issuer) + "_" + Ja4Hash12(ja4x.subject) + "_" + Ja4Hash12(ja4x.extensions)),
+			     Value(ja4x.issuer + "_" + ja4x.subject + "_" + ja4x.extensions)}));
+		}
+		vector.SetValue(row, Value::LIST(type, values));
 		break;
 	}
 	default:

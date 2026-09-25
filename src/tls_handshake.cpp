@@ -10,6 +10,7 @@ const uint8_t RECORD_CHANGE_CIPHER_SPEC = 20;
 const uint8_t RECORD_HANDSHAKE = 22;
 const uint8_t HANDSHAKE_CLIENT_HELLO = 1;
 const uint8_t HANDSHAKE_SERVER_HELLO = 2;
+const uint8_t HANDSHAKE_CERTIFICATE = 11;
 const uint16_t EXTENSION_SERVER_NAME = 0;
 const uint16_t EXTENSION_SUPPORTED_VERSIONS = 43;
 const uint16_t TLS_1_3 = 0x0304;
@@ -354,6 +355,60 @@ bool ParseHello(const std::vector<uint8_t> &body, bool client, const TlsHandshak
 	return true;
 }
 
+// RFC 5246 7.4.2: a three-byte vector of certificates, each a three-byte length
+// and its DER encoding. A second Certificate message is malformed, as a repeated
+// extension is. A certificate that does not parse keeps its place in the chain.
+// held counts the certificate text this direction already holds; a chain that
+// would take it past max_direction_certificate_bytes is over the limit.
+void ParseCertificates(const std::vector<uint8_t> &body, const TlsHandshakeLimits &limits, size_t &held,
+                       TlsHandshake &handshake) {
+	auto &chain = handshake.server_certificates;
+	if (Duplicate(chain)) {
+		return;
+	}
+	Reader reader(body.data(), body.size());
+	const uint32_t list_length = reader.U24();
+	if (reader.Overrun() || reader.Remaining() != list_length) {
+		chain.malformed = true;
+		return;
+	}
+	std::vector<TlsCertificate> certificates;
+	const size_t held_before = held;
+	while (reader.Remaining() > 0) {
+		const uint32_t length = reader.U24();
+		std::vector<uint8_t> der;
+		if (reader.Overrun() || !reader.TakeBytes(length, der)) {
+			chain.malformed = true;
+			return;
+		}
+		TlsCertificate certificate;
+		auto result = X509Result::OVER_LIMIT;
+		if (certificates.size() < limits.max_certificates && length <= limits.max_certificate_bytes) {
+			result = ParseX509Certificate(der.data(), der.size(), limits.max_list_entries, certificate.fields);
+			const size_t text = certificate.fields.TextBytes();
+			if (result == X509Result::OK && text > limits.max_direction_certificate_bytes - held) {
+				result = X509Result::OVER_LIMIT;
+			}
+			if (result == X509Result::OK) {
+				held += text;
+			}
+		}
+		if (result == X509Result::OVER_LIMIT) {
+			held = held_before; // the chain is dropped, so it holds nothing
+			chain.over_limit = true;
+			if (handshake.status.empty()) {
+				handshake.status = "limit";
+				handshake.error = "TLS certificate chain exceeds the certificate limits";
+			}
+			return;
+		}
+		certificate.parsed = result == X509Result::OK;
+		certificates.push_back(std::move(certificate));
+	}
+	chain.present = true;
+	chain.values = std::move(certificates);
+}
+
 // A hello that failed to parse reports none of the fields read before the
 // failure: a partial list is worse than none, since it looks complete.
 void ClearHello(TlsHandshake &handshake) {
@@ -463,7 +518,7 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 	};
 	const Locator locator = {&record_spans};
 
-	size_t message_offset = 0;
+	size_t message_offset = 0, certificate_bytes = 0;
 	while (handshake_bytes.size() - message_offset >= 4) {
 		Reader reader(handshake_bytes.data() + message_offset, handshake_bytes.size() - message_offset);
 		const uint8_t type = reader.U8();
@@ -504,6 +559,21 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 			direction.client = direction.client || client;
 			direction.handshakes.push_back(handshake);
 			direction.session_ids.push_back(session_id);
+		} else if (type == HANDSHAKE_CERTIFICATE && !direction.handshakes.empty() &&
+		           direction.handshakes.back().has_server_hello && direction.handshakes.back().status != "invalid") {
+			// The server's Certificate follows its ServerHello; a client certificate,
+			// or one with no hello before it, is not reported.
+			auto &handshake = direction.handshakes.back();
+			std::vector<uint8_t> body(handshake_bytes.begin() + static_cast<long>(message_offset + 4),
+			                          handshake_bytes.begin() + static_cast<long>(message_offset + 4 + length));
+			ParseCertificates(body, limits, certificate_bytes, handshake);
+			const auto span = locator.Locate(message_offset, length + 4);
+			if (span.second > 0) {
+				const auto provenance = chunk->Provenance(span.first, span.second);
+				if (provenance.second.number > handshake.last.number) {
+					handshake.last = provenance.second;
+				}
+			}
 		}
 		message_offset += 4 + length;
 	}
@@ -565,6 +635,7 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 			handshake.server_extensions = from_server->server_extensions;
 			handshake.server_alpn = from_server->server_alpn;
 			handshake.server_supported_versions = from_server->server_supported_versions;
+			handshake.server_certificates = from_server->server_certificates;
 			if (from_client == nullptr) {
 				handshake.first = from_server->first;
 				handshake.last = from_server->last;
@@ -635,6 +706,16 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 		if (from_server != nullptr &&
 		    (from_server->server_alpn.malformed || from_server->server_supported_versions.malformed)) {
 			handshake.warnings.push_back("server_list_malformed");
+		}
+		if (from_server != nullptr) {
+			const auto &chain = from_server->server_certificates;
+			bool unparsed = chain.malformed;
+			for (const auto &certificate : chain.values) {
+				unparsed = unparsed || !certificate.parsed;
+			}
+			if (unparsed) {
+				handshake.warnings.push_back("server_certificate_malformed");
+			}
 		}
 		result.push_back(handshake);
 	}

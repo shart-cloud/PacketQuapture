@@ -53,9 +53,17 @@ jobs:
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -g -O1 \
             -fsanitize=address,undefined -fno-omit-frame-pointer \
-            -Isrc/include src/tcp_reassembly.cpp src/tls_handshake.cpp test/unit/tls_handshake_test.cpp \
-            -o build/tls_handshake_test
+            -Isrc/include src/tcp_reassembly.cpp src/tls_handshake.cpp src/x509_certificate.cpp \
+            test/unit/tls_handshake_test.cpp -o build/tls_handshake_test
           ./build/tls_handshake_test
+
+      - name: Build and test X.509 certificate parsing with sanitizers
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -g -O1 \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Isrc/include src/x509_certificate.cpp test/unit/x509_certificate_test.cpp \
+            -o build/x509_certificate_test
+          ./build/x509_certificate_test
 
       - name: Build and test TLS fingerprint strings with sanitizers
         run: |

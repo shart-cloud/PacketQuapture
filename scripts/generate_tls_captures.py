@@ -245,6 +245,7 @@ def reassembly_fixtures():
 
     fingerprint_fixtures()
     idle_fixtures()
+    certificate_fixtures()
 
     # TCP that is not TLS at all.
     pcap(
@@ -326,6 +327,90 @@ def fingerprint_fixtures():
         extension(11, vector8(b"\0")),
     ], version=0x0301)
     pcap(DATA / "ja3_legacy.pcap", connection([record(old_hello)], [record(old_reply)]))
+
+
+# X.509 DER, built field by field. Signatures are placeholders: read_tls parses
+# certificates and never verifies them, and fixed bytes keep the fixtures stable.
+def der(tag, content):
+    n = len(content)
+    if n < 0x80:
+        length = bytes([n])
+    elif n < 0x100:
+        length = bytes([0x81, n])
+    else:
+        length = bytes([0x82]) + struct.pack("!H", n)
+    return bytes([tag]) + length + content
+
+
+def oid(dotted):
+    arcs = [int(a) for a in dotted.split(".")]
+    out = b""
+    for value in [arcs[0] * 40 + arcs[1]] + arcs[2:]:
+        chunk = [value & 0x7F]
+        value >>= 7
+        while value:
+            chunk.insert(0, 0x80 | (value & 0x7F))
+            value >>= 7
+        out += bytes(chunk)
+    return der(0x06, out)
+
+
+def name(*rdns):
+    """Each RDN is a list of (oid, tag, value bytes), least specific first."""
+    # DER sorts the members of a SET by their encodings.
+    return der(0x30, b"".join(
+        der(0x31, b"".join(sorted(der(0x30, oid(o) + der(t, v)) for o, t, v in rdn))) for rdn in rdns))
+
+
+def certificate(serial, issuer, subject, not_before, not_after, dns=(), ips=()):
+    algorithm = der(0x30, oid("1.2.840.10045.4.3.2"))
+    key = der(0x30, der(0x30, oid("1.2.840.10045.2.1") + oid("1.2.840.10045.3.1.7"))
+              + der(0x03, b"\0\x04" + bytes(range(64))))
+    tbs = der(0xA0, der(0x02, b"\x02")) + der(0x02, serial) + algorithm + issuer
+    tbs += der(0x30, not_before + not_after) + subject + key
+    names = b"".join(der(0x82, d) for d in dns) + b"".join(der(0x87, ip) for ip in ips)
+    if names:
+        san = der(0x30, oid("2.5.29.17") + der(0x04, der(0x30, names)))
+        tbs += der(0xA3, der(0x30, san))
+    return der(0x30, der(0x30, tbs) + algorithm + der(0x03, b"\0" + der(0x30, bytes(8))))
+
+
+def certificate_message(chain):
+    entries = b"".join(struct.pack("!I", len(c))[1:] + c for c in chain)
+    return handshake(struct.pack("!I", len(entries))[1:] + entries, 11)
+
+
+CN, O, OU, C, L = "2.5.4.3", "2.5.4.10", "2.5.4.11", "2.5.4.6", "2.5.4.7"
+UTF8, PRINTABLE, TELETEX, IA5, BMP = 0x0C, 0x13, 0x14, 0x16, 0x1E
+
+
+def certificate_fixtures():
+    ca = name([(C, PRINTABLE, b"US")], [(O, PRINTABLE, b"Fixture Trust")], [(CN, UTF8, b"Fixture Root CA")])
+    intermediate_name = name(
+        [(C, PRINTABLE, b"US")], [(O, PRINTABLE, b"Fixture Trust")],
+        [(OU, UTF8, b"Issuing"), (CN, UTF8, b"Fixture Issuing CA 1")])
+    intermediate = certificate(
+        b"\x01", ca, intermediate_name, der(0x17, b"200101000000Z"), der(0x18, b"20501231235959Z"))
+    leaf_name = name(
+        [(C, PRINTABLE, b"DE")], [(L, TELETEX, b"M\xfcnchen")],
+        [(O, UTF8, "Beispiel, \"Gr\u00fcn\" + Co <AG>;".encode())],
+        [(O, BMP, "\u00e9t\u00e9".encode("utf-16-be"))],
+        [("1.2.840.113549.1.9.1", IA5, b"ops@example.test")],
+        [("1.3.6.1.4.1.55555.1", UTF8, b"private")],
+        [(CN, UTF8, b" #www.example.test ")])
+    leaf = certificate(
+        b"\x00\x8f\x3a\x10\x42", intermediate_name, leaf_name,
+        der(0x17, b"250301120000Z"), der(0x17, b"260301120000Z"),
+        dns=[b"www.example.test", b"example.test", b"*.cdn.example.test"],
+        ips=[bytes([192, 0, 2, 44]), bytes.fromhex("20010db8000000000000000000000044")])
+
+    client = record(client_hello(server_name("www.example.test")))
+    reply = record(server_hello() + certificate_message([leaf, intermediate]))
+    pcap(DATA / "certificates.pcap", connection([client], [reply]))
+
+    # One certificate that does not parse keeps its place in the chain.
+    broken = record(server_hello() + certificate_message([leaf, b"\x30\x03\x02\x01"]))
+    pcap(DATA / "certificate_malformed.pcap", connection([client], [broken]))
 
 
 def idle_fixtures():
