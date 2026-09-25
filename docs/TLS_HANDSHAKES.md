@@ -233,8 +233,8 @@ WHERE server_certificates IS NOT NULL;
 | `san_ip` | subjectAltName IP addresses: dotted IPv4, RFC 5952 IPv6. |
 | `ja4x`, `ja4x_r` | JA4X certificate fingerprint and its raw form. **FoxIO License 1.1**, see [NOTICE](../NOTICE). See below. |
 | `sha1`, `sha256` | The whole DER certificate's hashes as lowercase hex, which is what certificate blocklists such as abuse.ch SSLBL key on. |
-| `signature_algorithm`, `public_key_algorithm` | As `openssl x509 -text` prints them: `sha256WithRSAEncryption`, `ecdsa-with-SHA256`, `rsaEncryption`, `id-ecPublicKey`, `ED25519`. An algorithm OpenSSL would print by number is its dotted OID. |
-| `public_key_bits` | RSA modulus or DSA prime size, or an EC curve's size, as OpenSSL's `Public-Key: (N bit)`. NULL for other keys, an unknown curve, or a key body that does not parse. |
+| `signature_algorithm`, `public_key_algorithm` | As `openssl x509 -text` prints them: `sha256WithRSAEncryption`, `ecdsa-with-SHA256`, `rsaEncryption`, `id-ecPublicKey`, `ED25519`. The names come from a table of about 45 RSA, RSA-PSS, DSA, ECDSA, EdDSA, SHA-3, SM2 and GOST algorithms, each checked against OpenSSL 3.0.13; any other algorithm is its dotted OID, even where OpenSSL has a name. |
+| `public_key_bits` | RSA or RSA-PSS modulus size, DSA prime size, or a named EC curve's size, as OpenSSL's `Public-Key: (N bit)`. NULL for other keys, an unknown or explicitly specified curve, or a key body that does not parse. |
 | `public_key_curve` | An EC key's named curve as OpenSSL's `ASN1 OID` line prints it, such as `prime256v1` or `secp384r1`; an unknown curve is its OID. |
 | `is_ca`, `path_length` | basicConstraints' cA flag and pathLenConstraint. `is_ca` is NULL without the extension; `path_length` is NULL without a constraint. |
 | `key_usage` | keyUsage bits by their RFC 5280 names, in bit order: `digitalSignature`, `nonRepudiation`, `keyEncipherment`, `dataEncipherment`, `keyAgreement`, `keyCertSign`, `cRLSign`, `encipherOnly`, `decipherOnly`. NULL without the extension. |
@@ -244,6 +244,12 @@ The algorithms and curve use OpenSSL's names so they can be read beside `openssl
 -text`; the usage lists use RFC 5280's, which are identifiers rather than prose (OpenSSL
 prints `TLS Web Server Authentication` for `serverAuth`). None of this is verified: a key
 is described, not checked, and an RSA modulus is sized without being tested.
+
+These fields only add to a certificate, so none of them can make it malformed. An
+algorithm or key that does not parse leaves its fields NULL. A basicConstraints, keyUsage
+or extendedKeyUsage that is malformed or repeated, which RFC 5280 forbids, leaves that
+field NULL too, since neither copy is more believable. Only more than `max_list_entries`
+purposes is a limit. The hashes are computed only when a certificate column is projected.
 
 Names follow RFC 4514 and match `openssl x509 -nameopt RFC2253,-esc_msb` character for
 character, with one exception. Attribute types in RFC 4514's own table use its short

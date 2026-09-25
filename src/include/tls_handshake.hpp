@@ -36,8 +36,9 @@ struct TlsHandshakeLimits {
 	// cap bounds the search for a hello in a stream that does not begin with one.
 	size_t max_tunnel_prefix_bytes = 8 * 1024;
 	// Fills a parsed certificate's sha1 and sha256 from its DER. This library has
-	// no hash of its own; the extension supplies DuckDB's. Left unset, they stay
-	// empty. Not a limit, but it travels with them to every certificate parse.
+	// no hash of its own; the extension supplies DuckDB's, and only when a
+	// certificate column is projected. Left unset, they stay empty. Not a limit,
+	// but it travels with them to every certificate parse.
 	void (*certificate_digest)(const uint8_t *der, size_t size, X509Certificate &out) = nullptr;
 };
 

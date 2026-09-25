@@ -345,13 +345,22 @@ void TestAlgorithmsAndKeys() {
 	assert(cert.signature_algorithm == "1.2.3.5" && cert.public_key_algorithm == "ED25519");
 	assert(cert.public_key_bits == 0);
 
-	// The key info must be framed: an algorithm, then a BIT STRING.
+	// Describing the key and algorithm only adds fields, so a key info or an
+	// algorithm that does not parse leaves them unknown, and the rest stands.
 	Spec broken;
 	broken.key = Tlv(0x30, Tlv(0x03, {0x00}));
-	assert(Malformed(broken));
+	cert = Ok(broken);
+	assert(cert.public_key_algorithm.empty() && cert.subject == "CN=www.example.com,O=Example Inc.,C=US");
 	broken = Spec();
 	broken.algorithm = Tlv(0x30, Tlv(0x05, {}));
-	assert(Malformed(broken));
+	cert = Ok(broken);
+	assert(cert.signature_algorithm.empty() && cert.public_key_algorithm == "id-ecPublicKey");
+
+	// RSASSA-PSS keys have the RSA body, so they are sized the same way.
+	spec.key = Tlv(0x30, Cat({Tlv(0x30, Oid({1, 2, 840, 113549, 1, 1, 10})),
+	                          Tlv(0x03, Cat({{0x00}, Tlv(0x30, Cat({Tlv(0x02, modulus), Tlv(0x02, {1, 0, 1})}))}))}));
+	cert = Ok(spec);
+	assert(cert.public_key_algorithm == "rsassaPss" && cert.public_key_bits == 2041);
 }
 
 void TestConstraintsAndUsage() {
@@ -367,11 +376,13 @@ void TestConstraintsAndUsage() {
 	spec.extensions = {Extension(basic, Tlv(0x30, Cat({Tlv(0x01, {0xFF}), Tlv(0x02, {0x00, 0x80})})))};
 	cert = Ok(spec);
 	assert(cert.is_ca && cert.has_path_length && cert.path_length == 128);
-	// A negative or oversized path length is malformed.
+	// A negative or oversized path length leaves basicConstraints unknown; these
+	// extensions only add fields, so the certificate itself still parses.
 	spec.extensions = {Extension(basic, Tlv(0x30, Cat({Tlv(0x01, {0xFF}), Tlv(0x02, {0x80})})))};
-	assert(Malformed(spec));
+	cert = Ok(spec);
+	assert(!cert.has_basic_constraints && !cert.is_ca && !cert.has_path_length);
 	spec.extensions = {Extension(basic, Tlv(0x30, Tlv(0x02, {1, 0, 0, 0, 0})))};
-	assert(Malformed(spec));
+	assert(!Ok(spec).has_basic_constraints);
 
 	// keyUsage bits in bit order, over two octets for decipherOnly.
 	spec.extensions = {Extension(usage, Tlv(0x03, {0x07, 0x86, 0x80}))};
@@ -382,27 +393,34 @@ void TestConstraintsAndUsage() {
 	cert = Ok(spec);
 	assert(cert.has_key_usage && cert.key_usage.empty());
 	spec.extensions = {Extension(usage, Tlv(0x03, {0x08, 0xFF}))};
-	assert(Malformed(spec));
+	cert = Ok(spec);
+	assert(!cert.has_key_usage && cert.key_usage.empty());
 
 	// Named purposes, then an unnamed one by OID.
 	spec.extensions = {Extension(
 	    purposes, Tlv(0x30, Cat({Oid({1, 3, 6, 1, 5, 5, 7, 3, 1}), Oid({2, 5, 29, 37, 0}), Oid({1, 2, 3})})))};
 	cert = Ok(spec);
 	assert((cert.extended_key_usage == std::vector<std::string> {"serverAuth", "anyExtendedKeyUsage", "1.2.3"}));
-	// RFC 5280 requires at least one purpose.
+	// RFC 5280 requires at least one purpose, and each must be an OID.
 	spec.extensions = {Extension(purposes, Tlv(0x30, {}))};
-	assert(Malformed(spec));
+	assert(!Ok(spec).has_extended_key_usage);
+	spec.extensions = {Extension(purposes, Tlv(0x30, Cat({Oid({1, 2, 3}), Tlv(0x05, {})})))};
+	cert = Ok(spec);
+	assert(!cert.has_extended_key_usage && cert.extended_key_usage.empty());
 	// More purposes than the limit is over the limit, as SAN entries are.
 	spec.extensions = {Extension(purposes, Tlv(0x30, Cat({Oid({1, 2, 3}), Oid({1, 2, 4}), Oid({1, 2, 5})})))};
 	X509Certificate out;
 	assert(Parse(Certificate(spec), out, 2) == X509Result::OVER_LIMIT);
 	assert(Parse(Certificate(spec), out, 3) == X509Result::OK && out.extended_key_usage.size() == 3);
 
-	// Each of these extensions twice is malformed.
+	// Each of these twice is unknown: RFC 5280 forbids it, and neither copy is
+	// more believable. A third copy does not bring it back.
 	for (const auto &oid : {basic, usage, purposes}) {
 		const Bytes value = oid == basic ? Tlv(0x30, {}) : oid == usage ? Tlv(0x03, {0x00}) : Tlv(0x30, Oid({1, 2}));
-		spec.extensions = {Extension(oid, value), Extension(oid, value)};
-		assert(Malformed(spec));
+		spec.extensions = {Extension(oid, value), Extension(oid, value), Extension(oid, value)};
+		cert = Ok(spec);
+		assert(!cert.has_basic_constraints && !cert.has_key_usage && !cert.has_extended_key_usage);
+		assert(cert.key_usage.empty() && cert.extended_key_usage.empty());
 	}
 }
 

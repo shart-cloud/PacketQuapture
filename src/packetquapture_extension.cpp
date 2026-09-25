@@ -1912,25 +1912,31 @@ struct StreamGlobalState : public CaptureGlobalState {
 	bool decode_dns = false;
 };
 
+// read_tls columns that hold certificate structs.
+static const column_t TLS_SERVER_CERTIFICATES = 50;
+static const column_t TLS_CLIENT_CERTIFICATES = 52;
+
 // SHA-1 and SHA-256 of a certificate's DER, for the parser, which has no hash
 // of its own.
 static void TlsCertificateDigest(const uint8_t *der, size_t size, packetquapture::X509Certificate &out) {
-	const std::string bytes(reinterpret_cast<const char *>(der), size);
+	// SHA1State takes only a string; SHA256State reads the bytes in place.
 	duckdb_mbedtls::MbedTlsWrapper::SHA1State sha1;
-	sha1.AddString(bytes);
+	sha1.AddString(std::string(reinterpret_cast<const char *>(der), size));
 	char sha1_hex[duckdb_mbedtls::MbedTlsWrapper::SHA1_HASH_LENGTH_TEXT];
 	sha1.FinishHex(sha1_hex);
 	out.sha1.assign(sha1_hex, sizeof(sha1_hex));
 	duckdb_mbedtls::MbedTlsWrapper::SHA256State sha256;
-	sha256.AddString(bytes);
+	sha256.AddBytes(der, size);
 	char sha256_hex[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT];
 	sha256.FinishHex(sha256_hex);
 	out.sha256.assign(sha256_hex, sizeof(sha256_hex));
 }
 
-static packetquapture::TlsHandshakeAssembler NewTlsAssembler() {
+// Hashing every certificate costs a query that asks for none, so the digest is
+// supplied only when a certificate column is projected.
+static packetquapture::TlsHandshakeAssembler NewTlsAssembler(bool digest) {
 	packetquapture::TlsHandshakeLimits limits;
-	limits.certificate_digest = TlsCertificateDigest;
+	limits.certificate_digest = digest ? TlsCertificateDigest : nullptr;
 	return packetquapture::TlsHandshakeAssembler(limits);
 }
 
@@ -1949,7 +1955,9 @@ struct StreamScanState : public LocalTableFunctionState {
 	// read_tls pairs the two directions of a connection, which the transport core
 	// finishes independently, so rows can outlive the stream that produced them.
 	// The file they belong to is held with them.
-	packetquapture::TlsHandshakeAssembler tls_assembler = NewTlsAssembler();
+	packetquapture::TlsHandshakeAssembler tls_assembler;
+	// Whether tls_assembler hashes certificates, decided on the first scan call.
+	bool tls_configured = false, tls_digest = false;
 	std::vector<packetquapture::TlsHandshake> tls_pending;
 	idx_t tls_pending_index = 0;
 	string tls_pending_filename, tls_open_filename;
@@ -2288,7 +2296,7 @@ static void DnsMessagesScan(ClientContext &context, TableFunctionInput &input, D
 // read_tls reports one row per handshake, pairing the two directions of a
 // connection so the offered name and the selected parameters arrive together.
 // The key is oriented client to server whichever direction was captured.
-// One element of server_certificates.
+// One element of server_certificates and client_certificates.
 static LogicalType TlsCertificateType() {
 	child_list_t<LogicalType> fields;
 	fields.emplace_back("subject", LogicalType::VARCHAR);
@@ -2545,7 +2553,7 @@ static void SetTlsCertificates(Vector &vector, idx_t row,
 		FlatVector::SetNull(vector, row, true);
 		return;
 	}
-	const auto type = TlsCertificateType();
+	static const LogicalType type = TlsCertificateType();
 	duckdb::vector<Value> values;
 	for (const auto &certificate : chain.values) {
 		if (!certificate.parsed) {
@@ -2561,7 +2569,8 @@ static void SetTlsCertificates(Vector &vector, idx_t row,
 		           TextList(fields.san_dns), TextList(fields.san_ip),
 		           Value(Ja4Hash12(ja4x.issuer) + "_" + Ja4Hash12(ja4x.subject) + "_" + Ja4Hash12(ja4x.extensions)),
 		           Value(ja4x.issuer + "_" + ja4x.subject + "_" + ja4x.extensions), OptionalText(fields.sha1),
-		           OptionalText(fields.sha256), Value(fields.signature_algorithm), Value(fields.public_key_algorithm),
+		           OptionalText(fields.sha256), OptionalText(fields.signature_algorithm),
+		           OptionalText(fields.public_key_algorithm),
 		           fields.public_key_bits != 0 ? Value::UINTEGER(fields.public_key_bits) : Value(LogicalType::UINTEGER),
 		           OptionalText(fields.public_key_curve),
 		           fields.has_basic_constraints ? Value::BOOLEAN(fields.is_ca) : Value(LogicalType::BOOLEAN),
@@ -2792,10 +2801,10 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 	}
 	// The chain from each side's Certificate message, leaf first. An entry that
 	// did not parse is a NULL element, so positions still match the chain.
-	case 50:
+	case TLS_SERVER_CERTIFICATES:
 		SetTlsCertificates(vector, row, handshake.server_certificates);
 		break;
-	case 52:
+	case TLS_CLIENT_CERTIFICATES:
 		SetTlsCertificates(vector, row, handshake.client_certificates);
 		break;
 	// NULL unless a prefix came before TLS in a captured direction. The protocol
@@ -2836,6 +2845,14 @@ static void TlsScan(ClientContext &context, TableFunctionInput &input, DataChunk
 		return;
 	}
 	idx_t count = 0, output_bytes = 0;
+	if (!state.tls_configured) {
+		for (const auto column : global.columns) {
+			state.tls_digest =
+			    state.tls_digest || column == TLS_SERVER_CERTIFICATES || column == TLS_CLIENT_CERTIFICATES;
+		}
+		state.tls_assembler = NewTlsAssembler(state.tls_digest);
+		state.tls_configured = true;
+	}
 	while (count < STANDARD_VECTOR_SIZE && output_bytes < STREAM_OUTPUT_BATCH_BYTES) {
 		if (context.IsInterrupted()) {
 			throw InterruptException();
@@ -2896,7 +2913,7 @@ static void TlsScan(ClientContext &context, TableFunctionInput &input, DataChunk
 	if (!count) {
 		std::vector<packetquapture::TcpStream>().swap(state.streams);
 		std::vector<packetquapture::TlsHandshake>().swap(state.tls_pending);
-		state.tls_assembler = NewTlsAssembler();
+		state.tls_assembler = NewTlsAssembler(state.tls_digest);
 		state.reassembler = packetquapture::TcpReassembler();
 		state.reservation.reset();
 	}

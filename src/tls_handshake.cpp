@@ -394,15 +394,17 @@ void ParseCertificates(const std::vector<uint8_t> &body, const TlsHandshakeLimit
 		auto result = X509Result::OVER_LIMIT;
 		if (certificates.size() < limits.max_certificates && length <= limits.max_certificate_bytes) {
 			result = ParseX509Certificate(der.data(), der.size(), limits.max_list_entries, certificate.fields);
-			if (result == X509Result::OK && limits.certificate_digest != nullptr) {
-				limits.certificate_digest(der.data(), der.size(), certificate.fields);
-			}
-			const size_t text = certificate.fields.TextBytes();
+			// The hashes are hex SHA-1 and SHA-256, charged before they are made
+			// so a chain dropped for its size is not hashed.
+			const size_t text = certificate.fields.TextBytes() + (limits.certificate_digest != nullptr ? 40 + 64 : 0);
 			if (result == X509Result::OK && text > limits.max_direction_certificate_bytes - held) {
 				result = X509Result::OVER_LIMIT;
 			}
 			if (result == X509Result::OK) {
 				held += text;
+				if (limits.certificate_digest != nullptr) {
+					limits.certificate_digest(der.data(), der.size(), certificate.fields);
+				}
 			}
 		}
 		if (result == X509Result::OVER_LIMIT) {

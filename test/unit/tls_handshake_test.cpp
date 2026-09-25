@@ -747,8 +747,6 @@ void TestCertificateLimits() {
 	assert(done[0].server_certificates.values.size() == 1 && done[1].server_certificates.over_limit);
 }
 
-// JA3S fingerprints the ServerHello's legacy_version, which supported_versions
-// replaces as the negotiated version.
 // A stand-in digest: the parser has none, and the extension supplies DuckDB's.
 void FakeDigest(const uint8_t *, size_t size, X509Certificate &out) {
 	out.sha1 = "sha1:" + std::to_string(size);
@@ -795,6 +793,8 @@ void TestClientCertificates() {
 	assert(orphan.Finish().empty());
 }
 
+// JA3S fingerprints the ServerHello's legacy_version, which supported_versions
+// replaces as the negotiated version.
 void TestServerLegacyVersion() {
 	TlsHandshakeAssembler assembler;
 	assembler.Add(Stream(Key(), 1, Record(ClientHello({})), 1));

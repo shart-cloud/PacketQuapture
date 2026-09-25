@@ -28,6 +28,7 @@ Exits non-zero on any disagreement that is not a documented divergence.
 import argparse
 import collections
 import datetime
+import functools
 import ipaddress
 import json
 import os
@@ -255,6 +256,7 @@ def tshark_certificates(path):
     return messages
 
 
+@functools.lru_cache(maxsize=None)
 def openssl_names(der):
     names = []
     for option in ("-subject", "-issuer"):
@@ -286,9 +288,11 @@ OPENSSL_PURPOSES = {
 }
 
 
+@functools.lru_cache(maxsize=None)
 def openssl_details(der):
     """The fields OpenSSL prints for a certificate, in read_tls's terms. None
-    when OpenSSL cannot read it."""
+    when OpenSSL cannot read it. Cached: a capture repeats the same few
+    certificates across many connections."""
     def run(*options):
         result = subprocess.run(["openssl", "x509", "-inform", "DER", "-noout", *options], input=der,
                                 capture_output=True)
