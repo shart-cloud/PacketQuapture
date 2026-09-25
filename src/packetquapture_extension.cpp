@@ -2282,6 +2282,16 @@ static LogicalType TlsCertificateType() {
 	return LogicalType::STRUCT(std::move(fields));
 }
 
+// The tunnel that carried a handshake, when TLS did not begin a stream.
+static LogicalType TlsTunnelType() {
+	child_list_t<LogicalType> fields;
+	fields.emplace_back("protocol", LogicalType::VARCHAR);
+	fields.emplace_back("destination", LogicalType::VARCHAR);
+	fields.emplace_back("client_prefix_bytes", LogicalType::UINTEGER);
+	fields.emplace_back("server_prefix_bytes", LogicalType::UINTEGER);
+	return LogicalType::STRUCT(std::move(fields));
+}
+
 static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBindInput &input,
                                         vector<LogicalType> &types, vector<string> &names) {
 	auto result = PcapBind(context, input, types, names);
@@ -2335,7 +2345,8 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         "ja4_r",
 	         "ja4s",
 	         "ja4s_r",
-	         "server_certificates"};
+	         "server_certificates",
+	         "tunnel"};
 	const auto codes = LogicalType::LIST(LogicalType::USMALLINT);
 	const auto text = LogicalType::LIST(LogicalType::VARCHAR);
 	types = {LogicalType::VARCHAR,
@@ -2388,7 +2399,8 @@ static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBin
 	         LogicalType::VARCHAR,
 	         LogicalType::VARCHAR,
 	         LogicalType::VARCHAR,
-	         LogicalType::LIST(TlsCertificateType())};
+	         LogicalType::LIST(TlsCertificateType()),
+	         TlsTunnelType()};
 	auto &bind = result->Cast<PcapBindData>();
 	bind.types = types;
 	bind.stream_plan =
@@ -2482,7 +2494,8 @@ static idx_t TlsRowBytes(const string &filename, const packetquapture::TlsHandsh
 		certificates += 256 + fields.TextBytes();
 		certificates += 32 * (fields.san_dns.size() + fields.san_ip.size());
 	}
-	return 1024 + filename.size() + handshake.sni.size() + 32 * codes + alpn + certificates;
+	return 1024 + filename.size() + handshake.sni.size() + 32 * codes + alpn + certificates +
+	       handshake.tunnel_destination.size();
 }
 
 static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const string &filename,
@@ -2729,6 +2742,25 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 			     Value(ja4x.issuer + "_" + ja4x.subject + "_" + ja4x.extensions)}));
 		}
 		vector.SetValue(row, Value::LIST(type, values));
+		break;
+	}
+	// NULL unless a prefix came before TLS in a captured direction. The protocol
+	// is the client's reading of its own prefix when it has one, since only the
+	// client's request names the destination; otherwise the server's.
+	case 51: {
+		if (handshake.client_prefix_bytes == 0 && handshake.server_prefix_bytes == 0) {
+			FlatVector::SetNull(vector, row, true);
+			break;
+		}
+		const auto &protocol = !handshake.client_tunnel.empty() ? handshake.client_tunnel : handshake.server_tunnel;
+		vector.SetValue(row, Value::STRUCT(TlsTunnelType(),
+		                                   {protocol.empty() ? Value(LogicalType::VARCHAR) : Value(protocol),
+		                                    handshake.tunnel_destination.empty() ? Value(LogicalType::VARCHAR)
+		                                                                         : Value(handshake.tunnel_destination),
+		                                    handshake.has_client_hello ? Value::UINTEGER(handshake.client_prefix_bytes)
+		                                                               : Value(LogicalType::UINTEGER),
+		                                    handshake.has_server_hello ? Value::UINTEGER(handshake.server_prefix_bytes)
+		                                                               : Value(LogicalType::UINTEGER)}));
 		break;
 	}
 	default:

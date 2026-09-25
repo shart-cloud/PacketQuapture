@@ -246,6 +246,7 @@ def reassembly_fixtures():
     fingerprint_fixtures()
     idle_fixtures()
     certificate_fixtures()
+    tunnel_fixtures()
 
     # TCP that is not TLS at all.
     pcap(
@@ -411,6 +412,65 @@ def certificate_fixtures():
     # One certificate that does not parse keeps its place in the chain.
     broken = record(server_hello() + certificate_message([leaf, b"\x30\x03\x02\x01"]))
     pcap(DATA / "certificate_malformed.pcap", connection([client], [broken]))
+
+
+def exchange(steps, port):
+    """A SYN-anchored connection whose payloads alternate as given: each step is
+    (True, payload) client to server or (False, payload) back, in wire order."""
+    packets = [to_server(b"", 0, port, flags=0x02), to_client(b"", 0, port, flags=0x12)]
+    seq = {True: 1, False: 1}
+    for client, payload in steps:
+        packets.append((to_server if client else to_client)(payload, seq[client], port))
+        seq[client] += len(payload)
+    return packets
+
+
+def tunnel_fixtures():
+    """TLS behind SOCKS and HTTP CONNECT, one connection per client port, each
+    message in its own segment and in the order a proxy exchanges them."""
+    reply = record(server_hello())
+
+    def hello(host):
+        return record(client_hello(server_name(host)))
+
+    def socks5_address(ip, port=443):
+        return b"\x01" + bytes(ip) + struct.pack("!H", port)
+
+    packets = []
+    # SOCKS5 with RFC 1929 username and password, to a name.
+    host = b"login.live.com"
+    packets += exchange([
+        (True, b"\x05\x02\x00\x02"), (False, b"\x05\x02"),
+        (True, b"\x01\x04user\x02pw"), (False, b"\x01\x00"),
+        (True, b"\x05\x01\x00\x03" + bytes([len(host)]) + host + struct.pack("!H", 443)),
+        (False, b"\x05\x00\x00" + socks5_address([65, 55, 196, 251])),
+        (True, hello("login.live.com")), (False, reply)], port=51001)
+    # SOCKS4a, to a name.
+    packets += exchange([
+        (True, b"\x04\x01\x01\xbb\x00\x00\x00\x01bot\x00c2.example\x00"),
+        (False, b"\x00\x5a\x00\x00\x00\x00\x00\x00"),
+        (True, hello("c2.example")), (False, reply)], port=51002)
+    # HTTP CONNECT with headers on both sides.
+    packets += exchange([
+        (True, b"CONNECT proxy.example:8443 HTTP/1.1\r\nHost: proxy.example:8443\r\n\r\n"),
+        (False, b"HTTP/1.1 200 Connection established\r\nProxy-Agent: fixture\r\n\r\n"),
+        (True, hello("proxy.example")), (False, reply)], port=51003)
+    # The CTU-13 Neris botnet's shape: one stray byte before a SOCKS5 greeting.
+    # The server side is standard SOCKS5.
+    packets += exchange([
+        (True, b"\x7e"), (True, b"\x05\x01\x00"), (False, b"\x05\x00"),
+        (True, b"\x05\x01\x00" + socks5_address([65, 55, 16, 187])),
+        (False, b"\x05\x00\x00" + socks5_address([65, 55, 16, 187])),
+        (True, hello("neris.example")), (False, reply)], port=51004)
+    # Not TLS: a record header whose hello runs past its record.
+    decoy = bytearray(hello("decoy.example"))
+    decoy[5 + 4 + 2 + 32] = 0xFF
+    packets += exchange([(True, b"junk"), (False, b"ok"), (True, bytes(decoy))], port=51005)
+    # Only the client side of a SOCKS5 tunnel was captured.
+    packets += exchange([
+        (True, b"\x05\x01\x00\x05\x01\x00" + socks5_address([192, 0, 2, 9])),
+        (True, hello("one-sided.example"))], port=51006)
+    pcap(DATA / "tunnels.pcap", packets)
 
 
 def idle_fixtures():

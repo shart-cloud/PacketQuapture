@@ -74,6 +74,7 @@ one row. That is a different shape, and it needs rules the DNS reader never had.
 | `ja4`, `ja4_r` | JA4 client fingerprint and its raw form. See below. |
 | `ja4s`, `ja4s_r` | JA4S server fingerprint and its raw form. **FoxIO License 1.1**, see [NOTICE](../NOTICE). |
 | `server_certificates` | The server's certificate chain, `LIST(STRUCT(subject, issuer, serial, not_before, not_after, san_dns, san_ip, ja4x, ja4x_r))`, leaf first. NULL when no Certificate message was read, which includes every TLS 1.3 handshake. See below. |
+| `tunnel` | `STRUCT(protocol, destination, client_prefix_bytes, server_prefix_bytes)` when bytes came before TLS in a captured direction, such as a SOCKS or HTTP CONNECT exchange; NULL when TLS began every captured stream. See below. |
 
 ## Hello lists
 
@@ -129,6 +130,7 @@ whatever the status. It is `[]` when there are none and is never NULL.
 | `client_hello_invalid`, `server_hello_invalid` | That hello was seen but failed to parse. |
 | `client_list_malformed`, `server_list_malformed` | At least one of that side's lists is NULL because it was malformed. On the server side this includes a malformed `supported_versions`, which leaves `negotiated_version` NULL. |
 | `server_certificate_malformed` | The Certificate message was malformed, so `server_certificates` is NULL, or at least one certificate in it did not parse and is a NULL element. |
+| `client_tunnel_unrecognized`, `server_tunnel_unrecognized` | Bytes came before TLS in that direction but did not parse exactly as a known tunnel. The TLS columns are still sound; see below. |
 
 ## JA3 and JA3S
 
@@ -274,6 +276,39 @@ an error on the Neris capture.
 `scripts/compare_tls_tshark.py --ja4x <rust ja4x binary>` compares every certificate's
 `ja4x` and `ja4x_r` with the rust reference.
 
+## Tunnels
+
+A stream that does not begin with a hello is searched for one in its first 1 KiB
+(`max_tunnel_prefix_bytes`). Past the start the test is stricter than at it: a whole
+ClientHello or ServerHello must sit inside the first record found, and must parse.
+Bytes that merely look like a record header are not TLS, and parsing one record per
+candidate bounds the search.
+
+The bytes before the hello are then read as a tunnel, and must parse exactly, with no
+byte left over:
+
+| `protocol` | Client prefix | Server prefix |
+| --- | --- | --- |
+| `socks5` | RFC 1928 greeting, RFC 1929 username and password if offered, CONNECT request | Method choice, RFC 1929 status if it chose that method, success reply |
+| `socks4`, `socks4a` | CONNECT request, and for 4a (address `0.0.0.x`) a name | Granted reply; always `socks4`, since the reply cannot tell 4 from 4a |
+| `http_connect` | `CONNECT target HTTP/1.x` and headers, ending in a blank line | A `2xx` HTTP/1.x status line and headers |
+
+- `protocol` is the client's reading when its prefix was recognised, since only the
+  client's request names the destination, and otherwise the server's. It is NULL when
+  neither side was recognised.
+- `destination` is the client's CONNECT target as `host:port`, with IPv6 in brackets and
+  names escaped as `tls_sni` is. It is NULL unless the client's prefix was recognised.
+- `client_prefix_bytes` and `server_prefix_bytes` count the bytes before TLS in each
+  direction: 0 when TLS began it, NULL when that direction was not captured.
+- A prefix that is not recognised still leaves the row sound, because its hello parsed
+  in full. The row gets `client_tunnel_unrecognized` or `server_tunnel_unrecognized`.
+
+On the CTU-13 Neris capture this reads all 63 handshakes tunnelled through
+`212.117.171.138:65500`, which was the last gap against tshark there. The server side is
+standard SOCKS5. The client sends one stray byte, `0x7e`, before an otherwise standard
+greeting, so its prefix is unrecognised and no destination is claimed. Other stream-start
+checks are unchanged: a stream that begins with a TLS record is never searched.
+
 ## `session_resumed` is often NULL
 
 A server resumed a session when it echoed back a non-empty session id the client offered.
@@ -312,6 +347,7 @@ Bounded by `TlsHandshakeLimits`, alongside the transport-wide
 | `max_certificates` | 16 | Certificates in one Certificate message. |
 | `max_certificate_bytes` | 32 KiB | One certificate. |
 | `max_direction_certificate_bytes` | 256 KiB | Parsed certificate text one direction holds across its handshakes. |
+| `max_tunnel_prefix_bytes` | 1 KiB | Bytes searched for a hello in a stream that does not begin with one. |
 
 Reaching a limit sets `reassembly_status` to `limit` rather than failing the query. Directions
 waiting for a peer hold parsed fields, not payload bytes, and at most
@@ -343,6 +379,7 @@ Handshakes can still go missing on very busy captures. The transport core tracks
 becomes its own one-packet stream with status `limit`. This reader cannot tell whether
 such a stream carried TLS, so it reports nothing for it.
 
-TLS carried inside another protocol, such as a SOCKS tunnel, is not read: a stream
-must begin with a TLS record. tshark does decode these, so they show up in
-`compare_tls_tshark.py` as tshark hellos without a `read_tls` row.
+Tunnels other than SOCKS and HTTP CONNECT are read, but not named. STARTTLS, where TLS
+follows a plaintext SMTP, IMAP or similar exchange, is found the same way when that
+exchange fits in 1 KiB, and is reported with an unrecognised prefix. TLS after a longer
+prefix is not found.

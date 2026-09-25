@@ -424,6 +424,8 @@ bool DecodeTime(const Element &element, int64_t &out) {
 	return true;
 }
 
+} // namespace
+
 std::string FormatIp(const uint8_t *p, size_t size) {
 	char text[8];
 	std::string out;
@@ -466,6 +468,8 @@ std::string FormatIp(const uint8_t *p, size_t size) {
 	}
 	return out;
 }
+
+namespace {
 
 // SubjectAltName ::= GeneralNames, a SEQUENCE OF GeneralName. Only dNSName and
 // iPAddress are kept; the other forms are skipped.

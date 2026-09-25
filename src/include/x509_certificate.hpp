@@ -43,6 +43,9 @@ struct X509Certificate {
 	}
 };
 
+// An IPv4 (size 4) or IPv6 (size 16) address as text: dotted IPv4, RFC 5952 IPv6.
+std::string FormatIp(const uint8_t *p, size_t size);
+
 enum class X509Result { OK, MALFORMED, OVER_LIMIT };
 
 // Parses exactly one certificate filling data. OVER_LIMIT means it is well formed

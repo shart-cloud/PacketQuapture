@@ -1,7 +1,9 @@
 #include "tls_handshake.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <iterator>
+#include <string>
 
 namespace packetquapture {
 namespace {
@@ -426,6 +428,189 @@ void ClearHello(TlsHandshake &handshake) {
 	handshake.server_supported_versions = TlsList<uint16_t>();
 }
 
+// The hello a record at offset begins, if one is there in full and parses: 1
+// for a ClientHello, 2 for a ServerHello, 0 otherwise. Used only to find TLS
+// after a tunnel's prefix, so it asks more than the stream-start parse does:
+// the whole hello inside the first record. Parsing one record bounds the cost
+// of each candidate offset.
+int HelloAt(const std::vector<uint8_t> &data, size_t offset, const TlsHandshakeLimits &limits) {
+	if (data.size() < offset || data.size() - offset < RECORD_HEADER_LENGTH + 4) {
+		return 0;
+	}
+	const uint8_t *header = data.data() + offset;
+	const size_t length = static_cast<size_t>((header[3] << 8U) | header[4]);
+	if (header[0] != RECORD_HANDSHAKE || header[1] != 0x03 || header[2] > 0x04 || length > MAX_RECORD_LENGTH ||
+	    length > data.size() - offset - RECORD_HEADER_LENGTH) {
+		return 0;
+	}
+	const uint8_t *message = header + RECORD_HEADER_LENGTH;
+	const uint8_t type = message[0];
+	const size_t message_length = (static_cast<size_t>(message[1]) << 16U) | (message[2] << 8U) | message[3];
+	if ((type != HANDSHAKE_CLIENT_HELLO && type != HANDSHAKE_SERVER_HELLO) || length < 4 ||
+	    message_length > length - 4) {
+		return 0;
+	}
+	const std::vector<uint8_t> body(message + 4, message + 4 + message_length);
+	TlsHandshake hello;
+	std::vector<uint8_t> session_id;
+	const bool client = type == HANDSHAKE_CLIENT_HELLO;
+	return ParseHello(body, client, limits, hello, session_id) ? (client ? 1 : 2) : 0;
+}
+
+// Reads a SOCKS address of the given type and the port after it as host:port.
+// Names are peer-supplied bytes, escaped as server names are.
+bool SocksAddress(Reader &reader, uint8_t type, std::string &out) {
+	std::string host;
+	if (type == 1 || type == 4) {
+		std::vector<uint8_t> address;
+		if (!reader.TakeBytes(type == 1 ? 4 : 16, address)) {
+			return false;
+		}
+		host = type == 1 ? FormatIp(address.data(), 4) : "[" + FormatIp(address.data(), 16) + "]";
+	} else if (type == 3) {
+		const size_t length = reader.U8();
+		if (reader.Overrun() || length == 0 || !reader.Take(length, host)) {
+			return false;
+		}
+		host = EscapeTlsText(host);
+	} else {
+		return false;
+	}
+	const uint16_t port = reader.U16();
+	if (reader.Overrun()) {
+		return false;
+	}
+	out = host + ":" + std::to_string(port);
+	return true;
+}
+
+// A NUL-terminated SOCKS4 field. The terminator is consumed.
+bool SocksString(Reader &reader, std::string &out) {
+	out.clear();
+	while (true) {
+		const uint8_t byte = reader.U8();
+		if (reader.Overrun()) {
+			return false;
+		}
+		if (byte == 0) {
+			return true;
+		}
+		out.push_back(static_cast<char>(byte));
+	}
+}
+
+// An HTTP message head that ends exactly at size: the first blank line closes it.
+bool HttpHeadEndsAt(const std::string &text) {
+	const size_t end = text.find("\r\n\r\n");
+	return end != std::string::npos && end + 4 == text.size();
+}
+
+// The client side of a tunnel before its ClientHello, parsed exactly: every
+// byte must belong to the exchange. RFC 1928 SOCKS5 with no authentication or
+// RFC 1929 username and password, SOCKS4 and 4a, and HTTP CONNECT.
+void ClassifyClientPrefix(const uint8_t *data, size_t size, std::string &tunnel, std::string &destination) {
+	if (size >= 2 && data[0] == 5) {
+		Reader reader(data, size);
+		reader.U8();
+		const size_t count = reader.U8();
+		std::vector<uint8_t> methods;
+		if (count == 0 || !reader.TakeBytes(count, methods)) {
+			return;
+		}
+		if (reader.Remaining() > 0 && data[size - reader.Remaining()] == 1 &&
+		    std::find(methods.begin(), methods.end(), 2) != methods.end()) {
+			reader.U8();
+			const size_t user = reader.U8();
+			if (reader.Overrun() || user == 0 || !reader.Skip(user)) {
+				return;
+			}
+			const size_t password = reader.U8();
+			if (reader.Overrun() || password == 0 || !reader.Skip(password)) {
+				return;
+			}
+		}
+		// Only CONNECT carries a stream that TLS could follow.
+		std::string address;
+		if (reader.U8() != 5 || reader.U8() != 1 || reader.U8() != 0 || reader.Overrun() ||
+		    !SocksAddress(reader, reader.U8(), address) || reader.Remaining() != 0) {
+			return;
+		}
+		tunnel = "socks5";
+		destination = address;
+		return;
+	}
+	if (size >= 9 && data[0] == 4 && data[1] == 1) {
+		Reader reader(data + 2, size - 2);
+		const uint16_t port = reader.U16();
+		std::vector<uint8_t> ip;
+		std::string user, host;
+		if (!reader.TakeBytes(4, ip) || !SocksString(reader, user)) {
+			return;
+		}
+		// SOCKS4a: an address of 0.0.0.x with x nonzero means a name follows.
+		const bool named = ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] != 0;
+		if (named && (!SocksString(reader, host) || host.empty())) {
+			return;
+		}
+		if (reader.Remaining() != 0) {
+			return;
+		}
+		tunnel = named ? "socks4a" : "socks4";
+		destination = (named ? EscapeTlsText(host) : FormatIp(ip.data(), 4)) + ":" + std::to_string(port);
+		return;
+	}
+	const std::string text(reinterpret_cast<const char *>(data), size);
+	const size_t line_end = text.find("\r\n");
+	if (text.compare(0, 8, "CONNECT ") != 0 || line_end == std::string::npos || !HttpHeadEndsAt(text)) {
+		return;
+	}
+	const std::string line = text.substr(8, line_end - 8);
+	const size_t space = line.find(' ');
+	if (space == 0 || space == std::string::npos ||
+	    (line.compare(space, std::string::npos, " HTTP/1.0") != 0 &&
+	     line.compare(space, std::string::npos, " HTTP/1.1") != 0)) {
+		return;
+	}
+	tunnel = "http_connect";
+	destination = EscapeTlsText(line.substr(0, space));
+}
+
+// The server side before its ServerHello: a SOCKS5 method choice, the RFC 1929
+// status if it chose username and password, and a successful reply; a granted
+// SOCKS4 reply; or a 2xx HTTP response head. A SOCKS4 reply cannot tell 4 from
+// 4a, so it is reported as socks4.
+void ClassifyServerPrefix(const uint8_t *data, size_t size, std::string &tunnel) {
+	if (size >= 2 && data[0] == 5) {
+		Reader reader(data, size);
+		reader.U8();
+		const uint8_t method = reader.U8();
+		if (method != 0 && method != 2) {
+			return;
+		}
+		if (method == 2 && (reader.U8() != 1 || reader.U8() != 0)) {
+			return;
+		}
+		std::string address;
+		if (reader.U8() != 5 || reader.U8() != 0 || reader.U8() != 0 || reader.Overrun() ||
+		    !SocksAddress(reader, reader.U8(), address) || reader.Remaining() != 0) {
+			return;
+		}
+		tunnel = "socks5";
+		return;
+	}
+	if (size == 8 && data[0] == 0 && data[1] == 0x5A) {
+		tunnel = "socks4";
+		return;
+	}
+	const std::string text(reinterpret_cast<const char *>(data), size);
+	if (text.size() >= 13 && (text.compare(0, 9, "HTTP/1.0 ") == 0 || text.compare(0, 9, "HTTP/1.1 ") == 0) &&
+	    text[9] == '2' && std::isdigit(static_cast<unsigned char>(text[10])) &&
+	    std::isdigit(static_cast<unsigned char>(text[11])) && (text[12] == ' ' || text[12] == '\r') &&
+	    HttpHeadEndsAt(text)) {
+		tunnel = "http_connect";
+	}
+}
+
 } // namespace
 
 TlsHandshakeAssembler::TlsHandshakeAssembler(TlsHandshakeLimits limits_p) : limits(limits_p) {
@@ -457,13 +642,43 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 	if (chunk == nullptr) {
 		return direction;
 	}
+	const Direction base = direction;
+	ParseRecords(stream, *chunk, 0, limits, direction);
+	if (!direction.handshakes.empty()) {
+		return direction;
+	}
+	// No hello where the stream begins. A tunnel may have carried the handshake,
+	// so look for one after a short prefix, and say what that prefix was.
+	const auto &data = chunk->data;
+	const size_t last = std::min(limits.max_tunnel_prefix_bytes, data.size());
+	for (size_t start = 1; start <= last; ++start) {
+		const int hello = HelloAt(data, start, limits);
+		if (hello == 0) {
+			continue;
+		}
+		direction = base;
+		ParseRecords(stream, *chunk, start, limits, direction);
+		direction.prefix_bytes = static_cast<uint32_t>(start);
+		if (hello == 1) {
+			ClassifyClientPrefix(data.data(), start, direction.tunnel, direction.tunnel_destination);
+		} else {
+			ClassifyServerPrefix(data.data(), start, direction.tunnel);
+		}
+		return direction;
+	}
+	return direction;
+}
 
+// Reads the TLS records of one direction from start, where the first record
+// begins, collecting its hellos and the server's certificates.
+void TlsHandshakeAssembler::ParseRecords(const TcpStream &stream, const TcpStreamChunk &chunk, size_t start,
+                                         const TlsHandshakeLimits &limits, Direction &direction) {
 	std::vector<uint8_t> handshake_bytes;
 	std::vector<std::pair<size_t, size_t>> record_spans; // offset in chunk, length contributed
-	size_t offset = 0;
+	size_t offset = start;
 	bool truncated = false;
-	while (chunk->data.size() - offset >= RECORD_HEADER_LENGTH) {
-		const uint8_t *header = chunk->data.data() + offset;
+	while (chunk.data.size() - offset >= RECORD_HEADER_LENGTH) {
+		const uint8_t *header = chunk.data.data() + offset;
 		const uint8_t type = header[0];
 		const uint32_t length = static_cast<uint32_t>((header[3] << 8U) | header[4]);
 		if (header[1] != 0x03 || header[2] > 0x04 || length == 0 || length > MAX_RECORD_LENGTH) {
@@ -473,7 +688,7 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 			// Everything after this is encrypted; stop rather than parse noise.
 			break;
 		}
-		if (length > chunk->data.size() - offset - RECORD_HEADER_LENGTH) {
+		if (length > chunk.data.size() - offset - RECORD_HEADER_LENGTH) {
 			truncated = true;
 			break;
 		}
@@ -482,13 +697,13 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 			continue;
 		}
 		const size_t begin = offset + RECORD_HEADER_LENGTH;
-		handshake_bytes.insert(handshake_bytes.end(), chunk->data.begin() + static_cast<long>(begin),
-		                       chunk->data.begin() + static_cast<long>(begin + length));
+		handshake_bytes.insert(handshake_bytes.end(), chunk.data.begin() + static_cast<long>(begin),
+		                       chunk.data.begin() + static_cast<long>(begin + length));
 		record_spans.push_back(std::make_pair(begin, static_cast<size_t>(length)));
 		offset += RECORD_HEADER_LENGTH + length;
 	}
 	if (handshake_bytes.empty()) {
-		return direction;
+		return;
 	}
 
 	// Map an offset in the concatenated handshake bytes back to the chunk, so
@@ -552,7 +767,7 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 			}
 			const auto span = locator.Locate(message_offset, length + 4);
 			if (span.second > 0) {
-				const auto provenance = chunk->Provenance(span.first, span.second);
+				const auto provenance = chunk.Provenance(span.first, span.second);
 				handshake.first = provenance.first;
 				handshake.last = provenance.second;
 			}
@@ -569,7 +784,7 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 			ParseCertificates(body, limits, certificate_bytes, handshake);
 			const auto span = locator.Locate(message_offset, length + 4);
 			if (span.second > 0) {
-				const auto provenance = chunk->Provenance(span.first, span.second);
+				const auto provenance = chunk.Provenance(span.first, span.second);
 				if (provenance.second.number > handshake.last.number) {
 					handshake.last = provenance.second;
 				}
@@ -590,7 +805,6 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 		// Only a ServerHello was seen, so this direction runs server to client.
 		direction.oriented_key = stream.key.Reverse();
 	}
-	return direction;
 }
 
 // Joins the two directions by position: the nth ClientHello of a connection is
@@ -623,6 +837,9 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 			handshake.last = from_client->last;
 			handshake.status = from_client->status;
 			handshake.error = from_client->error;
+			handshake.client_prefix_bytes = client.prefix_bytes;
+			handshake.client_tunnel = client.tunnel;
+			handshake.tunnel_destination = client.tunnel_destination;
 		}
 		if (from_server != nullptr) {
 			handshake.has_server_hello = true;
@@ -636,6 +853,8 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 			handshake.server_alpn = from_server->server_alpn;
 			handshake.server_supported_versions = from_server->server_supported_versions;
 			handshake.server_certificates = from_server->server_certificates;
+			handshake.server_prefix_bytes = server->prefix_bytes;
+			handshake.server_tunnel = server->tunnel;
 			if (from_client == nullptr) {
 				handshake.first = from_server->first;
 				handshake.last = from_server->last;
@@ -716,6 +935,14 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 			if (unparsed) {
 				handshake.warnings.push_back("server_certificate_malformed");
 			}
+		}
+		// Bytes before TLS that parsed as no known tunnel. The row is still
+		// reported: its hello parsed in full, so the TLS fields are sound.
+		if (from_client != nullptr && client.prefix_bytes > 0 && client.tunnel.empty()) {
+			handshake.warnings.push_back("client_tunnel_unrecognized");
+		}
+		if (from_server != nullptr && server->prefix_bytes > 0 && server->tunnel.empty()) {
+			handshake.warnings.push_back("server_tunnel_unrecognized");
 		}
 		result.push_back(handshake);
 	}
