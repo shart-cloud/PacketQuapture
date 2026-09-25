@@ -73,7 +73,7 @@ one row. That is a different shape, and it needs rules the DNS reader never had.
 | `ja3s`, `ja3s_full` | JA3S server fingerprint and the string it hashes. |
 | `ja4`, `ja4_r` | JA4 client fingerprint and its raw form. See below. |
 | `ja4s`, `ja4s_r` | JA4S server fingerprint and its raw form. **FoxIO License 1.1**, see [NOTICE](../NOTICE). |
-| `server_certificates` | The server's certificate chain, `LIST(STRUCT(subject, issuer, serial, not_before, not_after, san_dns, san_ip))`, leaf first. NULL when no Certificate message was read, which includes every TLS 1.3 handshake. See below. |
+| `server_certificates` | The server's certificate chain, `LIST(STRUCT(subject, issuer, serial, not_before, not_after, san_dns, san_ip, ja4x, ja4x_r))`, leaf first. NULL when no Certificate message was read, which includes every TLS 1.3 handshake. See below. |
 
 ## Hello lists
 
@@ -226,6 +226,7 @@ WHERE server_certificates IS NOT NULL;
 | `not_before`, `not_after` | The validity period, UTC. |
 | `san_dns` | subjectAltName DNS names, escaped as `tls_sni` is. |
 | `san_ip` | subjectAltName IP addresses: dotted IPv4, RFC 5952 IPv6. |
+| `ja4x`, `ja4x_r` | JA4X certificate fingerprint and its raw form. **FoxIO License 1.1**, see [NOTICE](../NOTICE). See below. |
 
 Names follow RFC 4514 and match `openssl x509 -nameopt RFC2253,-esc_msb` character for
 character, with one exception. Attribute types in RFC 4514's own table use its short
@@ -251,6 +252,27 @@ peer can hold.
 `scripts/compare_tls_tshark.py` compares chains with tshark field by field, and names
 with OpenSSL's rendering of the DER that tshark extracted. On the whole CTU-13 Neris
 capture it compared 832 values with no disagreements.
+
+## JA4X
+
+`ja4x` fingerprints how a certificate was built, not what it says: the attribute types
+of its issuer and subject names and the extension types it carries, each in wire order.
+Two certificates from the same issuing software tend to share it, whatever their names.
+`ja4x_r` is `issuer_subject_extensions`, each part the comma-joined hex of the DER OID
+content octets, and `ja4x` replaces each part with the first 12 hex digits of its
+SHA-256, or `000000000000` for an empty part.
+
+The definition is FoxIO-LLC/ja4 at `16b96d9`, which has no written specification for
+JA4X, only its two reference implementations. `ja4x` equals the rust one (`rust/ja4x`)
+on every certificate checked: 135 certificates, including this machine's CA bundle,
+the fixtures and the CTU-13 Neris capture. The python one (`python/ja4x.py`) differs in
+three ways, all reference bugs: it writes an empty part as the hash of an empty
+string, `e3b0c44298fc`; it counts RDNs rather than attributes, so a multi-valued RDN
+shifts every later OID and it misses later certificates in the chain; and it stops with
+an error on the Neris capture.
+
+`scripts/compare_tls_tshark.py --ja4x <rust ja4x binary>` compares every certificate's
+`ja4x` and `ja4x_r` with the rust reference.
 
 ## `session_resumed` is often NULL
 
@@ -311,9 +333,8 @@ that would have matched it.
 
 ## Not yet implemented
 
-JA4X, the certificate fingerprint. It is part of JA4+ and under the same license as
-JA4S. Other certificate fields, such as the public key, extensions beyond
-subjectAltName, and client certificates. DTLS and QUIC hellos, the `d` and `q` JA4
+Other certificate fields, such as the public key, extensions beyond subjectAltName,
+and client certificates. DTLS and QUIC hellos, the `d` and `q` JA4
 variants, are not read.
 
 Handshakes can still go missing on very busy captures. The transport core tracks

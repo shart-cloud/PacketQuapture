@@ -4,18 +4,22 @@ PacketQuapture
 PacketQuapture is licensed under the MIT License (see LICENSE), with the
 exception below.
 
-JA4S (FoxIO License 1.1)
-------------------------
+JA4S and JA4X (FoxIO License 1.1)
+----------------------------------
 
-The read_tls columns ja4s and ja4s_r implement JA4S, part of JA4+ by FoxIO,
-LLC. JA4S is patent pending and licensed under the FoxIO License 1.1, whose
-full text follows. It permits academic and internal business use but not
-monetization: offering JA4S fingerprinting in a product or service sold to
-others, or using it to provide value to paying customers, needs an OEM license
-from FoxIO. The code computing it is src/tls_fingerprint.cpp (Ja4sStrings).
-The rest of PacketQuapture, including JA3, JA3S and JA4, remains MIT.
+The read_tls columns ja4s and ja4s_r implement JA4S, and the ja4x and ja4x_r
+fields of each server_certificates element implement JA4X. Both are part of
+JA4+ by FoxIO, LLC, are patent pending, and are licensed under the FoxIO
+License 1.1, whose full text follows. It permits academic and internal
+business use but not monetization: offering JA4S or JA4X fingerprinting in a
+product or service sold to others, or using it to provide value to paying
+customers, needs an OEM license from FoxIO. The code computing them is
+src/tls_fingerprint.cpp (Ja4sStrings and Ja4xStrings) and the code that
+formats them in src/packetquapture_extension.cpp. The certificate parser in
+src/x509_certificate.cpp only extracts fields and remains MIT, as does the
+rest of PacketQuapture, including JA3, JA3S and JA4.
 
-JA4S and JA4+ are trademarks of FoxIO. Specification and reference:
+JA4S, JA4X and JA4+ are trademarks of FoxIO. Specification and reference:
 https://github.com/FoxIO-LLC/ja4 at 16b96d95c220762cf658f67d678cda2aac95c81e.
 See https://github.com/FoxIO-LLC/ja4/blob/main/License%20FAQ.md.
 

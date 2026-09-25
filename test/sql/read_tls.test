@@ -458,3 +458,23 @@ query II
 SELECT count(*), count(server_certificates) FROM read_tls(['test/data/tls/browser_tls13.pcap', 'test/data/tls/session.pcap']);
 ----
 2	0
+
+# JA4X for each certificate in the chain, and its raw form. Expected values are
+# from the FoxIO rust reference (FoxIO-LLC/ja4 at 16b96d9, rust/ja4x) run on the
+# DER tshark extracted. The intermediate has no extensions: the rust reference,
+# like JA4, writes an empty part as zeros. FoxIO License 1.1; see NOTICE.
+query ITT
+SELECT i, s.ja4x, s.ja4x_r FROM (SELECT unnest(server_certificates) AS s, generate_subscripts(server_certificates, 1) AS i
+FROM read_tls('test/data/tls/certificates.pcap')) ORDER BY i;
+----
+1	7d5dbb3783b4_3170afc38336_6ea8df877ef2	550406,55040a,55040b,550403_550406,550407,55040a,55040a,2a864886f70d010901,2b0601040183b20301,550403_551d11
+2	a373a9f83c6b_7d5dbb3783b4_000000000000	550406,55040a,550403_550406,55040a,55040b,550403_
+
+# Each hash is the first 12 hex digits of SHA-256 over its raw part.
+query I
+WITH c AS (SELECT unnest(server_certificates) AS s FROM read_tls('test/data/tls/*.pcap')),
+parts AS (SELECT s.ja4x AS ja4x, string_split(s.ja4x_r, '_') AS r FROM c WHERE s IS NOT NULL)
+SELECT count(*) FROM parts
+WHERE ja4x IS DISTINCT FROM array_to_string(list_transform(r, lambda p: CASE WHEN p = '' THEN '000000000000' ELSE left(sha256(p), 12) END), '_');
+----
+0

@@ -48,6 +48,18 @@ bool Ja4Strings(const TlsHandshake &handshake, Ja4Parts &out);
 // second: extension types in wire order, GREASE included.
 bool Ja4sStrings(const TlsHandshake &handshake, Ja4Parts &out);
 
+// JA4X, from the same repository: rust/ja4x/src/lib.rs and python/ja4x.py. The
+// fingerprint is hash12(issuer)_hash12(subject)_hash12(extensions) and the raw
+// form issuer_subject_extensions, each part the comma-joined hex OIDs in wire
+// order: issuer attribute types, subject attribute types, extensions. An
+// empty part hashes to 000000000000, as in the rust reference and JA4; the
+// python reference writes the hash of an empty string instead. FoxIO License
+// 1.1; see NOTICE.
+struct Ja4xParts {
+	std::string issuer, subject, extensions;
+};
+void Ja4xStrings(const X509Certificate &certificate, Ja4xParts &out);
+
 // The two ALPN characters of a JA4 prefix, per JA4.md: the first and last
 // byte when both are ASCII alphanumeric, otherwise the first and last digit
 // of the value's lower-case hex. 00 for no value.
