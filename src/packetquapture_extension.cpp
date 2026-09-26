@@ -2319,6 +2319,12 @@ static LogicalType TlsCertificateType() {
 	fields.emplace_back("path_length", LogicalType::UINTEGER);
 	fields.emplace_back("key_usage", LogicalType::LIST(LogicalType::VARCHAR));
 	fields.emplace_back("extended_key_usage", LogicalType::LIST(LogicalType::VARCHAR));
+	fields.emplace_back("subject_key_id", LogicalType::VARCHAR);
+	fields.emplace_back("authority_key_id", LogicalType::VARCHAR);
+	fields.emplace_back("ocsp_urls", LogicalType::LIST(LogicalType::VARCHAR));
+	fields.emplace_back("ca_issuers_urls", LogicalType::LIST(LogicalType::VARCHAR));
+	fields.emplace_back("crl_urls", LogicalType::LIST(LogicalType::VARCHAR));
+	fields.emplace_back("policies", LogicalType::LIST(LogicalType::VARCHAR));
 	return LogicalType::STRUCT(std::move(fields));
 }
 
@@ -2536,7 +2542,8 @@ static idx_t TlsRowBytes(const string &filename, const packetquapture::TlsHandsh
 			const auto &fields = certificate.fields;
 			certificates += 512 + fields.TextBytes();
 			certificates += 32 * (fields.san_dns.size() + fields.san_ip.size() + fields.key_usage.size() +
-			                      fields.extended_key_usage.size());
+			                      fields.extended_key_usage.size() + fields.ocsp_urls.size() +
+			                      fields.ca_issuers_urls.size() + fields.crl_urls.size() + fields.policies.size());
 		}
 	}
 	return 1024 + filename.size() + handshake.sni.size() + 32 * codes + alpn + certificates +
@@ -2545,6 +2552,10 @@ static idx_t TlsRowBytes(const string &filename, const packetquapture::TlsHandsh
 
 static Value OptionalText(const std::string &text) {
 	return text.empty() ? Value(LogicalType::VARCHAR) : Value(text);
+}
+
+static Value OptionalList(bool present, const std::vector<std::string> &items) {
+	return present ? TextList(items) : Value(LogicalType::LIST(LogicalType::VARCHAR));
 }
 
 static void SetTlsCertificates(Vector &vector, idx_t row,
@@ -2564,20 +2575,31 @@ static void SetTlsCertificates(Vector &vector, idx_t row,
 		packetquapture::Ja4xParts ja4x;
 		packetquapture::Ja4xStrings(fields, ja4x);
 		values.push_back(Value::STRUCT(
-		    type, {Value(fields.subject), Value(fields.issuer), Value(fields.serial),
-		           Value::TIMESTAMP(timestamp_t(fields.not_before)), Value::TIMESTAMP(timestamp_t(fields.not_after)),
-		           TextList(fields.san_dns), TextList(fields.san_ip),
+		    type, {Value(fields.subject),
+		           Value(fields.issuer),
+		           Value(fields.serial),
+		           Value::TIMESTAMP(timestamp_t(fields.not_before)),
+		           Value::TIMESTAMP(timestamp_t(fields.not_after)),
+		           TextList(fields.san_dns),
+		           TextList(fields.san_ip),
 		           Value(Ja4Hash12(ja4x.issuer) + "_" + Ja4Hash12(ja4x.subject) + "_" + Ja4Hash12(ja4x.extensions)),
-		           Value(ja4x.issuer + "_" + ja4x.subject + "_" + ja4x.extensions), OptionalText(fields.sha1),
-		           OptionalText(fields.sha256), OptionalText(fields.signature_algorithm),
+		           Value(ja4x.issuer + "_" + ja4x.subject + "_" + ja4x.extensions),
+		           OptionalText(fields.sha1),
+		           OptionalText(fields.sha256),
+		           OptionalText(fields.signature_algorithm),
 		           OptionalText(fields.public_key_algorithm),
 		           fields.public_key_bits != 0 ? Value::UINTEGER(fields.public_key_bits) : Value(LogicalType::UINTEGER),
 		           OptionalText(fields.public_key_curve),
 		           fields.has_basic_constraints ? Value::BOOLEAN(fields.is_ca) : Value(LogicalType::BOOLEAN),
 		           fields.has_path_length ? Value::UINTEGER(fields.path_length) : Value(LogicalType::UINTEGER),
-		           fields.has_key_usage ? TextList(fields.key_usage) : Value(LogicalType::LIST(LogicalType::VARCHAR)),
-		           fields.has_extended_key_usage ? TextList(fields.extended_key_usage)
-		                                         : Value(LogicalType::LIST(LogicalType::VARCHAR))}));
+		           OptionalList(fields.has_key_usage, fields.key_usage),
+		           OptionalList(fields.has_extended_key_usage, fields.extended_key_usage),
+		           OptionalText(fields.subject_key_id),
+		           OptionalText(fields.authority_key_id),
+		           OptionalList(fields.has_authority_info_access, fields.ocsp_urls),
+		           OptionalList(fields.has_authority_info_access, fields.ca_issuers_urls),
+		           OptionalList(fields.has_crl_distribution_points, fields.crl_urls),
+		           OptionalList(fields.has_policies, fields.policies)}));
 	}
 	vector.SetValue(row, Value::LIST(type, values));
 }

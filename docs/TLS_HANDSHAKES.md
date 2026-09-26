@@ -234,11 +234,15 @@ WHERE server_certificates IS NOT NULL;
 | `ja4x`, `ja4x_r` | JA4X certificate fingerprint and its raw form. **FoxIO License 1.1**, see [NOTICE](../NOTICE). See below. |
 | `sha1`, `sha256` | The whole DER certificate's hashes as lowercase hex, which is what certificate blocklists such as abuse.ch SSLBL key on. |
 | `signature_algorithm`, `public_key_algorithm` | As `openssl x509 -text` prints them: `sha256WithRSAEncryption`, `ecdsa-with-SHA256`, `rsaEncryption`, `id-ecPublicKey`, `ED25519`. The names come from a table of about 45 RSA, RSA-PSS, DSA, ECDSA, EdDSA, SHA-3, SM2 and GOST algorithms, each checked against OpenSSL 3.0.13; any other algorithm is its dotted OID, even where OpenSSL has a name. |
-| `public_key_bits` | RSA or RSA-PSS modulus size, DSA prime size, or a named EC curve's size, as OpenSSL's `Public-Key: (N bit)`. NULL for other keys, an unknown or explicitly specified curve, or a key body that does not parse. |
-| `public_key_curve` | An EC key's named curve as OpenSSL's `ASN1 OID` line prints it, such as `prime256v1` or `secp384r1`; an unknown curve is its OID. |
+| `public_key_bits` | RSA or RSA-PSS modulus size, DSA prime size, a named EC curve's size, or for an EC key with explicit curve parameters the bit length of the group order, each as OpenSSL's `Public-Key: (N bit)`. NULL for other keys, an unknown named curve, or a key body that does not parse. |
+| `public_key_curve` | An EC key's named curve as OpenSSL's `ASN1 OID` line prints it, such as `prime256v1` or `secp384r1`; an unknown curve is its OID. NULL for explicit curve parameters, which have no name. CAs do not issue such keys, and they were the vehicle of CVE-2020-0601, so a sized EC key with a NULL curve is worth a look. |
 | `is_ca`, `path_length` | basicConstraints' cA flag and pathLenConstraint. `is_ca` is NULL without the extension; `path_length` is NULL without a constraint. |
 | `key_usage` | keyUsage bits by their RFC 5280 names, in bit order: `digitalSignature`, `nonRepudiation`, `keyEncipherment`, `dataEncipherment`, `keyAgreement`, `keyCertSign`, `cRLSign`, `encipherOnly`, `decipherOnly`. NULL without the extension. |
 | `extended_key_usage` | extendedKeyUsage purposes by their RFC 5280 names (`serverAuth`, `clientAuth`, `codeSigning`, `emailProtection`, `timeStamping`, `OCSPSigning`, `anyExtendedKeyUsage`), others as dotted OIDs, in wire order. NULL without the extension. |
+| `subject_key_id`, `authority_key_id` | subjectKeyIdentifier, and authorityKeyIdentifier's keyIdentifier, as lowercase hex; OpenSSL prints the same octets as colon-separated uppercase. A certificate's `authority_key_id` equals its issuer's `subject_key_id`, which links a chain without comparing names. NULL without the extension, or without a keyIdentifier. |
+| `ocsp_urls`, `ca_issuers_urls` | authorityInfoAccess OCSP and caIssuers locations that are URIs, escaped as `tls_sni` is, in wire order. Other name forms and access methods are skipped. Both NULL without the extension. |
+| `crl_urls` | cRLDistributionPoints URIs from each point's full name, escaped and in wire order; a relative name has none. NULL without the extension. |
+| `policies` | certificatePolicies identifiers as dotted OIDs, such as `2.23.140.1.2.1` (CA/Browser Forum domain-validated); anyPolicy is `2.5.29.32.0`. Qualifiers are not kept. NULL without the extension. |
 
 The algorithms and curve use OpenSSL's names so they can be read beside `openssl x509
 -text`; the usage lists use RFC 5280's, which are identifiers rather than prose (OpenSSL
@@ -248,8 +252,14 @@ is described, not checked, and an RSA modulus is sized without being tested.
 These fields only add to a certificate, so none of them can make it malformed. An
 algorithm or key that does not parse leaves its fields NULL. A basicConstraints, keyUsage
 or extendedKeyUsage that is malformed or repeated, which RFC 5280 forbids, leaves that
-field NULL too, since neither copy is more believable. Only more than `max_list_entries`
-purposes is a limit. The hashes are computed only when a certificate column is projected.
+field NULL too, since neither copy is more believable, and so does each of the five
+extensions above. An empty authorityInfoAccess, cRLDistributionPoints or
+certificatePolicies is read as present and empty, as OpenSSL reads it, though RFC 5280
+requires at least one entry. Only more than `max_list_entries` purposes is a limit on the
+certificate; more than that many entries in one URL or policy list leaves that list NULL,
+since the certificate's own size, capped by `max_certificate_bytes`, already bounds its
+memory. Policy OIDs with arcs up to 140 bits, such as UUID OIDs under `2.25`, are written
+in full. The hashes are computed only when a certificate column is projected.
 
 Names follow RFC 4514 and match `openssl x509 -nameopt RFC2253,-esc_msb` character for
 character, with one exception. Attribute types in RFC 4514's own table use its short
@@ -290,7 +300,9 @@ SHA-256, or `000000000000` for an empty part.
 The definition is FoxIO-LLC/ja4 at `16b96d9`, which has no written specification for
 JA4X, only its two reference implementations. `ja4x` equals the rust one (`rust/ja4x`)
 on every certificate checked: 135 certificates, including this machine's CA bundle,
-the fixtures and the CTU-13 Neris capture. The python one (`python/ja4x.py`) differs in
+the fixtures and the CTU-13 Neris capture, and again on the 131 certificates of the
+fixtures and the CA bundle once the certificate detail and extension fields were added.
+The python one (`python/ja4x.py`) differs in
 three ways, all reference bugs: it writes an empty part as the hash of an empty
 string, `e3b0c44298fc`; it counts RDNs rather than attributes, so a multi-valued RDN
 shifts every later OID and it misses later certificates in the chain; and it stops with
@@ -406,9 +418,10 @@ that would have matched it.
 
 ## Not yet implemented
 
-Certificate extensions beyond subjectAltName, basicConstraints, keyUsage and
-extendedKeyUsage, such as the key identifiers, CRL and OCSP locations, and policies, and
-the public key's own bytes. DTLS and QUIC hellos, the `d` and `q` JA4
+Certificate extensions beyond subjectAltName, basicConstraints, keyUsage,
+extendedKeyUsage, the key identifiers, authorityInfoAccess, cRLDistributionPoints and
+certificatePolicies, such as nameConstraints and signed certificate timestamps; policy
+qualifiers; and the public key's own bytes. DTLS and QUIC hellos, the `d` and `q` JA4
 variants, are not read.
 
 Handshakes can still go missing on very busy captures. The transport core tracks

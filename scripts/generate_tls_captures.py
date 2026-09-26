@@ -247,6 +247,7 @@ def reassembly_fixtures():
     idle_fixtures()
     certificate_fixtures()
     certificate_detail_fixtures()
+    certificate_extension_fixtures()
     tunnel_fixtures()
 
     # TCP that is not TLS at all.
@@ -531,6 +532,72 @@ def certificate_detail_fixtures():
     pcap(DATA / "certificate_details.pcap",
          exchange([(True, hello), (False, reply), (True, record(certificate_message([client_leaf])))], port=51000)
          + exchange([(True, hello), (False, reply), (True, record(certificate_message([])))], port=51001))
+
+
+def certificate_extension_fixtures():
+    """Key identifiers, authority information access, CRL distribution points,
+    policies and an explicit-parameter EC key; then the same extensions
+    duplicated, empty or carrying only forms that are not kept."""
+    def integer(value):
+        body = value.to_bytes((value.bit_length() + 7) // 8 or 1, "big")
+        return der(0x02, (b"\0" + body) if body[0] & 0x80 else body)
+
+    p = int("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff", 16)
+    order = int("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
+    # RFC 3279 ECParameters for P-256, spelled out rather than named.
+    parameters = der(0x30, integer(1) + der(0x30, oid("1.2.840.10045.1.1") + integer(p))
+                     + der(0x30, der(0x04, bytes.fromhex(
+                         "ffffffff00000001000000000000000000000000fffffffffffffffffffffffc"))
+                           + der(0x04, bytes.fromhex(
+                               "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b")))
+                     + der(0x04, P256_G) + integer(order) + integer(1))
+    explicit = der(0x30, der(0x30, oid("1.2.840.10045.2.1") + parameters) + der(0x03, b"\0" + P256_G))
+    issuer = name([(C, PRINTABLE, b"US")], [(CN, UTF8, b"Extension CA")])
+    ocsp, ca_issuers = "1.3.6.1.5.5.7.48.1", "1.3.6.1.5.5.7.48.2"
+    subject_id = bytes(range(0x10, 0x24))
+    authority_id = bytes(range(0xA0, 0xB4))
+    relative = der(0xA1, der(0x30, oid(CN) + der(UTF8, b"crl")))
+    full = certificate(
+        b"\x21", issuer, name([(CN, UTF8, b"full.example.test")]),
+        der(0x17, b"250101000000Z"), der(0x17, b"260101000000Z"), key=explicit,
+        extensions=[
+            x509_extension("2.5.29.14", der(0x04, subject_id)),
+            # The key identifier is kept; the issuer name and serial are skipped.
+            x509_extension("2.5.29.35", der(0x30, der(0x80, authority_id) + der(0xA1, der(0xA4, issuer))
+                                        + der(0x82, b"\x0a"))),
+            # A DNS-name location is not a URI and is skipped.
+            x509_extension("1.3.6.1.5.5.7.1.1", der(0x30,
+                der(0x30, oid(ocsp) + der(0x86, b"http://ocsp.example.test"))
+                + der(0x30, oid(ca_issuers) + der(0x86, b"http://ca.example.test/issuing.crt"))
+                + der(0x30, oid(ocsp) + der(0x82, b"ocsp.example.test")))),
+            # A full name with two URIs, and a name relative to the CRL issuer.
+            x509_extension("2.5.29.31", der(0x30,
+                der(0x30, der(0xA0, der(0xA0, der(0x86, b"http://crl.example.test/a.crl")
+                                              + der(0x86, b"ldap://crl.example.test/b"))))
+                + der(0x30, der(0xA0, relative)))),
+            x509_extension("2.5.29.32", der(0x30,
+                der(0x30, oid("2.23.140.1.2.1"))
+                + der(0x30, oid("1.3.6.1.4.1.44947.1.1.1") + der(0x30, der(0x30,
+                    oid("1.3.6.1.5.5.7.2.1") + der(IA5, b"http://cps.example.test")))))),
+        ])
+    sparse = certificate(
+        b"\x22", issuer, name([(CN, UTF8, b"sparse.example.test")]),
+        der(0x17, b"250101000000Z"), der(0x17, b"260101000000Z"),
+        extensions=[
+            # Twice: neither copy is believed.
+            x509_extension("2.5.29.14", der(0x04, subject_id)),
+            x509_extension("2.5.29.14", der(0x04, subject_id)),
+            # Issuer and serial only, with no key identifier.
+            x509_extension("2.5.29.35", der(0x30, der(0xA1, der(0xA4, issuer)) + der(0x82, b"\x0a"))),
+            # A location is missing, so both lists are unknown.
+            x509_extension("1.3.6.1.5.5.7.1.1", der(0x30, der(0x30, oid("1.3.6.1.5.5.7.48.1")))),
+            # Present, with no URI to keep.
+            x509_extension("2.5.29.31", der(0x30, der(0x30, der(0xA0, relative)))),
+            x509_extension("2.5.29.32", der(0x30, der(0x30, oid("2.5.29.32.0")))),
+        ])
+    hello = record(client_hello(server_name("full.example.test")))
+    reply = record(server_hello() + certificate_message([full, sparse]))
+    pcap(DATA / "certificate_extensions.pcap", exchange([(True, hello), (False, reply)], port=51000))
 
 
 def idle_fixtures():
