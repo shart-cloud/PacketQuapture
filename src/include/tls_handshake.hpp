@@ -170,6 +170,10 @@ private:
 		std::string status, error;
 		// Bytes before the first TLS record, and what they parsed as.
 		uint32_t prefix_bytes = 0;
+		// Found by searching a stream whose SYN was not captured, so its first
+		// byte is mid-conversation. Reported only once the other direction of
+		// the same connection confirms it; see Add.
+		bool needs_confirmation = false;
 		std::string tunnel, tunnel_destination;
 		std::vector<TlsHandshake> handshakes;
 		// Kept beside each handshake rather than on the reported row: it is only
@@ -180,8 +184,14 @@ private:
 	static void ParseRecords(const TcpStream &stream, const TcpStreamChunk &chunk, size_t start,
 	                         const TlsHandshakeLimits &limits, Direction &direction);
 	static std::vector<TlsHandshake> Merge(const Direction &client, const Direction *server);
+	static bool Confirms(const Direction &peer, const Direction &found);
+	static std::vector<TlsHandshake> ReportAlone(const Direction &direction);
+	bool Hold(const Direction &direction);
+	void Release(std::map<TcpFlowKey, Direction>::iterator it);
 	TlsHandshakeLimits limits;
 	std::map<TcpFlowKey, Direction> pending;
+	// How many held directions still need confirmation.
+	size_t unconfirmed = 0;
 };
 
 } // namespace packetquapture
