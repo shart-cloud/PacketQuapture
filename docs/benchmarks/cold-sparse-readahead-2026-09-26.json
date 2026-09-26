@@ -1,0 +1,108 @@
+{
+  "date": "2026-09-26",
+  "host": "WSL2 Ubuntu, ext4 on /dev/sdd, read_ahead_kb 128",
+  "baseline": "main 7ffab81",
+  "candidate": "sparse-readahead",
+  "query": "SELECT count(*) FROM read_pcap(...)",
+  "command": "scripts/benchmark_cold_sparse.py <main cli> <candidate cli> 9",
+  "trials": 9,
+  "results": {
+    "large_15000/cold": {
+      "baseline": {
+        "median": 3.691449860983994,
+        "min": 3.195180431997869,
+        "max": 4.314543691987637
+      },
+      "candidate": {
+        "median": 0.1642062229802832,
+        "min": 0.1315586569835432,
+        "max": 0.3081237180158496
+      }
+    },
+    "large_15000/warm": {
+      "baseline": {
+        "median": 0.034402163000777364,
+        "min": 0.033685015980154276,
+        "max": 0.0362610129523091
+      },
+      "candidate": {
+        "median": 0.03615262598032132,
+        "min": 0.034676627023145556,
+        "max": 0.038662147999275476
+      }
+    },
+    "medium_6000/cold": {
+      "baseline": {
+        "median": 1.6333469630335458,
+        "min": 1.1652757629635744,
+        "max": 2.1454889560118318
+      },
+      "candidate": {
+        "median": 0.18489473103545606,
+        "min": 0.15988882398232818,
+        "max": 0.24417023395653814
+      }
+    },
+    "medium_6000/warm": {
+      "baseline": {
+        "median": 0.06965373898856342,
+        "min": 0.06544849101919681,
+        "max": 0.07734577596420422
+      },
+      "candidate": {
+        "median": 0.07024853001348674,
+        "min": 0.06933958799345419,
+        "max": 0.07237963902298361
+      }
+    },
+    "huge_200000/cold": {
+      "baseline": {
+        "median": 0.27840910403756425,
+        "min": 0.25122838298557326,
+        "max": 0.3354402100085281
+      },
+      "candidate": {
+        "median": 0.14512654999271035,
+        "min": 0.13715933199273422,
+        "max": 0.15518193499883637
+      }
+    },
+    "huge_200000/warm": {
+      "baseline": {
+        "median": 0.019974999013356864,
+        "min": 0.01873820897890255,
+        "max": 0.021678382996469736
+      },
+      "candidate": {
+        "median": 0.020896625006571412,
+        "min": 0.019878346007317305,
+        "max": 0.022886916005518287
+      }
+    },
+    "dense_1500/cold": {
+      "baseline": {
+        "median": 0.35366823099320754,
+        "min": 0.26716147700790316,
+        "max": 0.43341452797176316
+      },
+      "candidate": {
+        "median": 0.42946521402336657,
+        "min": 0.29310940101277083,
+        "max": 0.47534195304615423
+      }
+    },
+    "dense_1500/warm": {
+      "baseline": {
+        "median": 0.12771407299442217,
+        "min": 0.10231139394454658,
+        "max": 0.12920449901139364
+      },
+      "candidate": {
+        "median": 0.13268670596880838,
+        "min": 0.11037242400925606,
+        "max": 0.14662119996501133
+      }
+    }
+  },
+  "note": "dense_1500 never reaches the hint (its gaps are windowed), so its baseline/candidate difference is a measure of run-to-run noise."
+}
