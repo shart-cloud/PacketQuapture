@@ -59,9 +59,13 @@ std::vector<TcpDnsMessage> FrameTcpDns(const TcpStream &stream, DnsFramingLimits
 		offset += length + 2;
 	}
 	if (offset != stream.expected_bytes) {
-		auto diagnostic = Diagnostic(stream, "incomplete",
-		                             !stream.gaps.empty() ? "missing TCP bytes leave a sequence gap"
-		                                                  : "incomplete DNS TCP frame at end of stream");
+		// The idle timeout ends a direction as file end does, but a message cut
+		// there may resume later, so it is named rather than called truncated.
+		auto diagnostic =
+		    Diagnostic(stream, "incomplete",
+		               !stream.gaps.empty()                    ? "missing TCP bytes leave a sequence gap"
+		               : stream.finalized_by == "idle_timeout" ? "incomplete DNS TCP frame at idle timeout"
+		                                                       : "incomplete DNS TCP frame at end of stream");
 		diagnostic.sequence += static_cast<uint32_t>(offset);
 		result.push_back(std::move(diagnostic));
 	}

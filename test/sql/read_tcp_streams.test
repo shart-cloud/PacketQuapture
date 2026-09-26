@@ -95,3 +95,56 @@ FROM read_tcp_streams('test/data/tls/idle_eviction.pcap');
 20000	contiguous	idle_timeout	5
 443	contiguous	eof	49
 51000	contiguous	eof	79
+
+# tcp_idle_timeout sets that timeout. At 302 s the quiet directions outlive the
+# 301 s pause, so the later connection finds every slot taken; zero disables
+# eviction to the same effect.
+query TTT rowsort
+SELECT src_port, finalized_by, reassembly_status
+FROM read_tcp_streams('test/data/tls/idle_eviction.pcap', tcp_idle_timeout=INTERVAL '302 seconds')
+WHERE src_port IN (20000, 443, 51000);
+----
+20000	eof	contiguous
+443	limit	limit
+443	limit	limit
+51000	limit	limit
+51000	limit	limit
+
+query TTT rowsort
+SELECT src_port, finalized_by, reassembly_status
+FROM read_tcp_streams('test/data/tls/idle_eviction.pcap', tcp_idle_timeout=INTERVAL '0 seconds')
+WHERE src_port IN (20000, 443, 51000);
+----
+20000	eof	contiguous
+443	limit	limit
+443	limit	limit
+51000	limit	limit
+51000	limit	limit
+
+query TTT rowsort
+SELECT src_port, finalized_by, reassembly_status
+FROM read_tcp_streams('test/data/tls/idle_eviction.pcap', tcp_idle_timeout=INTERVAL '1 second');
+----
+20000	idle_timeout	contiguous
+443	eof	contiguous
+51000	eof	contiguous
+
+statement error
+SELECT * FROM read_tcp_streams('test/data/tls/idle_eviction.pcap', tcp_idle_timeout=INTERVAL '-1 second');
+----
+TCP idle timeout must be a nonnegative fixed interval without months
+
+statement error
+SELECT * FROM read_tcp_streams('test/data/tls/idle_eviction.pcap', tcp_idle_timeout=INTERVAL '1 month');
+----
+TCP idle timeout must be a nonnegative fixed interval without months
+
+statement error
+SELECT * FROM read_tcp_streams('test/data/tls/idle_eviction.pcap', tcp_idle_timeout=NULL);
+----
+TCP idle timeout must not be NULL
+
+statement error
+SELECT * FROM read_tcp_streams('test/data/tls/idle_eviction.pcap', udp_idle_timeout=INTERVAL '1 second');
+----
+Invalid named parameter
