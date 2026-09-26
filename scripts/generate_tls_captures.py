@@ -494,6 +494,26 @@ def tunnel_fixtures():
                b"Proxy-Authorization: Basic dXNlcjpwdw==\r\n\r\n"),
         (False, b"HTTP/1.1 200 Connection established\r\n\r\n"),
         (True, hello("login.example")), (False, reply)], port=51007)
+    # STARTTLS: TLS after a plaintext SMTP, IMAP, POP3 or FTP exchange.
+    packets += exchange([
+        (False, b"220 mx.example ESMTP\r\n"), (True, b"EHLO client.example\r\n"),
+        (False, b"250-mx.example\r\n250-PIPELINING\r\n250 STARTTLS\r\n"), (True, b"STARTTLS\r\n"),
+        (False, b"220 2.0.0 Ready to start TLS\r\n"),
+        (True, hello("mx.example")), (False, reply)], port=51008)
+    packets += exchange([
+        (False, b"* OK IMAP4rev1 ready\r\n"), (True, b"a1 CAPABILITY\r\n"),
+        (False, b"* CAPABILITY IMAP4rev1 STARTTLS LOGINDISABLED\r\na1 OK done\r\n"),
+        (True, b"a2 STARTTLS\r\n"), (False, b"a2 OK Begin TLS negotiation now\r\n"),
+        (True, hello("imap.example")), (False, reply)], port=51009)
+    packets += exchange([
+        (False, b"+OK POP3 ready\r\n"), (True, b"CAPA\r\n"),
+        (False, b"+OK Capability list follows\r\nSTLS\r\nUSER\r\n.\r\n"), (True, b"STLS\r\n"),
+        (False, b"+OK Begin TLS negotiation\r\n"),
+        (True, hello("pop.example")), (False, reply)], port=51010)
+    packets += exchange([
+        (False, b"220 FTP server ready\r\n"), (True, b"AUTH TLS\r\n"),
+        (False, b"234 AUTH TLS successful\r\n"),
+        (True, hello("ftp.example")), (False, reply)], port=51011)
     pcap(DATA / "tunnels.pcap", packets)
 
 

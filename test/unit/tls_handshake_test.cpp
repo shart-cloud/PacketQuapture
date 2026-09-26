@@ -971,12 +971,92 @@ void TestSocks4AndHttpTunnels() {
 	assert(handshake.client_tunnel.empty() && handshake.server_tunnel.empty());
 	assert(
 	    (handshake.warnings == std::vector<std::string> {"client_tunnel_unrecognized", "server_tunnel_unrecognized"}));
+}
 
-	// SMTP STARTTLS is found the same way, and not named.
-	handshake = Tunnelled(Bytes("EHLO client.example\r\nSTARTTLS\r\n"),
-	                      Bytes("220 mx ESMTP\r\n250-mx\r\n250 STARTTLS\r\n220 Ready\r\n"));
-	assert(handshake.client_tunnel.empty() && handshake.server_tunnel.empty());
-	assert(handshake.status == "complete" && handshake.tunnel_destination.empty());
+// STARTTLS exchanges are named by protocol, with no destination. Each side is
+// read on its own, so each near miss is checked on one side at a time.
+void TestStartTls() {
+	struct Case {
+		const char *client, *server, *protocol;
+	};
+	const Case named[] = {
+	    {"EHLO client.example\r\nSTARTTLS\r\n", "220 mx ESMTP\r\n250-mx\r\n250 STARTTLS\r\n220 Ready\r\n", "smtp"},
+	    {"helo client\r\nNOOP\r\nstarttls\r\n", "220-mx\r\n220 ESMTP\r\n250 mx\r\n250 OK\r\n220 Go\r\n", "smtp"},
+	    {"a1 CAPABILITY\r\na2 STARTTLS\r\n",
+	     "* OK IMAP4rev1 ready\r\n* CAPABILITY IMAP4rev1 STARTTLS\r\na1 OK done\r\na2 OK Begin TLS\r\n", "imap"},
+	    {"a starttls\r\n", "* OK ready\r\na OK go\r\n", "imap"},
+	    {"CAPA\r\nSTLS\r\n", "+OK POP3 ready\r\n+OK\r\nSTLS\r\nUSER\r\n.\r\n+OK Begin TLS\r\n", "pop3"},
+	    {"stls\r\n", "+OK ready\r\n+OK\r\n", "pop3"},
+	    {"AUTH TLS\r\n", "220 FTP ready\r\n234 AUTH TLS OK\r\n", "ftp"},
+	    {"FEAT\r\nauth ssl\r\n", "220-Welcome\r\n220 FTP\r\n211-Features:\r\n AUTH TLS\r\n211 End\r\n234 OK\r\n",
+	     "ftp"},
+	    // Refusals a client recovers from: FEAT unknown, one mechanism refused.
+	    {"FEAT\r\nAUTH TLS\r\nAUTH TLS-P\r\n", "220 FTP\r\n500 FEAT?\r\n504 no\r\n234 OK\r\n", "ftp"},
+	    {"EHLO x\r\nHELO x\r\nSTARTTLS\r\n", "220 mx\r\n502 no\r\n250 mx\r\n220 go\r\n", "smtp"},
+	    {"EHLO x\r\nSTARTTLS\r\n", "220 mx\r\n250-mx\r\n250\r\n220\r\n", "smtp"},
+	    {"a STARTTLS\r\n", "* OK [CAPABILITY IMAP4rev1 STARTTLS] ready\r\n* OK [ALERT] hi\r\na OK go\r\n", "imap"},
+	};
+	for (const auto &item : named) {
+		const auto handshake = Tunnelled(Bytes(item.client), Bytes(item.server));
+		assert(handshake.client_tunnel == item.protocol && handshake.server_tunnel == item.protocol);
+		assert(handshake.status == "complete" && handshake.tunnel_destination.empty());
+		assert(handshake.warnings.empty());
+	}
+
+	// Client prefixes that are not a STARTTLS exchange, each paired with a
+	// valid SMTP server side.
+	const char *clients[] = {
+	    "STARTTLS\r\n",                              // SMTP without EHLO first
+	    "EHLO x\r\nMAIL FROM:<a@b>\r\nSTARTTLS\r\n", // a command SMTP sends only after TLS here
+	    "EHLO x\r\nSTARTTLS\r\nNOOP\r\n",            // bytes after STARTTLS
+	    "EHLO x\nSTARTTLS\n",                        // bare LF
+	    "EHLO x\r\nSTARTTLS",                        // no final CRLF
+	    "EHLO x\r\nSTART\rTLS\r\n",                  // a stray CR
+	    "USER bob\r\nSTLS\r\n",                      // POP3 login before STLS
+	    "USER anonymous\r\nAUTH TLS\r\n",            // FTP login before AUTH
+	    "AUTH GSSAPI\r\n",                           // not a TLS mechanism
+	    "* STARTTLS\r\n",                            // IMAP untagged is a server line
+	    "a1 LOGIN u p\r\na2 STARTTLS\r\n",           // IMAP login before STARTTLS
+	    "a1 STARTTLS\r\na2 NOOP\r\n",                // STARTTLS not last
+	    "GET / HTTP/1.1\r\n\r\n",                    // plain HTTP
+	};
+	for (const char *client : clients) {
+		const auto handshake = Tunnelled(Bytes(client), Bytes("220 mx\r\n250 mx\r\n220 go\r\n"));
+		assert(handshake.client_tunnel.empty() && handshake.server_tunnel == "smtp");
+		assert((handshake.warnings == std::vector<std::string> {"client_tunnel_unrecognized"}));
+	}
+
+	const char *servers[] = {
+	    "220 mx\r\n",                                                 // only a greeting
+	    "220 a\r\n220 b\r\n",                                         // no reply to EHLO
+	    "220-mx\r\nGET / HTTP/1.1\r\n220 mx\r\n250 ok\r\n220 go\r\n", // SMTP repeats its code
+	    "220 mx\r\n250 mx\r\n451 later\r\n220 go\r\n",                // a 4xx is no refusal a client continues from
+	    "250 mx\r\n220 go\r\n",                                       // no greeting
+	    "220 mx\r\n250 mx\r\n454 no TLS\r\n",                         // refused
+	    "220 mx\r\n550 no\r\n220 go\r\n",                             // not a 250 between
+	    "220-mx\r\n250 mx\r\n220 go\r\n",                             // multi-line reply never ended
+	    "220 FTP\r\n331 password\r\n234 OK\r\n",                      // FTP login before AUTH
+	    "220 mx\r\n220 go",                                           // no final CRLF
+	    "22O mx\r\n220 go\r\n",                                       // not a code
+	    "+OK ready\r\n+OK\r\nSTLS\r\n",                               // multi-line POP3 reply never ended
+	    "+OK ready\r\n-ERR no\r\n",                                   // STLS refused
+	    "+OK ready\r\n",                                              // only a greeting
+	    "* PREAUTH ready\r\na OK go\r\n",                             // IMAP forbids STARTTLS after PREAUTH
+	    "* OK ready\r\na NO no\r\n",                                  // refused
+	    "* OK ready\r\n* BYE\r\n",                                    // no tagged reply
+	    "* OK ready\r\n* BYE going\r\na OK x\r\n",                    // BYE closes the connection
+	    "* OK x\r\n* PREAUTH\r\na OK x\r\n",                          // nor PREAUTH mid-way
+	};
+	for (const char *server : servers) {
+		const auto handshake = Tunnelled(Bytes("EHLO x\r\nSTARTTLS\r\n"), Bytes(server));
+		assert(handshake.client_tunnel == "smtp" && handshake.server_tunnel.empty());
+		assert((handshake.warnings == std::vector<std::string> {"server_tunnel_unrecognized"}));
+	}
+
+	// Two different protocols named on the two sides disagree.
+	const auto crossed = Tunnelled(Bytes("EHLO x\r\nSTARTTLS\r\n"), Bytes("220 FTP\r\n234 OK\r\n"));
+	assert(crossed.client_tunnel == "smtp" && crossed.server_tunnel == "ftp");
+	assert((crossed.warnings == std::vector<std::string> {"tunnel_mismatch"}));
 }
 
 void TestTunnelPrefixLimit() {
@@ -1157,6 +1237,7 @@ int main() {
 	TestListFuzz();
 	TestSocks5Tunnels();
 	TestSocks4AndHttpTunnels();
+	TestStartTls();
 	TestTunnelPrefixLimit();
 	TestTunnelSearchIsStrict();
 	TestTunnelEdges();

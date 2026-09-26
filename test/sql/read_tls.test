@@ -482,7 +482,8 @@ WHERE ja4x IS DISTINCT FROM array_to_string(list_transform(r, lambda p: CASE WHE
 # TLS behind a tunnel. Prefix lengths are tshark 4.2.2's relative tcp.seq of
 # the segment that starts each hello, less one. Port 51007 is an HTTP proxy
 # login: CONNECT, 407 with a page, CONNECT with credentials, 200. A SOCKS4 reply cannot tell 4
-# from 4a, so the protocol comes from the client's request.
+# from 4a, so the protocol comes from the client's request. Ports 51008-51011 are
+# STARTTLS over SMTP, IMAP, POP3 and FTP, which name no destination.
 query IIIIIII
 SELECT client_port, tls_sni, reassembly_status, tunnel.protocol, tunnel.destination,
        tunnel.client_prefix_bytes, tunnel.server_prefix_bytes
@@ -494,6 +495,10 @@ FROM read_tls('test/data/tls/tunnels.pcap') ORDER BY client_port;
 51004	neris.example	complete	socks5	NULL	14	12
 51006	one-sided.example	one-sided	socks5	192.0.2.9:443	13	NULL
 51007	login.example	complete	http_connect	login.example:443	167	3147
+51008	mx.example	complete	smtp	NULL	31	98
+51009	imap.example	complete	imap	NULL	28	114
+51010	pop.example	complete	pop3	NULL	12	87
+51011	ftp.example	complete	ftp	NULL	10	47
 
 # The Neris shape: a stray byte before the client's SOCKS5 greeting is not
 # SOCKS, so no destination is claimed and the row says why.
@@ -506,6 +511,10 @@ SELECT client_port, warnings FROM read_tls('test/data/tls/tunnels.pcap') ORDER B
 51004	[client_tunnel_unrecognized]
 51006	[server_hello_missing]
 51007	[]
+51008	[]
+51009	[]
+51010	[]
+51011	[]
 
 # TLS that begins its stream has no tunnel.
 query I
