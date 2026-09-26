@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <initializer_list>
 #include <iterator>
 #include <string>
 
@@ -627,6 +628,204 @@ bool HttpServerPrefix(const std::string &text) {
 	return false;
 }
 
+// The lines of a plaintext exchange. Every line must end in CRLF, including
+// the last, and hold no other CR or LF, or the text is not such an exchange.
+bool CrlfLines(const std::string &text, std::vector<std::string> &lines) {
+	lines.clear();
+	size_t pos = 0;
+	while (pos < text.size()) {
+		const size_t end = text.find("\r\n", pos);
+		if (end == std::string::npos) {
+			return false;
+		}
+		std::string line = text.substr(pos, end - pos);
+		if (line.find_first_of("\r\n") != std::string::npos) {
+			return false;
+		}
+		lines.push_back(std::move(line));
+		pos = end + 2;
+	}
+	return !lines.empty();
+}
+
+std::string Upper(std::string text) {
+	for (auto &c : text) {
+		c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+	}
+	return text;
+}
+
+// Whether an upper-cased line is this command, alone or followed by a space
+// and arguments.
+bool Command(const std::string &upper, const char *verb) {
+	const size_t length = std::strlen(verb);
+	return upper.compare(0, length, verb) == 0 && (upper.size() == length || upper[length] == ' ');
+}
+
+bool AnyCommand(const std::string &upper, std::initializer_list<const char *> verbs) {
+	return std::any_of(verbs.begin(), verbs.end(), [&](const char *verb) { return Command(upper, verb); });
+}
+
+bool ReplyCode(const std::string &line) {
+	return line.size() >= 3 && std::isdigit(static_cast<unsigned char>(line[0])) &&
+	       std::isdigit(static_cast<unsigned char>(line[1])) && std::isdigit(static_cast<unsigned char>(line[2])) &&
+	       (line.size() == 3 || line[3] == ' ' || line[3] == '-');
+}
+
+// RFC 5321 and RFC 959 replies. A code alone, or a code and a space, ends a
+// reply; a code and a hyphen begins a multi-line one, which ends at the same
+// code alone or followed by a space. SMTP repeats the code and a hyphen on
+// every line between; FTP allows any text there.
+bool ReplyCodes(const std::vector<std::string> &lines, bool smtp, std::vector<int> &codes) {
+	codes.clear();
+	for (size_t i = 0; i < lines.size(); ++i) {
+		if (!ReplyCode(lines[i])) {
+			return false;
+		}
+		const std::string code = lines[i].substr(0, 3);
+		if (lines[i].size() > 3 && lines[i][3] == '-') {
+			while (true) {
+				if (++i == lines.size()) {
+					return false;
+				}
+				const std::string &line = lines[i];
+				if (line.compare(0, 3, code) == 0 && (line.size() == 3 || line[3] == ' ')) {
+					break;
+				}
+				if (smtp && (line.compare(0, 3, code) != 0 || line.size() < 4 || line[3] != '-')) {
+					return false;
+				}
+			}
+		}
+		codes.push_back(std::stoi(code));
+	}
+	return true;
+}
+
+// An IMAP line: a tag, a space and the rest, upper-cased. "*" is the untagged
+// marker, which a client never sends.
+bool ImapLine(const std::string &line, std::string &tag, std::string &rest) {
+	const size_t space = line.find(' ');
+	if (space == 0 || space == std::string::npos || line.find_first_of("+(){%\"\\", 0) < space) {
+		return false;
+	}
+	tag = line.substr(0, space);
+	rest = Upper(line.substr(space + 1));
+	return true;
+}
+
+// The plaintext client exchange of a protocol upgraded by STARTTLS, or empty.
+// Only the commands a client sends before upgrading may come first: RFC 3207
+// SMTP opens with EHLO or HELO, RFC 2595 IMAP and POP3, RFC 4217 FTP, which
+// may retry AUTH with another mechanism after a refusal.
+std::string StartTlsClient(const std::string &text) {
+	std::vector<std::string> lines;
+	if (!CrlfLines(text, lines)) {
+		return std::string();
+	}
+	std::vector<std::string> upper;
+	for (const auto &line : lines) {
+		upper.push_back(Upper(line));
+	}
+	const auto before = [&](std::initializer_list<const char *> verbs) {
+		return std::all_of(upper.begin(), upper.end() - 1,
+		                   [&](const std::string &line) { return AnyCommand(line, verbs); });
+	};
+	const std::string &last = upper.back();
+	if (last == "STARTTLS") {
+		if (upper.size() >= 2 && AnyCommand(upper[0], {"EHLO", "HELO"}) && before({"EHLO", "HELO", "NOOP", "RSET"})) {
+			return "smtp";
+		}
+		return std::string();
+	}
+	if (last == "STLS") {
+		return before({"CAPA"}) ? "pop3" : std::string();
+	}
+	const auto auth = {"AUTH TLS", "AUTH SSL", "AUTH TLS-C", "AUTH TLS-P"};
+	if (std::find(auth.begin(), auth.end(), last) != auth.end()) {
+		return std::all_of(upper.begin(), upper.end() - 1,
+		                   [&](const std::string &line) {
+			                   return AnyCommand(line, {"FEAT", "SYST", "NOOP"}) ||
+			                          std::find(auth.begin(), auth.end(), line) != auth.end();
+		                   })
+		           ? "ftp"
+		           : std::string();
+	}
+	for (size_t i = 0; i < lines.size(); ++i) {
+		std::string tag, command;
+		if (!ImapLine(lines[i], tag, command) || tag == "*") {
+			return std::string();
+		}
+		if (i + 1 == lines.size() ? command != "STARTTLS" : !AnyCommand(command, {"CAPABILITY", "NOOP"})) {
+			return std::string();
+		}
+	}
+	return "imap";
+}
+
+bool PopStatus(const std::string &line, const char *status) {
+	const size_t length = std::strlen(status);
+	return line.compare(0, length, status) == 0 && (line.size() == length || line[length] == ' ');
+}
+
+// The server side of the same exchanges, ending in the reply that accepts
+// STARTTLS. SMTP: a 220 greeting, 250 replies with 5xx refusals among them,
+// at least one 250, then 220. FTP: a 220 greeting, then 2xx or 5xx replies,
+// then 234. POP3: a +OK greeting, +OK or -ERR replies, of which a multi-line
+// one (CAPA's) ends with a lone dot, then +OK. IMAP: an untagged OK greeting,
+// untagged CAPABILITY or OK data and tagged replies, then a tagged OK.
+std::string StartTlsServer(const std::string &text) {
+	std::vector<std::string> lines;
+	if (!CrlfLines(text, lines)) {
+		return std::string();
+	}
+	std::vector<int> codes;
+	if (ReplyCodes(lines, true, codes) && codes.size() >= 3 && codes.front() == 220 && codes.back() == 220 &&
+	    std::all_of(codes.begin() + 1, codes.end() - 1, [](int code) { return code == 250 || code / 100 == 5; }) &&
+	    std::find(codes.begin() + 1, codes.end() - 1, 250) != codes.end() - 1) {
+		return "smtp";
+	}
+	if (ReplyCodes(lines, false, codes) && codes.size() >= 2 && codes.front() == 220 && codes.back() == 234 &&
+	    std::all_of(codes.begin() + 1, codes.end() - 1,
+	                [](int code) { return code != 234 && (code / 100 == 2 || code / 100 == 5); })) {
+		return "ftp";
+	}
+	if (PopStatus(lines[0], "+OK")) {
+		if (lines.size() < 2 || !PopStatus(lines.back(), "+OK")) {
+			return std::string();
+		}
+		for (size_t i = 1; i + 1 < lines.size(); ++i) {
+			const bool ok = PopStatus(lines[i], "+OK");
+			if (!ok && !PopStatus(lines[i], "-ERR")) {
+				return std::string();
+			}
+			// A +OK followed by a line that is no status begins a multi-line reply.
+			if (ok && !PopStatus(lines[i + 1], "+OK") && !PopStatus(lines[i + 1], "-ERR")) {
+				while (++i + 1 < lines.size() && lines[i] != ".") {
+				}
+				if (lines[i] != ".") {
+					return std::string();
+				}
+			}
+		}
+		return "pop3";
+	}
+	std::string tag, rest;
+	if (lines.size() < 2 || !ImapLine(lines[0], tag, rest) || tag != "*" || !Command(rest, "OK")) {
+		return std::string();
+	}
+	for (size_t i = 1; i < lines.size(); ++i) {
+		const bool last = i + 1 == lines.size();
+		if (!ImapLine(lines[i], tag, rest) || (last && (tag == "*" || !Command(rest, "OK")))) {
+			return std::string();
+		}
+		if (!last && !(tag == "*" ? AnyCommand(rest, {"CAPABILITY", "OK"}) : AnyCommand(rest, {"OK", "NO", "BAD"}))) {
+			return std::string();
+		}
+	}
+	return "imap";
+}
+
 // The client side of a tunnel before its ClientHello, parsed exactly: every
 // byte must belong to the exchange. RFC 1928 SOCKS5 with no authentication or
 // RFC 1929 username and password, SOCKS4 and 4a, and HTTP CONNECT. SOCKS5 with
@@ -683,10 +882,13 @@ void ClassifyClientPrefix(const uint8_t *data, size_t size, std::string &tunnel,
 		return;
 	}
 	std::string target;
-	if (HttpClientPrefix(std::string(reinterpret_cast<const char *>(data), size), target)) {
+	const std::string text(reinterpret_cast<const char *>(data), size);
+	if (HttpClientPrefix(text, target)) {
 		tunnel = "http_connect";
 		destination = EscapeTlsText(target);
+		return;
 	}
+	tunnel = StartTlsClient(text);
 }
 
 // The server side before its ServerHello: a SOCKS5 method choice, the RFC 1929
@@ -716,9 +918,12 @@ void ClassifyServerPrefix(const uint8_t *data, size_t size, std::string &tunnel)
 		tunnel = "socks4";
 		return;
 	}
-	if (HttpServerPrefix(std::string(reinterpret_cast<const char *>(data), size))) {
+	const std::string text(reinterpret_cast<const char *>(data), size);
+	if (HttpServerPrefix(text)) {
 		tunnel = "http_connect";
+		return;
 	}
+	tunnel = StartTlsServer(text);
 }
 
 } // namespace

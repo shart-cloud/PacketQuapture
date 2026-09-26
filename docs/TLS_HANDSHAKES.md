@@ -75,7 +75,7 @@ one row. That is a different shape, and it needs rules the DNS reader never had.
 | `ja4s`, `ja4s_r` | JA4S server fingerprint and its raw form. **FoxIO License 1.1**, see [NOTICE](../NOTICE). |
 | `server_certificates` | The server's certificate chain, a `LIST(STRUCT)` with the fields below, leaf first. NULL when no Certificate message was read, which includes every TLS 1.3 handshake. See below. |
 | `client_certificates` | The client's certificates, the same type, when the server asked for them in TLS 1.2 or earlier. `[]` when the client was asked and had none; NULL when it sent no Certificate message. |
-| `tunnel` | `STRUCT(protocol, destination, client_prefix_bytes, server_prefix_bytes)` when bytes came before TLS in a captured direction, such as a SOCKS or HTTP CONNECT exchange; NULL when TLS began every captured stream. See below. |
+| `tunnel` | `STRUCT(protocol, destination, client_prefix_bytes, server_prefix_bytes)` when bytes came before TLS in a captured direction, such as a SOCKS or HTTP CONNECT exchange or a STARTTLS upgrade; NULL when TLS began every captured stream. See below. |
 
 ## Hello lists
 
@@ -320,6 +320,18 @@ byte left over:
 | `socks5` | RFC 1928 greeting, RFC 1929 username and password if offered, CONNECT request | Method choice, RFC 1929 status if it chose that method, success reply |
 | `socks4`, `socks4a` | CONNECT request, and for 4a (address `0.0.0.x`) a name | Granted reply; always `socks4`, since the reply cannot tell 4 from 4a |
 | `http_connect` | One or more `CONNECT target HTTP/1.x` heads to one target, as a client sends when a proxy asks it to log in | Refusals such as `407`, each body framed by `Content-Length`, then a `2xx` head, which has no body whatever it declares |
+| `smtp` | `EHLO` or `HELO`, then any of `EHLO`, `HELO`, `NOOP`, `RSET`, then `STARTTLS` (RFC 3207) | A `220` greeting, `250` replies (at least one) with `5xx` refusals among them, then `220` |
+| `imap` | Tagged `CAPABILITY` or `NOOP` commands, then a tagged `STARTTLS` (RFC 2595) | An untagged `* OK` greeting, untagged `CAPABILITY` or `OK` data and tagged `OK`, `NO` or `BAD` replies, then a tagged `OK` |
+| `pop3` | Any number of `CAPA`, then `STLS` (RFC 2595) | A `+OK` greeting, `+OK` or `-ERR` replies (`CAPA`'s multi-line one ending in a lone `.`), then `+OK` |
+| `ftp` | Any of `FEAT`, `SYST`, `NOOP` and refused `AUTH` attempts, then `AUTH TLS`, `AUTH SSL`, `AUTH TLS-C` or `AUTH TLS-P` (RFC 4217) | A `220` greeting, `2xx` or `5xx` replies, then `234` |
+
+The four STARTTLS exchanges are read line by line: every line must end in CRLF, and
+commands are matched without regard to case. A multi-line SMTP or FTP reply ends at its
+code alone or followed by a space; SMTP repeats the code and a hyphen on every line before
+that, while FTP allows any text there. A login, `MAIL`, or any command not listed before
+the upgrade leaves the prefix unrecognised, as does an IMAP `BYE` or `PREAUTH`. Each side
+is read on its own, so an IMAP server's final tag is not matched to the client's. These
+protocols name no destination, so `destination` is NULL for them.
 
 - `protocol` is the client's reading when its prefix was recognised, since only the
   client's request names the destination, and otherwise the server's. It is NULL when
@@ -417,7 +429,7 @@ Handshakes can still go missing on very busy captures. The transport core tracks
 becomes its own one-packet stream with status `limit`. This reader cannot tell whether
 such a stream carried TLS, so it reports nothing for it.
 
-Tunnels other than SOCKS and HTTP CONNECT are read, but not named. STARTTLS, where TLS
-follows a plaintext SMTP, IMAP or similar exchange, is found the same way when that
-exchange fits in 8 KiB, and is reported with an unrecognised prefix. TLS after a longer
-prefix is not found.
+Tunnels other than SOCKS, HTTP CONNECT and SMTP, IMAP, POP3 and FTP STARTTLS are read,
+but not named: XMPP, LDAP and PostgreSQL upgrades, for example, are found the same way
+when their exchange fits in 8 KiB, and are reported with an unrecognised prefix. TLS after
+a longer prefix is not found.
