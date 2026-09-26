@@ -9,6 +9,7 @@ namespace {
 
 const uint8_t TAG_BOOLEAN = 0x01;
 const uint8_t TAG_INTEGER = 0x02;
+const uint8_t TAG_BIT_STRING = 0x03;
 const uint8_t TAG_OCTET_STRING = 0x04;
 const uint8_t TAG_OID = 0x06;
 const uint8_t TAG_UTF8_STRING = 0x0C;
@@ -145,11 +146,33 @@ bool DecodeOid(const Element &element, std::string &out) {
 	return true;
 }
 
+// An OID and the name it is given.
+struct Named {
+	const char *oid, *name;
+};
+
+// The entry for oid in a table whose entries begin with their OID, or nullptr.
+template <class T, size_t N>
+const T *Find(const T (&table)[N], const std::string &oid) {
+	for (const auto &entry : table) {
+		if (oid == entry.oid) {
+			return &entry;
+		}
+	}
+	return nullptr;
+}
+
+template <size_t N>
+const char *Lookup(const Named (&table)[N], const std::string &oid) {
+	const Named *entry = Find(table, oid);
+	return entry != nullptr ? entry->name : nullptr;
+}
+
 // RFC 4514 section 3 lists the names every implementation must know. It allows
 // other registered names; for those this uses the spelling OpenSSL prints with
 // -nameopt RFC2253, so the two can be compared. Anything else is a dotted OID.
 const char *ShortName(const std::string &oid) {
-	static const char *const names[][2] = {
+	static const Named names[] = {
 	    {"2.5.4.3", "CN"},
 	    {"2.5.4.7", "L"},
 	    {"2.5.4.8", "ST"},
@@ -176,12 +199,7 @@ const char *ShortName(const std::string &oid) {
 	    {"1.3.6.1.4.1.311.60.2.1.2", "jurisdictionST"},
 	    {"1.3.6.1.4.1.311.60.2.1.3", "jurisdictionC"},
 	};
-	for (const auto &entry : names) {
-		if (oid == entry[0]) {
-			return entry[1];
-		}
-	}
-	return nullptr;
+	return Lookup(names, oid);
 }
 
 void AppendUtf8(uint32_t code, std::string &out) {
@@ -471,6 +489,245 @@ std::string FormatIp(const uint8_t *p, size_t size) {
 
 namespace {
 
+// Algorithm and curve names as `openssl x509 -text` prints them, which is
+// OpenSSL's long name for each object, each checked against OpenSSL 3.0.13. An
+// algorithm outside this table is its dotted OID, even where OpenSSL has a name.
+const char *AlgorithmName(const std::string &oid) {
+	static const Named names[] = {
+	    {"1.2.840.113549.1.1.1", "rsaEncryption"},
+	    {"1.2.840.113549.1.1.2", "md2WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.3", "md4WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.4", "md5WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.5", "sha1WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.7", "rsaesOaep"},
+	    {"1.2.840.113549.1.1.10", "rsassaPss"},
+	    {"1.2.840.113549.1.1.11", "sha256WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.12", "sha384WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.13", "sha512WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.14", "sha224WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.15", "sha512-224WithRSAEncryption"},
+	    {"1.2.840.113549.1.1.16", "sha512-256WithRSAEncryption"},
+	    {"1.3.14.3.2.29", "sha1WithRSA"},
+	    {"1.3.36.3.3.1.2", "ripemd160WithRSA"},
+	    {"2.16.840.1.101.3.4.3.13", "RSA-SHA3-224"},
+	    {"2.16.840.1.101.3.4.3.14", "RSA-SHA3-256"},
+	    {"2.16.840.1.101.3.4.3.15", "RSA-SHA3-384"},
+	    {"2.16.840.1.101.3.4.3.16", "RSA-SHA3-512"},
+	    {"1.2.840.10040.4.1", "dsaEncryption"},
+	    {"1.2.840.10040.4.3", "dsaWithSHA1"},
+	    {"2.16.840.1.101.3.4.3.1", "dsa_with_SHA224"},
+	    {"2.16.840.1.101.3.4.3.2", "dsa_with_SHA256"},
+	    {"2.16.840.1.101.3.4.3.3", "dsa_with_SHA384"},
+	    {"2.16.840.1.101.3.4.3.4", "dsa_with_SHA512"},
+	    {"1.2.840.10045.2.1", "id-ecPublicKey"},
+	    {"1.2.840.10045.4.1", "ecdsa-with-SHA1"},
+	    {"1.2.840.10045.4.2", "ecdsa-with-Recommended"},
+	    {"1.2.840.10045.4.3.1", "ecdsa-with-SHA224"},
+	    {"1.2.840.10045.4.3.2", "ecdsa-with-SHA256"},
+	    {"1.2.840.10045.4.3.3", "ecdsa-with-SHA384"},
+	    {"1.2.840.10045.4.3.4", "ecdsa-with-SHA512"},
+	    {"2.16.840.1.101.3.4.3.9", "ecdsa_with_SHA3-224"},
+	    {"2.16.840.1.101.3.4.3.10", "ecdsa_with_SHA3-256"},
+	    {"2.16.840.1.101.3.4.3.11", "ecdsa_with_SHA3-384"},
+	    {"2.16.840.1.101.3.4.3.12", "ecdsa_with_SHA3-512"},
+	    {"1.2.156.10197.1.501", "SM2-with-SM3"},
+	    {"1.2.643.7.1.1.1.1", "GOST R 34.10-2012 with 256 bit modulus"},
+	    {"1.2.643.7.1.1.1.2", "GOST R 34.10-2012 with 512 bit modulus"},
+	    {"1.2.643.7.1.1.3.2", "GOST R 34.10-2012 with GOST R 34.11-2012 (256 bit)"},
+	    {"1.2.643.7.1.1.3.3", "GOST R 34.10-2012 with GOST R 34.11-2012 (512 bit)"},
+	    {"1.3.101.110", "X25519"},
+	    {"1.3.101.111", "X448"},
+	    {"1.3.101.112", "ED25519"},
+	    {"1.3.101.113", "ED448"},
+	};
+	return Lookup(names, oid);
+}
+
+// Named curves as OpenSSL's ASN1 OID line prints them, and their sizes.
+struct NamedCurve {
+	const char *oid, *name;
+	uint32_t bits;
+};
+
+const NamedCurve *FindCurve(const std::string &oid) {
+	static const NamedCurve curves[] = {
+	    {"1.2.840.10045.3.1.1", "prime192v1", 192},
+	    {"1.3.132.0.33", "secp224r1", 224},
+	    {"1.2.840.10045.3.1.7", "prime256v1", 256},
+	    {"1.3.132.0.34", "secp384r1", 384},
+	    {"1.3.132.0.35", "secp521r1", 521},
+	    {"1.3.132.0.10", "secp256k1", 256},
+	    {"1.3.36.3.3.2.8.1.1.7", "brainpoolP256r1", 256},
+	    {"1.3.36.3.3.2.8.1.1.11", "brainpoolP384r1", 384},
+	    {"1.3.36.3.3.2.8.1.1.13", "brainpoolP512r1", 512},
+	    {"1.2.156.10197.1.301", "SM2", 256},
+	};
+	return Find(curves, oid);
+}
+
+// RFC 5280 4.2.1.12 and the purposes CAs commonly assert beside them.
+const char *PurposeName(const std::string &oid) {
+	static const Named names[] = {
+	    {"2.5.29.37.0", "anyExtendedKeyUsage"},   {"1.3.6.1.5.5.7.3.1", "serverAuth"},
+	    {"1.3.6.1.5.5.7.3.2", "clientAuth"},      {"1.3.6.1.5.5.7.3.3", "codeSigning"},
+	    {"1.3.6.1.5.5.7.3.4", "emailProtection"}, {"1.3.6.1.5.5.7.3.8", "timeStamping"},
+	    {"1.3.6.1.5.5.7.3.9", "OCSPSigning"},
+	};
+	return Lookup(names, oid);
+}
+
+// The name OpenSSL prints for an AlgorithmIdentifier's algorithm, or its dotted
+// OID. False, with nothing set, when the OID cannot be read.
+bool AlgorithmOf(const Element &identifier, std::string &oid, std::string &out) {
+	Der fields(identifier.content, identifier.length);
+	Element id;
+	if (!fields.Expect(TAG_OID, id) || !DecodeOid(id, oid)) {
+		return false;
+	}
+	const char *name = AlgorithmName(oid);
+	out = name != nullptr ? name : oid;
+	return true;
+}
+
+// Significant bits of a DER INTEGER's magnitude, as OpenSSL's BN_num_bits.
+uint32_t IntegerBits(const Element &integer) {
+	size_t i = 0;
+	while (i < integer.length && integer.content[i] == 0) {
+		++i;
+	}
+	if (i == integer.length) {
+		return 0;
+	}
+	uint32_t bits = static_cast<uint32_t>((integer.length - i - 1) * 8);
+	for (uint8_t top = integer.content[i]; top != 0; top >>= 1U) {
+		++bits;
+	}
+	return bits;
+}
+
+// SubjectPublicKeyInfo: the algorithm, and the key's size where it has one.
+// Describing the key is an addition to the certificate, so anything here that
+// does not parse leaves these fields unknown and the certificate as it was.
+void DecodePublicKey(const Element &info, X509Certificate &out) {
+	Der fields(info.content, info.length);
+	Element algorithm, key;
+	std::string oid;
+	if (!fields.Expect(TAG_SEQUENCE, algorithm) || !fields.Expect(TAG_BIT_STRING, key) ||
+	    !AlgorithmOf(algorithm, oid, out.public_key_algorithm)) {
+		return;
+	}
+	Der parameters(algorithm.content, algorithm.length);
+	Element skipped, parameter;
+	parameters.Next(skipped);
+	const bool has_parameter = !parameters.AtEnd() && parameters.Next(parameter);
+	if (oid == "1.2.840.10045.2.1") {
+		// A named curve; explicit curve parameters are not sized.
+		std::string curve;
+		if (has_parameter && parameter.tag == TAG_OID && DecodeOid(parameter, curve)) {
+			const NamedCurve *known = FindCurve(curve);
+			out.public_key_curve = known != nullptr ? known->name : curve;
+			out.public_key_bits = known != nullptr ? known->bits : 0;
+		}
+	} else if (oid == "1.2.840.10040.4.1") {
+		Element prime;
+		if (has_parameter && parameter.tag == TAG_SEQUENCE) {
+			Der values(parameter.content, parameter.length);
+			if (values.Expect(TAG_INTEGER, prime)) {
+				out.public_key_bits = IntegerBits(prime);
+			}
+		}
+	} else if ((oid == "1.2.840.113549.1.1.1" || oid == "1.2.840.113549.1.1.10") && key.length > 1 &&
+	           key.content[0] == 0) {
+		// rsaEncryption and RSASSA-PSS keys share the RSAPublicKey body.
+		Der body(key.content + 1, key.length - 1);
+		Element sequence, modulus;
+		if (body.Expect(TAG_SEQUENCE, sequence)) {
+			Der values(sequence.content, sequence.length);
+			if (values.Expect(TAG_INTEGER, modulus)) {
+				out.public_key_bits = IntegerBits(modulus);
+			}
+		}
+	}
+}
+
+// basicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+//                                 pathLenConstraint INTEGER (0..MAX) OPTIONAL }
+bool DecodeBasicConstraints(const Element &value, X509Certificate &out) {
+	Der outer(value.content, value.length);
+	Element sequence, element;
+	if (!outer.Expect(TAG_SEQUENCE, sequence) || !outer.AtEnd()) {
+		return false;
+	}
+	Der fields(sequence.content, sequence.length);
+	out.has_basic_constraints = true;
+	if (fields.PeekTag() == TAG_BOOLEAN) {
+		if (!fields.Next(element) || element.length != 1) {
+			return false;
+		}
+		out.is_ca = element.content[0] != 0;
+	}
+	if (fields.PeekTag() == TAG_INTEGER) {
+		// Non-negative, and small enough for a UINTEGER after any sign octet.
+		if (!fields.Next(element) || element.length == 0 || (element.content[0] & 0x80U) ||
+		    element.length - (element.content[0] == 0 ? 1 : 0) > 4) {
+			return false;
+		}
+		uint64_t length = 0;
+		for (size_t i = 0; i < element.length; ++i) {
+			length = (length << 8U) | element.content[i];
+		}
+		out.has_path_length = true;
+		out.path_length = static_cast<uint32_t>(length);
+	}
+	return fields.AtEnd();
+}
+
+// keyUsage ::= BIT STRING, bit 0 first.
+bool DecodeKeyUsage(const Element &value, X509Certificate &out) {
+	static const char *const bits[] = {"digitalSignature", "nonRepudiation", "keyEncipherment",
+	                                   "dataEncipherment", "keyAgreement",   "keyCertSign",
+	                                   "cRLSign",          "encipherOnly",   "decipherOnly"};
+	Der outer(value.content, value.length);
+	Element string;
+	if (!outer.Expect(TAG_BIT_STRING, string) || !outer.AtEnd() || string.length == 0 || string.content[0] > 7 ||
+	    (string.length == 1 && string.content[0] != 0)) {
+		return false;
+	}
+	const size_t unused = string.content[0];
+	const size_t total = (string.length - 1) * 8 - unused;
+	out.has_key_usage = true;
+	for (size_t bit = 0; bit < total && bit < sizeof(bits) / sizeof(bits[0]); ++bit) {
+		if (string.content[1 + bit / 8] & (0x80U >> (bit % 8))) {
+			out.key_usage.push_back(bits[bit]);
+		}
+	}
+	return true;
+}
+
+// ExtKeyUsageSyntax ::= SEQUENCE SIZE (1..MAX) OF KeyPurposeId
+X509Result DecodeExtendedKeyUsage(const Element &value, size_t max_entries, X509Certificate &out) {
+	Der outer(value.content, value.length);
+	Element sequence;
+	if (!outer.Expect(TAG_SEQUENCE, sequence) || !outer.AtEnd()) {
+		return X509Result::MALFORMED;
+	}
+	Der list(sequence.content, sequence.length);
+	out.has_extended_key_usage = true;
+	while (!list.AtEnd()) {
+		Element id;
+		std::string oid;
+		if (!list.Expect(TAG_OID, id) || !DecodeOid(id, oid)) {
+			return X509Result::MALFORMED;
+		}
+		if (out.extended_key_usage.size() >= max_entries) {
+			return X509Result::OVER_LIMIT;
+		}
+		const char *name = PurposeName(oid);
+		out.extended_key_usage.push_back(name != nullptr ? name : oid);
+	}
+	return out.extended_key_usage.empty() ? X509Result::MALFORMED : X509Result::OK;
+}
+
 // SubjectAltName ::= GeneralNames, a SEQUENCE OF GeneralName. Only dNSName and
 // iPAddress are kept; the other forms are skipped.
 X509Result DecodeSubjectAltName(const Element &value, size_t max_entries, X509Certificate &out) {
@@ -504,13 +761,18 @@ X509Result DecodeSubjectAltName(const Element &value, size_t max_entries, X509Ce
 	return X509Result::OK;
 }
 
-X509Result DecodeExtensions(const Element &wrapper, size_t max_san_entries, X509Certificate &out) {
+X509Result DecodeExtensions(const Element &wrapper, size_t max_entries, X509Certificate &out) {
 	Der explicit_tag(wrapper.content, wrapper.length);
 	Element extensions;
 	if (!explicit_tag.Expect(TAG_SEQUENCE, extensions) || !explicit_tag.AtEnd()) {
 		return X509Result::MALFORMED;
 	}
+	// RFC 5280 4.2: a certificate must not carry an extension twice. A second
+	// subjectAltName makes the certificate malformed, as it always has. The
+	// other extensions read here only add fields, so a malformed or repeated
+	// one leaves its field unknown instead.
 	bool seen_san = false;
+	size_t basic_copies = 0, usage_copies = 0, purpose_copies = 0;
 	Der list(extensions.content, extensions.length);
 	while (!list.AtEnd()) {
 		Element extension, id, value;
@@ -531,21 +793,41 @@ X509Result DecodeExtensions(const Element &wrapper, size_t max_san_entries, X509
 			return X509Result::MALFORMED;
 		}
 		if (oid == "2.5.29.17") {
-			// RFC 5280 4.2: a certificate must not carry an extension twice.
 			if (seen_san) {
 				return X509Result::MALFORMED;
 			}
 			seen_san = true;
-			const auto result = DecodeSubjectAltName(value, max_san_entries, out);
+			const auto result = DecodeSubjectAltName(value, max_entries, out);
 			if (result != X509Result::OK) {
 				return result;
+			}
+		} else if (oid == "2.5.29.19") {
+			if (++basic_copies > 1 || !DecodeBasicConstraints(value, out)) {
+				out.has_basic_constraints = out.is_ca = out.has_path_length = false;
+				out.path_length = 0;
+			}
+		} else if (oid == "2.5.29.15") {
+			if (++usage_copies > 1 || !DecodeKeyUsage(value, out)) {
+				out.has_key_usage = false;
+				out.key_usage.clear();
+			}
+		} else if (oid == "2.5.29.37") {
+			// Too many purposes is a limit, as too many names is: it bounds memory.
+			const auto result =
+			    ++purpose_copies > 1 ? X509Result::MALFORMED : DecodeExtendedKeyUsage(value, max_entries, out);
+			if (result == X509Result::OVER_LIMIT) {
+				return result;
+			}
+			if (result != X509Result::OK) {
+				out.has_extended_key_usage = false;
+				out.extended_key_usage.clear();
 			}
 		}
 	}
 	return X509Result::OK;
 }
 
-X509Result Parse(const uint8_t *data, size_t size, size_t max_san_entries, X509Certificate &out) {
+X509Result Parse(const uint8_t *data, size_t size, size_t max_entries, X509Certificate &out) {
 	Der top(data, size);
 	Element certificate, tbs;
 	if (!top.Expect(TAG_SEQUENCE, certificate) || !top.AtEnd()) {
@@ -555,11 +837,15 @@ X509Result Parse(const uint8_t *data, size_t size, size_t max_san_entries, X509C
 	if (!outer.Expect(TAG_SEQUENCE, tbs)) {
 		return X509Result::MALFORMED;
 	}
-	// signatureAlgorithm and signatureValue follow; they are framed but not read.
+	// signatureAlgorithm and signatureValue follow. The value is framed but not
+	// read, since nothing is verified.
 	Element algorithm, signature;
+	std::string signature_oid;
 	if (!outer.Expect(TAG_SEQUENCE, algorithm) || !outer.Next(signature) || !outer.AtEnd()) {
 		return X509Result::MALFORMED;
 	}
+	// Naming the algorithm adds a field; an OID that cannot be read leaves it unknown.
+	AlgorithmOf(algorithm, signature_oid, out.signature_algorithm);
 
 	Der fields(tbs.content, tbs.length);
 	Element element, serial, validity, issuer, subject;
@@ -589,6 +875,7 @@ X509Result Parse(const uint8_t *data, size_t size, size_t max_san_entries, X509C
 	if (!fields.Expect(TAG_SEQUENCE, element)) { // subjectPublicKeyInfo
 		return X509Result::MALFORMED;
 	}
+	DecodePublicKey(element, out);
 	for (const uint8_t optional : {TAG_ISSUER_UID, TAG_SUBJECT_UID}) {
 		if (fields.PeekTag() == optional && !fields.Next(element)) {
 			return X509Result::MALFORMED;
@@ -598,7 +885,7 @@ X509Result Parse(const uint8_t *data, size_t size, size_t max_san_entries, X509C
 		if (!fields.Expect(TAG_EXTENSIONS, element) || !fields.AtEnd()) {
 			return X509Result::MALFORMED;
 		}
-		const auto result = DecodeExtensions(element, max_san_entries, out);
+		const auto result = DecodeExtensions(element, max_entries, out);
 		if (result != X509Result::OK) {
 			return result;
 		}
@@ -608,9 +895,9 @@ X509Result Parse(const uint8_t *data, size_t size, size_t max_san_entries, X509C
 
 } // namespace
 
-X509Result ParseX509Certificate(const uint8_t *data, size_t size, size_t max_san_entries, X509Certificate &out) {
+X509Result ParseX509Certificate(const uint8_t *data, size_t size, size_t max_entries, X509Certificate &out) {
 	X509Certificate parsed;
-	const auto result = Parse(data, size, max_san_entries, parsed);
+	const auto result = Parse(data, size, max_entries, parsed);
 	out = result == X509Result::OK ? parsed : X509Certificate();
 	return result;
 }

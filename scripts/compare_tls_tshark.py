@@ -28,9 +28,11 @@ Exits non-zero on any disagreement that is not a documented divergence.
 import argparse
 import collections
 import datetime
+import functools
 import ipaddress
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -249,11 +251,12 @@ def tshark_certificates(path):
             # tshark lists every entry's length but dissects only the certificates
             # it can parse; the rest are counted, so read_tls must have NULLs there.
             unparsed = len(as_list(message.get("tls.handshake.certificate_length", []))) - len(chain)
-            # The certificate follows the server's hello, so the server is the source.
-            messages[dst + src].append((chain, unparsed))
+            # Keyed sender first; compare_certificates decides which side sent it.
+            messages[src + dst].append((chain, unparsed))
     return messages
 
 
+@functools.lru_cache(maxsize=None)
 def openssl_names(der):
     names = []
     for option in ("-subject", "-issuer"):
@@ -264,16 +267,89 @@ def openssl_names(der):
     return names
 
 
-def our_certificates(path, duckdb):
+# OpenSSL's -text names for keyUsage bits and extendedKeyUsage purposes, and
+# what read_tls calls them: RFC 5280 names, or the dotted OID for a purpose
+# that has none there.
+OPENSSL_KEY_USAGE = {
+    "Digital Signature": "digitalSignature", "Non Repudiation": "nonRepudiation",
+    "Key Encipherment": "keyEncipherment", "Data Encipherment": "dataEncipherment",
+    "Key Agreement": "keyAgreement", "Certificate Sign": "keyCertSign", "CRL Sign": "cRLSign",
+    "Encipher Only": "encipherOnly", "Decipher Only": "decipherOnly",
+}
+OPENSSL_PURPOSES = {
+    "Any Extended Key Usage": "anyExtendedKeyUsage", "TLS Web Server Authentication": "serverAuth",
+    "TLS Web Client Authentication": "clientAuth", "Code Signing": "codeSigning",
+    "E-mail Protection": "emailProtection", "Time Stamping": "timeStamping", "OCSP Signing": "OCSPSigning",
+    "Microsoft Server Gated Crypto": "1.3.6.1.4.1.311.10.3.3", "Netscape Server Gated Crypto": "2.16.840.1.113730.4.1",
+    "Microsoft Encrypted File System": "1.3.6.1.4.1.311.10.3.4", "Microsoft Smartcard Login": "1.3.6.1.4.1.311.20.2.2",
+    "IPSec End System": "1.3.6.1.5.5.7.3.5", "IPSec Tunnel": "1.3.6.1.5.5.7.3.6", "IPSec User": "1.3.6.1.5.5.7.3.7",
+    "ipsec Internet Key Exchange": "1.3.6.1.5.5.7.3.17", "Microsoft Commercial Code Signing": "1.3.6.1.4.1.311.2.1.22",
+    "Microsoft Individual Code Signing": "1.3.6.1.4.1.311.2.1.21", "Microsoft Trust List Signing": "1.3.6.1.4.1.311.10.3.1",
+}
+
+
+@functools.lru_cache(maxsize=None)
+def openssl_details(der):
+    """The fields OpenSSL prints for a certificate, in read_tls's terms. None
+    when OpenSSL cannot read it. Cached: a capture repeats the same few
+    certificates across many connections."""
+    def run(*options):
+        result = subprocess.run(["openssl", "x509", "-inform", "DER", "-noout", *options], input=der,
+                                capture_output=True)
+        return result.stdout.decode("utf-8", "replace") if result.returncode == 0 else None
+    text = run("-text")
+    if text is None:
+        return None
+    fingerprints = [run("-fingerprint", f"-{digest}") for digest in ("sha1", "sha256")]
+    details = {name: fingerprint.split("=", 1)[1].strip().replace(":", "").lower() if fingerprint else None
+               for name, fingerprint in zip(("sha1", "sha256"), fingerprints)}
+    lines = [line.strip() for line in text.splitlines()]
+
+    def after(label):
+        for index, line in enumerate(lines):
+            if line.startswith(label):
+                return line[len(label):].strip(), (lines[index + 1] if index + 1 < len(lines) else "")
+        return None, None
+
+    details["signature_algorithm"] = after("Signature Algorithm:")[0]
+    details["public_key_algorithm"] = after("Public Key Algorithm:")[0]
+    bits = re.search(r"Public-Key: \((\d+) bit\)", text)
+    details["public_key_bits"] = int(bits.group(1)) if bits else None
+    curve = after("ASN1 OID:")[0]
+    details["public_key_curve"] = curve
+    label, value = after("X509v3 Basic Constraints:")
+    details["is_ca"] = None if label is None else "CA:TRUE" in value
+    path = re.search(r"pathlen:(\d+)", value or "")
+    details["path_length"] = int(path.group(1)) if path else None
+    label, value = after("X509v3 Key Usage:")
+    details["key_usage"] = None if label is None else [OPENSSL_KEY_USAGE.get(v.strip(), v.strip())
+                                                         for v in value.split(",")]
+    label, value = after("X509v3 Extended Key Usage:")
+    details["extended_key_usage"] = None if label is None else [OPENSSL_PURPOSES.get(v.strip(), v.strip())
+                                                                  for v in value.split(",")]
+    return details
+
+
+DETAIL_FIELDS = ("sha1", "sha256", "signature_algorithm", "public_key_algorithm", "public_key_bits",
+                 "public_key_curve", "is_ca", "path_length", "key_usage", "extended_key_usage")
+
+
+def our_certificates(path, duckdb, column="server_certificates"):
     # Nested values travel as control-character-separated strings, as the lists do.
     field = ("CASE WHEN c IS NULL THEN chr(1) ELSE concat_ws(chr(30), c.subject, c.issuer, c.serial, "
              "epoch(c.not_before)::BIGINT, epoch(c.not_after)::BIGINT, array_to_string(c.san_dns, chr(29)), "
-             "array_to_string(c.san_ip, chr(29)), c.ja4x, c.ja4x_r) END")
+             "array_to_string(c.san_ip, chr(29)), c.ja4x, c.ja4x_r, "
+             "coalesce(c.sha1, chr(2)), coalesce(c.sha256, chr(2)), coalesce(c.signature_algorithm, chr(2)), "
+             "coalesce(c.public_key_algorithm, chr(2)), coalesce(c.public_key_bits::VARCHAR, chr(2)), "
+             "coalesce(c.public_key_curve, chr(2)), coalesce(c.is_ca::VARCHAR, chr(2)), "
+             "coalesce(c.path_length::VARCHAR, chr(2)), coalesce(array_to_string(c.key_usage, chr(29)), chr(2)), "
+             "coalesce(array_to_string(c.extended_key_usage, chr(29)), chr(2))) END")
     query = (f"SELECT client_ip, client_port, server_ip, server_port, reassembly_status, "
              f"array_to_string(warnings, ',') AS warnings, "
-             f"array_to_string(list_transform(server_certificates, lambda c: {field}), chr(31)) AS chain, "
-             f"server_certificates IS NULL AS absent "
-             f"FROM read_tls('{path}') WHERE server_hello ORDER BY client_ip, client_port, handshake_number")
+             f"array_to_string(list_transform({column}, lambda c: {field}), chr(31)) AS chain, "
+             f"{column} IS NULL AS absent FROM read_tls('{path}') "
+             f"WHERE {'server_hello' if column == 'server_certificates' else 'client_hello'} "
+             f"ORDER BY client_ip, client_port, handshake_number")
     output = subprocess.run([duckdb, "-json", "-c", query], check=True, capture_output=True, cwd=ROOT).stdout
     chains = collections.defaultdict(list)
     for row in json.loads(output.strip() or b"[]"):
@@ -285,11 +361,23 @@ def our_certificates(path, duckdb):
                 if item == "\x01":
                     chain.append(None)
                     continue
-                subject, issuer, serial, before, after, dns, ips, ja4x, ja4x_r = item.split("\x1e")
-                chain.append({"subject": subject, "issuer": issuer, "serial": serial, "ja4x": ja4x, "ja4x_r": ja4x_r,
-                              "times": [int(before), int(after)],
-                              "san_dns": dns.split("\x1d") if dns else [],
-                              "san_ip": ips.split("\x1d") if ips else []})
+                parts = item.split("\x1e")
+                subject, issuer, serial, before, after, dns, ips, ja4x, ja4x_r = parts[:9]
+                certificate = {"subject": subject, "issuer": issuer, "serial": serial, "ja4x": ja4x,
+                               "ja4x_r": ja4x_r, "times": [int(before), int(after)],
+                               "san_dns": dns.split("\x1d") if dns else [],
+                               "san_ip": ips.split("\x1d") if ips else []}
+                for name, value in zip(DETAIL_FIELDS, parts[9:]):
+                    if value == "\x02":
+                        value = None
+                    elif name in ("public_key_bits", "path_length"):
+                        value = int(value)
+                    elif name == "is_ca":
+                        value = value == "true"
+                    elif name in ("key_usage", "extended_key_usage"):
+                        value = value.split("\x1d") if value else []
+                    certificate[name] = value
+                chain.append(certificate)
         chains[key].append((chain, row))
     return chains
 
@@ -308,10 +396,18 @@ def rust_ja4x(binary, der):
 
 def compare_certificates(path, duckdb, ja4x=None):
     reference = tshark_certificates(path)
-    ours_by_key = our_certificates(path, duckdb)
+    server_side = our_certificates(path, duckdb)
+    client_side = our_certificates(path, duckdb, "client_certificates")
     checked = failures = divergences = missed = 0
-    for key, messages in reference.items():
-        rows = [(chain, row) for chain, row in ours_by_key.get(key, []) if chain is not None or
+    for sent, messages in reference.items():
+        # Rows are keyed client first. A message sent by a row's client is a
+        # client certificate; otherwise the server sent it.
+        received = sent[2:] + sent[:2]
+        if sent in client_side and received not in server_side:
+            key, candidates = sent, client_side[sent]
+        else:
+            key, candidates = received, server_side.get(received, [])
+        rows = [(chain, row) for chain, row in candidates if chain is not None or
                 "certificate" in row["warnings"] or row["reassembly_status"] == "limit"]
         for index, (expected_chain, unparsed) in enumerate(messages):
             if index >= len(rows):
@@ -339,6 +435,9 @@ def compare_certificates(path, duckdb, ja4x=None):
                          ("san_dns", expected["san_dns"], actual["san_dns"]),
                          ("san_ip", [ipaddress.ip_address(a) for a in expected["san_ip"]],
                           [ipaddress.ip_address(a) for a in actual["san_ip"]])]
+                details = openssl_details(expected["der"])
+                if details is not None:
+                    pairs += [(name, details[name], actual[name]) for name in DETAIL_FIELDS]
                 if ja4x:
                     hashed, raw = rust_ja4x(ja4x, expected["der"])
                     pairs += [("ja4x", hashed, actual["ja4x"]), ("ja4x_r", raw, actual["ja4x_r"])]

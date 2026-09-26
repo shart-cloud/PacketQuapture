@@ -519,3 +519,40 @@ SELECT tunnel.protocol, tunnel.destination, tunnel.client_prefix_bytes, tunnel.s
 FROM read_tls('test/data/tls/tunnels.pcap') WHERE client_port = 51006;
 ----
 socks5	192.0.2.9:443	13	true
+
+# Hashes, algorithms, keys and usage, each from OpenSSL 3.0.13's -fingerprint
+# and -text for the DER tshark extracted. Usage names are RFC 5280's; OpenSSL
+# prints "Digital Signature" for digitalSignature, and a purpose without an
+# RFC 5280 name, here Microsoft Server Gated Crypto, is its OID.
+query IIIIIIIIIII
+SELECT i, s.sha1, s.sha256, s.signature_algorithm, s.public_key_algorithm, s.public_key_bits, s.public_key_curve,
+       s.is_ca, s.path_length, s.key_usage, s.extended_key_usage
+FROM (SELECT unnest(server_certificates) AS s, generate_subscripts(server_certificates, 1) AS i
+      FROM read_tls('test/data/tls/certificate_details.pcap') WHERE client_port = 51000) ORDER BY i;
+----
+1	faf848a99542af602d350e6b1632459b678dffe0	b2510a9be41c4be68cde00ca1d1b5b3110198b5f80e4eac63a4eabe3cd0d5ac1	sha256WithRSAEncryption	rsaEncryption	2048	NULL	false	NULL	[digitalSignature, keyEncipherment]	[serverAuth, clientAuth, 1.3.6.1.4.1.311.10.3.3]
+2	35c4db6f8531c726c2301f7db44ce7069d4d39d6	67140e4b6b6656ddd3a1b4f94086b8edae6e52c572faae10a22cb95a052369e9	ecdsa-with-SHA256	id-ecPublicKey	256	prime256v1	true	0	[keyCertSign, cRLSign]	NULL
+
+# The client's certificate, sent after its hello. An Ed25519 key has no size
+# OpenSSL prints. The second connection's client was asked and sent none.
+query IIIIII
+SELECT client_port, len(client_certificates), client_certificates[1].sha1, client_certificates[1].public_key_algorithm,
+       client_certificates[1].public_key_bits, client_certificates[1].extended_key_usage
+FROM read_tls('test/data/tls/certificate_details.pcap') ORDER BY client_port;
+----
+51000	1	c780daff8e7c323e7a516f84ad1ad409cab9f0cd	ED25519	NULL	[clientAuth]
+51001	0	NULL	NULL	NULL	NULL
+
+# No basicConstraints, keyUsage or extendedKeyUsage extension is NULL, not false or [].
+query IIIII
+SELECT s.sha1, s.is_ca, s.path_length, s.key_usage, s.extended_key_usage
+FROM (SELECT unnest(server_certificates) AS s FROM read_tls('test/data/tls/certificates.pcap')) ORDER BY s.sha1;
+----
+0195d962e51c74d40289f5ac42493cd2f207efdf	NULL	NULL	NULL	NULL
+4b37561d7c35b011a8c7ad05a07e6385f02530db	NULL	NULL	NULL	NULL
+
+# A client that sent no Certificate message has client_certificates NULL.
+query I
+SELECT count(*) FROM read_tls('test/data/tls/*.pcap') WHERE client_certificates IS NOT NULL AND filename NOT LIKE '%certificate_details.pcap';
+----
+0

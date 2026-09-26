@@ -371,8 +371,7 @@ bool ParseHello(const std::vector<uint8_t> &body, bool client, const TlsHandshak
 // held counts the certificate text this direction already holds; a chain that
 // would take it past max_direction_certificate_bytes is over the limit.
 void ParseCertificates(const std::vector<uint8_t> &body, const TlsHandshakeLimits &limits, size_t &held,
-                       TlsHandshake &handshake) {
-	auto &chain = handshake.server_certificates;
+                       TlsList<TlsCertificate> &chain, TlsHandshake &handshake) {
 	if (Duplicate(chain)) {
 		return;
 	}
@@ -395,12 +394,17 @@ void ParseCertificates(const std::vector<uint8_t> &body, const TlsHandshakeLimit
 		auto result = X509Result::OVER_LIMIT;
 		if (certificates.size() < limits.max_certificates && length <= limits.max_certificate_bytes) {
 			result = ParseX509Certificate(der.data(), der.size(), limits.max_list_entries, certificate.fields);
-			const size_t text = certificate.fields.TextBytes();
+			// The hashes are hex SHA-1 and SHA-256, charged before they are made
+			// so a chain dropped for its size is not hashed.
+			const size_t text = certificate.fields.TextBytes() + (limits.certificate_digest != nullptr ? 40 + 64 : 0);
 			if (result == X509Result::OK && text > limits.max_direction_certificate_bytes - held) {
 				result = X509Result::OVER_LIMIT;
 			}
 			if (result == X509Result::OK) {
 				held += text;
+				if (limits.certificate_digest != nullptr) {
+					limits.certificate_digest(der.data(), der.size(), certificate.fields);
+				}
 			}
 		}
 		if (result == X509Result::OVER_LIMIT) {
@@ -417,6 +421,16 @@ void ParseCertificates(const std::vector<uint8_t> &body, const TlsHandshakeLimit
 	}
 	chain.present = true;
 	chain.values = std::move(certificates);
+}
+
+// Whether a Certificate message was malformed or holds a certificate that did
+// not parse.
+bool Unparsed(const TlsList<TlsCertificate> &chain) {
+	bool unparsed = chain.malformed;
+	for (const auto &certificate : chain.values) {
+		unparsed = unparsed || !certificate.parsed;
+	}
+	return unparsed;
 }
 
 // A hello that failed to parse reports none of the fields read before the
@@ -883,13 +897,15 @@ void TlsHandshakeAssembler::ParseRecords(const TcpStream &stream, const TcpStrea
 			direction.handshakes.push_back(handshake);
 			direction.session_ids.push_back(session_id);
 		} else if (type == HANDSHAKE_CERTIFICATE && !direction.handshakes.empty() &&
-		           direction.handshakes.back().has_server_hello && direction.handshakes.back().status != "invalid") {
-			// The server's Certificate follows its ServerHello; a client certificate,
-			// or one with no hello before it, is not reported.
+		           direction.handshakes.back().status != "invalid") {
+			// Each side's Certificate follows its own hello in its own direction: the
+			// server's after the ServerHello, the client's, when asked for, after
+			// the ClientHello. One with no hello before it is not reported.
 			auto &handshake = direction.handshakes.back();
+			auto &chain = handshake.has_server_hello ? handshake.server_certificates : handshake.client_certificates;
 			std::vector<uint8_t> body(handshake_bytes.begin() + static_cast<long>(message_offset + 4),
 			                          handshake_bytes.begin() + static_cast<long>(message_offset + 4 + length));
-			ParseCertificates(body, limits, certificate_bytes, handshake);
+			ParseCertificates(body, limits, certificate_bytes, chain, handshake);
 			const auto span = locator.Locate(message_offset, length + 4);
 			if (span.second > 0) {
 				const auto provenance = chunk.Provenance(span.first, span.second);
@@ -941,6 +957,7 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 			handshake.client_supported_versions = from_client->client_supported_versions;
 			handshake.client_ec_point_formats = from_client->client_ec_point_formats;
 			handshake.client_alpn = from_client->client_alpn;
+			handshake.client_certificates = from_client->client_certificates;
 			handshake.first = from_client->first;
 			handshake.last = from_client->last;
 			handshake.status = from_client->status;
@@ -1037,15 +1054,11 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 		    (from_server->server_alpn.malformed || from_server->server_supported_versions.malformed)) {
 			handshake.warnings.push_back("server_list_malformed");
 		}
-		if (from_server != nullptr) {
-			const auto &chain = from_server->server_certificates;
-			bool unparsed = chain.malformed;
-			for (const auto &certificate : chain.values) {
-				unparsed = unparsed || !certificate.parsed;
-			}
-			if (unparsed) {
-				handshake.warnings.push_back("server_certificate_malformed");
-			}
+		if (from_server != nullptr && Unparsed(from_server->server_certificates)) {
+			handshake.warnings.push_back("server_certificate_malformed");
+		}
+		if (from_client != nullptr && Unparsed(from_client->client_certificates)) {
+			handshake.warnings.push_back("client_certificate_malformed");
 		}
 		// Bytes before TLS that parsed as no known tunnel. The row is still
 		// reported: its hello parsed in full, so the TLS fields are sound.

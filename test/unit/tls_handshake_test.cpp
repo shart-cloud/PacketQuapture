@@ -747,6 +747,52 @@ void TestCertificateLimits() {
 	assert(done[0].server_certificates.values.size() == 1 && done[1].server_certificates.over_limit);
 }
 
+// A stand-in digest: the parser has none, and the extension supplies DuckDB's.
+void FakeDigest(const uint8_t *, size_t size, X509Certificate &out) {
+	out.sha1 = "sha1:" + std::to_string(size);
+	out.sha256 = "sha256:" + std::to_string(size);
+}
+
+// The client's Certificate follows its ClientHello in its own direction, as
+// sent when the server asks for one; the server's chain is unaffected.
+void TestClientCertificates() {
+	const auto leaf = LeafCertificate();
+	TlsHandshakeLimits limits;
+	limits.certificate_digest = FakeDigest;
+	TlsHandshakeAssembler assembler(limits);
+	assembler.Add(Stream(Key(), 1, Concat(Record(ClientHello({})), Record(CertificateMessage({leaf}))), 1));
+	auto done = assembler.Add(
+	    Stream(Key().Reverse(), 2, Record(Concat(ServerHello(0x009C), CertificateMessage({leaf, leaf}))), 2));
+	assert(done.size() == 1 && done[0].warnings.empty());
+	const auto &client = done[0].client_certificates;
+	assert(client.present && client.values.size() == 1 && client.values[0].parsed);
+	assert(client.values[0].fields.subject == "CN=leaf.example,O=Test");
+	assert(client.values[0].fields.sha1 == "sha1:" + std::to_string(leaf.size()));
+	assert(done[0].server_certificates.values.size() == 2);
+	assert(done[0].server_certificates.values[1].fields.sha256 == "sha256:" + std::to_string(leaf.size()));
+
+	// Without a digest the hashes stay empty; a client with none sends an empty list.
+	TlsHandshakeAssembler plain;
+	plain.Add(Stream(Key(), 1, Concat(Record(ClientHello({})), Record(CertificateMessage({}))), 1));
+	done = plain.Finish();
+	assert(done.size() == 1 && done[0].client_certificates.present && done[0].client_certificates.values.empty());
+	assert(!done[0].server_certificates.present);
+
+	// A broken client certificate keeps its place and warns on the client side.
+	TlsHandshakeAssembler broken;
+	broken.Add(
+	    Stream(Key(), 1, Concat(Record(ClientHello({})), Record(CertificateMessage({{0x30, 0x03, 0x02, 0x01}}))), 1));
+	done = broken.Finish();
+	assert(done.size() == 1 && done[0].client_certificates.values.size() == 1);
+	assert(!done[0].client_certificates.values[0].parsed && HasWarning(done[0], "client_certificate_malformed"));
+	assert(!HasWarning(done[0], "server_certificate_malformed"));
+
+	// Without a hello first, a Certificate message is not reported.
+	TlsHandshakeAssembler orphan;
+	orphan.Add(Stream(Key(), 1, Record(CertificateMessage({leaf})), 1));
+	assert(orphan.Finish().empty());
+}
+
 // JA3S fingerprints the ServerHello's legacy_version, which supported_versions
 // replaces as the negotiated version.
 void TestServerLegacyVersion() {
@@ -1107,6 +1153,7 @@ int main() {
 	TestServerCertificates();
 	TestMalformedCertificates();
 	TestCertificateLimits();
+	TestClientCertificates();
 	TestListFuzz();
 	TestSocks5Tunnels();
 	TestSocks4AndHttpTunnels();
