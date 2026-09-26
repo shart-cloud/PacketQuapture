@@ -128,3 +128,29 @@ statement error
 SELECT * FROM read_dns_messages('test/data/malformed/payload.pcap');
 ----
 Unexpected end
+
+# A query paused for two seconds mid-message is whole under the default 300 s
+# idle timeout. A one-second tcp_idle_timeout finalizes the first half at the
+# pause, and the rest arrives as a new direction without its SYN.
+query ITT
+SELECT message_number, reassembly_status, dns_question_name
+FROM read_dns_messages('test/data/reassembly/paused.pcap');
+----
+1	complete	example.com
+
+query ITT rowsort
+SELECT message_number, reassembly_status, reassembly_error
+FROM read_dns_messages('test/data/reassembly/paused.pcap', tcp_idle_timeout=INTERVAL '1 second');
+----
+NULL	incomplete	incomplete DNS TCP frame at idle timeout
+NULL	unanchored	TCP SYN was not captured; DNS message alignment is unknown
+
+statement error
+SELECT * FROM read_dns_messages('test/data/reassembly/paused.pcap', tcp_idle_timeout=INTERVAL '-1 second');
+----
+TCP idle timeout must be a nonnegative fixed interval without months
+
+# read_dns has no transport core, so it does not take the option.
+statement error
+SELECT * FROM read_dns('test/data/reassembly/paused.pcap', tcp_idle_timeout=INTERVAL '1 second');
+----

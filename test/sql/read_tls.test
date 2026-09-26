@@ -421,6 +421,32 @@ SELECT tls_sni, reassembly_status, warnings FROM read_tls('test/data/tls/idle_ev
 ----
 after-idle.example	complete	[]
 
+# With eviction later than the pause, or off, the handshake is lost to the limit.
+query I
+SELECT count(*) FROM read_tls('test/data/tls/idle_eviction.pcap', tcp_idle_timeout=INTERVAL '302 seconds');
+----
+0
+
+query I
+SELECT count(*) FROM read_tls('test/data/tls/idle_eviction.pcap', tcp_idle_timeout=INTERVAL '0 seconds');
+----
+0
+
+query T
+SELECT tls_sni FROM read_tls('test/data/tls/idle_eviction.pcap', tcp_idle_timeout=INTERVAL '1 second');
+----
+after-idle.example
+
+statement error
+SELECT * FROM read_tls('test/data/tls/idle_eviction.pcap', tcp_idle_timeout=INTERVAL '1 month');
+----
+TCP idle timeout must be a nonnegative fixed interval without months
+
+statement error
+SELECT * FROM read_tls('test/data/tls/idle_eviction.pcap', tcp_idle_timeout=NULL);
+----
+TCP idle timeout must not be NULL
+
 # The server's certificate chain, leaf first. Names are the RFC 4514 strings
 # OpenSSL 3.0.13 prints with -nameopt RFC2253,-esc_msb. Serials, times and SANs
 # are tshark 4.2.2's x509af.serialNumber, x509af.utcTime/generalizedTime,
