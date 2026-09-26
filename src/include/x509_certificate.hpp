@@ -36,8 +36,10 @@ struct X509Certificate {
 	// `openssl x509 -text` prints them. An OID it would print by number is its
 	// dotted OID here too.
 	std::string signature_algorithm, public_key_algorithm, public_key_curve;
-	// An RSA modulus or DSA prime in bits, or an EC curve's size. Zero when the
-	// key is another kind or its curve is not known.
+	// An RSA modulus or DSA prime in bits, or an EC key's size: its named
+	// curve's, or for explicit curve parameters the bits of the group order, as
+	// OpenSSL counts them. Zero when the key is another kind or its curve is not
+	// known.
 	uint32_t public_key_bits = 0;
 	// basicConstraints, when present: the cA flag and any pathLenConstraint.
 	bool has_basic_constraints = false, is_ca = false, has_path_length = false;
@@ -46,6 +48,14 @@ struct X509Certificate {
 	// bit and wire order. A purpose without a name here is its dotted OID.
 	bool has_key_usage = false, has_extended_key_usage = false;
 	std::vector<std::string> key_usage, extended_key_usage;
+	// subjectKeyIdentifier and authorityKeyIdentifier's keyIdentifier, as
+	// lowercase hex. Empty when absent.
+	std::string subject_key_id, authority_key_id;
+	// authorityInfoAccess OCSP and caIssuers locations, and cRLDistributionPoints
+	// full names, each a URI escaped as tls_sni is; other name forms are skipped.
+	// certificatePolicies policy identifiers as dotted OIDs. In wire order.
+	bool has_authority_info_access = false, has_crl_distribution_points = false, has_policies = false;
+	std::vector<std::string> ocsp_urls, ca_issuers_urls, crl_urls, policies;
 
 	// The memory this certificate holds once parsed, for budgets: its text, and
 	// each list entry's own string.
@@ -53,8 +63,9 @@ struct X509Certificate {
 		size_t bytes = subject.size() + issuer.size() + serial.size() + issuer_oids.size() + subject_oids.size() +
 		               extension_oids.size() + sizeof(not_before) + sizeof(not_after) + sha1.size() + sha256.size() +
 		               signature_algorithm.size() + public_key_algorithm.size() + public_key_curve.size() +
-		               sizeof(public_key_bits) + sizeof(path_length);
-		for (const auto *list : {&san_dns, &san_ip, &key_usage, &extended_key_usage}) {
+		               sizeof(public_key_bits) + sizeof(path_length) + subject_key_id.size() + authority_key_id.size();
+		for (const auto *list :
+		     {&san_dns, &san_ip, &key_usage, &extended_key_usage, &ocsp_urls, &ca_issuers_urls, &crl_urls, &policies}) {
 			for (const auto &item : *list) {
 				bytes += sizeof(std::string) + item.size();
 			}
@@ -70,8 +81,9 @@ enum class X509Result { OK, MALFORMED, OVER_LIMIT };
 
 // Parses exactly one certificate filling data. OVER_LIMIT means it is well formed
 // so far but carries more than max_entries subjectAltName entries, or more than
-// max_entries extendedKeyUsage purposes. On anything but OK, out is left
-// default-constructed.
+// max_entries extendedKeyUsage purposes. More than max_entries entries in an
+// authorityInfoAccess, cRLDistributionPoints or certificatePolicies list leaves
+// that list unknown instead. On anything but OK, out is left default-constructed.
 X509Result ParseX509Certificate(const uint8_t *data, size_t size, size_t max_entries, X509Certificate &out);
 
 } // namespace packetquapture
