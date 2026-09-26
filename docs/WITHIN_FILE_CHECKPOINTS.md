@@ -185,9 +185,10 @@ Step 1 moved the baseline that step 3 must now beat. Selective queries warm are 
 to 2.1× faster on the packet-dense shapes, and an inventory refresh of `small_payloads`
 is 5.0× faster, so the absolute saving still available to checkpoints on those shapes
 has shrunk by about half. The per-packet pipeline work that only region skipping can
-remove is now the larger share of what remains. `large_payloads` is unchanged, and the
-cold sparse pathology this study identified is still open: it was not addressed by step
-1 and is not a checkpoint question either.
+remove is now the larger share of what remains. `large_payloads` is unchanged. The cold
+sparse pathology this study identified was not addressed by step 1 and is not a
+checkpoint question; a readahead hint for sparse local captures now addresses it, see
+[record traversal](RECORD_TRAVERSAL.md#readahead-hint-for-sparse-local-captures).
 
 Do not turn region statistics into optimizer bounds or cached `EMPTY_RESULT` plans;
 the same weak-identity argument that keeps catalog counts out of the optimizer applies
