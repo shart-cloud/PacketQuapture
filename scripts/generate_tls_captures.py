@@ -246,6 +246,8 @@ def reassembly_fixtures():
     fingerprint_fixtures()
     idle_fixtures()
     certificate_fixtures()
+    certificate_detail_fixtures()
+    tunnel_fixtures()
 
     # TCP that is not TLS at all.
     pcap(
@@ -362,16 +364,29 @@ def name(*rdns):
         der(0x31, b"".join(sorted(der(0x30, oid(o) + der(t, v)) for o, t, v in rdn))) for rdn in rdns))
 
 
-def certificate(serial, issuer, subject, not_before, not_after, dns=(), ips=()):
-    algorithm = der(0x30, oid("1.2.840.10045.4.3.2"))
-    key = der(0x30, der(0x30, oid("1.2.840.10045.2.1") + oid("1.2.840.10045.3.1.7"))
-              + der(0x03, b"\0\x04" + bytes(range(64))))
+# The P-256 base point, a valid public key that OpenSSL can load. The fixtures
+# verify nothing, so any valid point will do.
+P256_G = bytes.fromhex(
+    "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+    "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+EC_KEY = der(0x30, der(0x30, oid("1.2.840.10045.2.1") + oid("1.2.840.10045.3.1.7")) + der(0x03, b"\0" + P256_G))
+ECDSA_SHA256 = der(0x30, oid("1.2.840.10045.4.3.2"))
+
+
+def x509_extension(oid_text, value, critical=False):
+    return der(0x30, oid(oid_text) + (der(0x01, b"\xff") if critical else b"") + der(0x04, value))
+
+
+def certificate(serial, issuer, subject, not_before, not_after, dns=(), ips=(), key=EC_KEY,
+                algorithm=ECDSA_SHA256, extensions=()):
     tbs = der(0xA0, der(0x02, b"\x02")) + der(0x02, serial) + algorithm + issuer
     tbs += der(0x30, not_before + not_after) + subject + key
     names = b"".join(der(0x82, d) for d in dns) + b"".join(der(0x87, ip) for ip in ips)
+    items = list(extensions)
     if names:
-        san = der(0x30, oid("2.5.29.17") + der(0x04, der(0x30, names)))
-        tbs += der(0xA3, der(0x30, san))
+        items.append(x509_extension("2.5.29.17", der(0x30, names)))
+    if items:
+        tbs += der(0xA3, der(0x30, b"".join(items)))
     return der(0x30, der(0x30, tbs) + algorithm + der(0x03, b"\0" + der(0x30, bytes(8))))
 
 
@@ -411,6 +426,111 @@ def certificate_fixtures():
     # One certificate that does not parse keeps its place in the chain.
     broken = record(server_hello() + certificate_message([leaf, b"\x30\x03\x02\x01"]))
     pcap(DATA / "certificate_malformed.pcap", connection([client], [broken]))
+
+
+def exchange(steps, port):
+    """A SYN-anchored connection whose payloads alternate as given: each step is
+    (True, payload) client to server or (False, payload) back, in wire order."""
+    packets = [to_server(b"", 0, port, flags=0x02), to_client(b"", 0, port, flags=0x12)]
+    seq = {True: 1, False: 1}
+    for client, payload in steps:
+        packets.append((to_server if client else to_client)(payload, seq[client], port))
+        seq[client] += len(payload)
+    return packets
+
+
+def tunnel_fixtures():
+    """TLS behind SOCKS and HTTP CONNECT, one connection per client port, each
+    message in its own segment and in the order a proxy exchanges them."""
+    reply = record(server_hello())
+
+    def hello(host):
+        return record(client_hello(server_name(host)))
+
+    def socks5_address(ip, port=443):
+        return b"\x01" + bytes(ip) + struct.pack("!H", port)
+
+    packets = []
+    # SOCKS5 with RFC 1929 username and password, to a name.
+    host = b"login.live.com"
+    packets += exchange([
+        (True, b"\x05\x02\x00\x02"), (False, b"\x05\x02"),
+        (True, b"\x01\x04user\x02pw"), (False, b"\x01\x00"),
+        (True, b"\x05\x01\x00\x03" + bytes([len(host)]) + host + struct.pack("!H", 443)),
+        (False, b"\x05\x00\x00" + socks5_address([65, 55, 196, 251])),
+        (True, hello("login.live.com")), (False, reply)], port=51001)
+    # SOCKS4a, to a name.
+    packets += exchange([
+        (True, b"\x04\x01\x01\xbb\x00\x00\x00\x01bot\x00c2.example\x00"),
+        (False, b"\x00\x5a\x00\x00\x00\x00\x00\x00"),
+        (True, hello("c2.example")), (False, reply)], port=51002)
+    # HTTP CONNECT with headers on both sides.
+    packets += exchange([
+        (True, b"CONNECT proxy.example:8443 HTTP/1.1\r\nHost: proxy.example:8443\r\n\r\n"),
+        (False, b"HTTP/1.1 200 Connection established\r\nProxy-Agent: fixture\r\n\r\n"),
+        (True, hello("proxy.example")), (False, reply)], port=51003)
+    # The CTU-13 Neris botnet's shape: one stray byte before a SOCKS5 greeting.
+    # The server side is standard SOCKS5.
+    packets += exchange([
+        (True, b"\x7e"), (True, b"\x05\x01\x00"), (False, b"\x05\x00"),
+        (True, b"\x05\x01\x00" + socks5_address([65, 55, 16, 187])),
+        (False, b"\x05\x00\x00" + socks5_address([65, 55, 16, 187])),
+        (True, hello("neris.example")), (False, reply)], port=51004)
+    # Not TLS: a record header whose hello runs past its record.
+    decoy = bytearray(hello("decoy.example"))
+    decoy[5 + 4 + 2 + 32] = 0xFF
+    packets += exchange([(True, b"junk"), (False, b"ok"), (True, bytes(decoy))], port=51005)
+    # Only the client side of a SOCKS5 tunnel was captured.
+    packets += exchange([
+        (True, b"\x05\x01\x00\x05\x01\x00" + socks5_address([192, 0, 2, 9])),
+        (True, hello("one-sided.example"))], port=51006)
+    # An HTTP proxy that wants a login: 407 with a page, then CONNECT again.
+    page = b"<html>" + b"login required " * 200 + b"</html>"
+    packets += exchange([
+        (True, b"CONNECT login.example:443 HTTP/1.1\r\nHost: login.example:443\r\n\r\n"),
+        (False, b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n"
+                b"Content-Length: " + str(len(page)).encode() + b"\r\n\r\n" + page),
+        (True, b"CONNECT login.example:443 HTTP/1.1\r\nHost: login.example:443\r\n"
+               b"Proxy-Authorization: Basic dXNlcjpwdw==\r\n\r\n"),
+        (False, b"HTTP/1.1 200 Connection established\r\n\r\n"),
+        (True, hello("login.example")), (False, reply)], port=51007)
+    pcap(DATA / "tunnels.pcap", packets)
+
+
+def certificate_detail_fixtures():
+    """Key types, basicConstraints, keyUsage and extendedKeyUsage, and a client
+    certificate. The RSA modulus is not a real key; OpenSSL reads it anyway."""
+    rsa = der(0x30, der(0x30, oid("1.2.840.113549.1.1.1") + b"\x05\x00") + der(0x03, b"\0" + der(0x30,
+              der(0x02, b"\x00\xc3" + bytes(range(1, 255)) + b"\x01") + der(0x02, b"\x01\x00\x01"))))
+    rsa_sha256 = der(0x30, oid("1.2.840.113549.1.1.11") + b"\x05\x00")
+    ed25519 = der(0x30, der(0x30, oid("1.3.101.112")) + der(0x03, b"\0" + bytes(range(32))))
+    ca = name([(C, PRINTABLE, b"US")], [(CN, UTF8, b"Detail Root")])
+    issuing = name([(C, PRINTABLE, b"US")], [(CN, UTF8, b"Detail Issuing")])
+    intermediate = certificate(
+        b"\x0a", ca, issuing, der(0x17, b"240101000000Z"), der(0x17, b"340101000000Z"),
+        extensions=[x509_extension("2.5.29.19", der(0x30, der(0x01, b"\xff") + der(0x02, b"\x00")), critical=True),
+                    x509_extension("2.5.29.15", der(0x03, b"\x01\x06"), critical=True)])
+    # digitalSignature and keyEncipherment; serverAuth, clientAuth and a
+    # purpose with no RFC 5280 name.
+    leaf = certificate(
+        b"\x0b", issuing, name([(CN, UTF8, b"rsa.example.test")]),
+        der(0x17, b"250101000000Z"), der(0x17, b"260101000000Z"), dns=[b"rsa.example.test"], key=rsa,
+        algorithm=rsa_sha256,
+        extensions=[x509_extension("2.5.29.19", der(0x30, b"")),
+                    x509_extension("2.5.29.15", der(0x03, b"\x05\xa0"), critical=True),
+                    x509_extension("2.5.29.37", der(0x30, oid("1.3.6.1.5.5.7.3.1") + oid("1.3.6.1.5.5.7.3.2")
+                                              + oid("1.3.6.1.4.1.311.10.3.3")))])
+    client_leaf = certificate(
+        b"\x0c", issuing, name([(CN, UTF8, b"client.example.test")]),
+        der(0x17, b"250101000000Z"), der(0x17, b"260101000000Z"), key=ed25519,
+        extensions=[x509_extension("2.5.29.37", der(0x30, oid("1.3.6.1.5.5.7.3.2")))])
+    hello = record(client_hello(server_name("rsa.example.test")))
+    reply = record(server_hello() + certificate_message([leaf, intermediate]))
+    # The client answers the server's request with its own Certificate message
+    # after its hello. Nothing checks that a CertificateRequest was sent.
+    pcap(DATA / "certificate_details.pcap",
+         exchange([(True, hello), (False, reply), (True, record(certificate_message([client_leaf])))], port=51000)
+         + exchange([(True, hello), (False, reply), (True, record(certificate_message([])))], port=51001))
 
 
 def idle_fixtures():

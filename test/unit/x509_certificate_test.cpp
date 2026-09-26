@@ -77,6 +77,8 @@ struct Spec {
 	bool version = true;
 	std::vector<Bytes> extensions;
 	Bytes trailing;
+	Bytes key = Tlv(0x30, Cat({Tlv(0x30, Oid({1, 2, 840, 10045, 2, 1})), Tlv(0x03, {0x00, 0x04, 0x01})}));
+	Bytes algorithm = Tlv(0x30, Cat({Oid({1, 2, 840, 10045, 4, 3, 2})}));
 };
 
 Bytes San(const std::vector<Bytes> &names) {
@@ -84,8 +86,8 @@ Bytes San(const std::vector<Bytes> &names) {
 }
 
 Bytes Certificate(const Spec &spec) {
-	const Bytes algorithm = Tlv(0x30, Cat({Oid({1, 2, 840, 10045, 4, 3, 2})}));
-	const Bytes key = Tlv(0x30, Cat({Tlv(0x30, Oid({1, 2, 840, 10045, 2, 1})), Tlv(0x03, {0x00, 0x04, 0x01})}));
+	const Bytes &algorithm = spec.algorithm;
+	const Bytes &key = spec.key;
 	Bytes tbs = spec.version ? Tlv(0xA0, Tlv(0x02, {0x02})) : Bytes();
 	tbs = Cat({tbs, Tlv(0x02, spec.serial), algorithm, spec.issuer, Tlv(0x30, Cat({spec.not_before, spec.not_after})),
 	           spec.subject, key});
@@ -290,6 +292,136 @@ void TestTextBytes() {
 	assert(cert.extension_oids.compare(cert.extension_oids.size() - 9, 9, "2a,551d11") == 0);
 	assert(cert.issuer_oids == "550406,55040a" && cert.subject_oids == "550406,55040a,550403");
 	assert(cert.TextBytes() >= cert.extension_oids.size() + 2 * sizeof(std::string));
+	// Usage names are list entries too.
+	Spec purposes;
+	std::vector<Bytes> oids;
+	for (uint64_t i = 0; i < 100; ++i) {
+		oids.push_back(Oid({1, 2, i}));
+	}
+	purposes.extensions = {Tlv(0x30, Cat({Oid({2, 5, 29, 37}), Tlv(0x04, Tlv(0x30, Cat(oids)))}))};
+	const auto many = Ok(purposes);
+	assert(many.TextBytes() >= 100 * sizeof(std::string));
+}
+
+Bytes Extension(const std::vector<uint64_t> &oid, const Bytes &value) {
+	return Tlv(0x30, Cat({Oid(oid), Tlv(0x04, value)}));
+}
+
+void TestAlgorithmsAndKeys() {
+	Spec spec;
+	auto cert = Ok(spec);
+	assert(cert.signature_algorithm == "ecdsa-with-SHA256" && cert.public_key_algorithm == "id-ecPublicKey");
+	// An EC key with no curve has no size.
+	assert(cert.public_key_curve.empty() && cert.public_key_bits == 0);
+
+	spec.key = Tlv(0x30, Cat({Tlv(0x30, Cat({Oid({1, 2, 840, 10045, 2, 1}), Oid({1, 3, 132, 0, 34})})),
+	                          Tlv(0x03, {0x00, 0x04, 0x01})}));
+	cert = Ok(spec);
+	assert(cert.public_key_curve == "secp384r1" && cert.public_key_bits == 384);
+	// A curve without a name here is its OID, with no size.
+	spec.key = Tlv(
+	    0x30, Cat({Tlv(0x30, Cat({Oid({1, 2, 840, 10045, 2, 1}), Oid({1, 2, 3, 4})})), Tlv(0x03, {0x00, 0x04, 0x01})}));
+	cert = Ok(spec);
+	assert(cert.public_key_curve == "1.2.3.4" && cert.public_key_bits == 0);
+
+	// RSA: the modulus's significant bits, not counting its sign octet.
+	Bytes modulus = {0x00, 0x01};
+	modulus.insert(modulus.end(), 255, 0xFF);
+	spec.key = Tlv(0x30, Cat({Tlv(0x30, Cat({Oid({1, 2, 840, 113549, 1, 1, 1}), Tlv(0x05, {})})),
+	                          Tlv(0x03, Cat({{0x00}, Tlv(0x30, Cat({Tlv(0x02, modulus), Tlv(0x02, {1, 0, 1})}))}))}));
+	spec.algorithm = Tlv(0x30, Cat({Oid({1, 2, 840, 113549, 1, 1, 11}), Tlv(0x05, {})}));
+	cert = Ok(spec);
+	assert(cert.public_key_algorithm == "rsaEncryption" && cert.public_key_bits == 2041);
+	assert(cert.signature_algorithm == "sha256WithRSAEncryption" && cert.public_key_curve.empty());
+	// A key body that does not parse leaves the size unknown, not the certificate broken.
+	spec.key = Tlv(0x30, Cat({Tlv(0x30, Oid({1, 2, 840, 113549, 1, 1, 1})), Tlv(0x03, {0x00, 0x05})}));
+	cert = Ok(spec);
+	assert(cert.public_key_algorithm == "rsaEncryption" && cert.public_key_bits == 0);
+
+	// Unknown algorithms are dotted OIDs.
+	spec.algorithm = Tlv(0x30, Oid({1, 2, 3, 5}));
+	spec.key = Tlv(0x30, Cat({Tlv(0x30, Oid({1, 3, 101, 112})), Tlv(0x03, Bytes(33, 0))}));
+	cert = Ok(spec);
+	assert(cert.signature_algorithm == "1.2.3.5" && cert.public_key_algorithm == "ED25519");
+	assert(cert.public_key_bits == 0);
+
+	// Describing the key and algorithm only adds fields, so a key info or an
+	// algorithm that does not parse leaves them unknown, and the rest stands.
+	Spec broken;
+	broken.key = Tlv(0x30, Tlv(0x03, {0x00}));
+	cert = Ok(broken);
+	assert(cert.public_key_algorithm.empty() && cert.subject == "CN=www.example.com,O=Example Inc.,C=US");
+	broken = Spec();
+	broken.algorithm = Tlv(0x30, Tlv(0x05, {}));
+	cert = Ok(broken);
+	assert(cert.signature_algorithm.empty() && cert.public_key_algorithm == "id-ecPublicKey");
+
+	// RSASSA-PSS keys have the RSA body, so they are sized the same way.
+	spec.key = Tlv(0x30, Cat({Tlv(0x30, Oid({1, 2, 840, 113549, 1, 1, 10})),
+	                          Tlv(0x03, Cat({{0x00}, Tlv(0x30, Cat({Tlv(0x02, modulus), Tlv(0x02, {1, 0, 1})}))}))}));
+	cert = Ok(spec);
+	assert(cert.public_key_algorithm == "rsassaPss" && cert.public_key_bits == 2041);
+}
+
+void TestConstraintsAndUsage() {
+	const std::vector<uint64_t> basic = {2, 5, 29, 19}, usage = {2, 5, 29, 15}, purposes = {2, 5, 29, 37};
+	Spec spec;
+	auto cert = Ok(spec);
+	assert(!cert.has_basic_constraints && !cert.has_key_usage && !cert.has_extended_key_usage);
+
+	// An empty SEQUENCE is cA FALSE with no path length.
+	spec.extensions = {Extension(basic, Tlv(0x30, {}))};
+	cert = Ok(spec);
+	assert(cert.has_basic_constraints && !cert.is_ca && !cert.has_path_length);
+	spec.extensions = {Extension(basic, Tlv(0x30, Cat({Tlv(0x01, {0xFF}), Tlv(0x02, {0x00, 0x80})})))};
+	cert = Ok(spec);
+	assert(cert.is_ca && cert.has_path_length && cert.path_length == 128);
+	// A negative or oversized path length leaves basicConstraints unknown; these
+	// extensions only add fields, so the certificate itself still parses.
+	spec.extensions = {Extension(basic, Tlv(0x30, Cat({Tlv(0x01, {0xFF}), Tlv(0x02, {0x80})})))};
+	cert = Ok(spec);
+	assert(!cert.has_basic_constraints && !cert.is_ca && !cert.has_path_length);
+	spec.extensions = {Extension(basic, Tlv(0x30, Tlv(0x02, {1, 0, 0, 0, 0})))};
+	assert(!Ok(spec).has_basic_constraints);
+
+	// keyUsage bits in bit order, over two octets for decipherOnly.
+	spec.extensions = {Extension(usage, Tlv(0x03, {0x07, 0x86, 0x80}))};
+	cert = Ok(spec);
+	assert((cert.key_usage == std::vector<std::string> {"digitalSignature", "keyCertSign", "cRLSign", "decipherOnly"}));
+	// No bits set is a present, empty list; unused bits beyond 7 are malformed.
+	spec.extensions = {Extension(usage, Tlv(0x03, {0x00}))};
+	cert = Ok(spec);
+	assert(cert.has_key_usage && cert.key_usage.empty());
+	spec.extensions = {Extension(usage, Tlv(0x03, {0x08, 0xFF}))};
+	cert = Ok(spec);
+	assert(!cert.has_key_usage && cert.key_usage.empty());
+
+	// Named purposes, then an unnamed one by OID.
+	spec.extensions = {Extension(
+	    purposes, Tlv(0x30, Cat({Oid({1, 3, 6, 1, 5, 5, 7, 3, 1}), Oid({2, 5, 29, 37, 0}), Oid({1, 2, 3})})))};
+	cert = Ok(spec);
+	assert((cert.extended_key_usage == std::vector<std::string> {"serverAuth", "anyExtendedKeyUsage", "1.2.3"}));
+	// RFC 5280 requires at least one purpose, and each must be an OID.
+	spec.extensions = {Extension(purposes, Tlv(0x30, {}))};
+	assert(!Ok(spec).has_extended_key_usage);
+	spec.extensions = {Extension(purposes, Tlv(0x30, Cat({Oid({1, 2, 3}), Tlv(0x05, {})})))};
+	cert = Ok(spec);
+	assert(!cert.has_extended_key_usage && cert.extended_key_usage.empty());
+	// More purposes than the limit is over the limit, as SAN entries are.
+	spec.extensions = {Extension(purposes, Tlv(0x30, Cat({Oid({1, 2, 3}), Oid({1, 2, 4}), Oid({1, 2, 5})})))};
+	X509Certificate out;
+	assert(Parse(Certificate(spec), out, 2) == X509Result::OVER_LIMIT);
+	assert(Parse(Certificate(spec), out, 3) == X509Result::OK && out.extended_key_usage.size() == 3);
+
+	// Each of these twice is unknown: RFC 5280 forbids it, and neither copy is
+	// more believable. A third copy does not bring it back.
+	for (const auto &oid : {basic, usage, purposes}) {
+		const Bytes value = oid == basic ? Tlv(0x30, {}) : oid == usage ? Tlv(0x03, {0x00}) : Tlv(0x30, Oid({1, 2}));
+		spec.extensions = {Extension(oid, value), Extension(oid, value), Extension(oid, value)};
+		cert = Ok(spec);
+		assert(!cert.has_basic_constraints && !cert.has_key_usage && !cert.has_extended_key_usage);
+		assert(cert.key_usage.empty() && cert.extended_key_usage.empty());
+	}
 }
 
 // Random corruption never crashes, and never yields a partly filled result.
@@ -330,6 +462,8 @@ void TestFuzz() {
 } // namespace
 
 int main() {
+	TestAlgorithmsAndKeys();
+	TestConstraintsAndUsage();
 	TestFields();
 	TestNames();
 	TestTimes();

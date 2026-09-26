@@ -747,6 +747,52 @@ void TestCertificateLimits() {
 	assert(done[0].server_certificates.values.size() == 1 && done[1].server_certificates.over_limit);
 }
 
+// A stand-in digest: the parser has none, and the extension supplies DuckDB's.
+void FakeDigest(const uint8_t *, size_t size, X509Certificate &out) {
+	out.sha1 = "sha1:" + std::to_string(size);
+	out.sha256 = "sha256:" + std::to_string(size);
+}
+
+// The client's Certificate follows its ClientHello in its own direction, as
+// sent when the server asks for one; the server's chain is unaffected.
+void TestClientCertificates() {
+	const auto leaf = LeafCertificate();
+	TlsHandshakeLimits limits;
+	limits.certificate_digest = FakeDigest;
+	TlsHandshakeAssembler assembler(limits);
+	assembler.Add(Stream(Key(), 1, Concat(Record(ClientHello({})), Record(CertificateMessage({leaf}))), 1));
+	auto done = assembler.Add(
+	    Stream(Key().Reverse(), 2, Record(Concat(ServerHello(0x009C), CertificateMessage({leaf, leaf}))), 2));
+	assert(done.size() == 1 && done[0].warnings.empty());
+	const auto &client = done[0].client_certificates;
+	assert(client.present && client.values.size() == 1 && client.values[0].parsed);
+	assert(client.values[0].fields.subject == "CN=leaf.example,O=Test");
+	assert(client.values[0].fields.sha1 == "sha1:" + std::to_string(leaf.size()));
+	assert(done[0].server_certificates.values.size() == 2);
+	assert(done[0].server_certificates.values[1].fields.sha256 == "sha256:" + std::to_string(leaf.size()));
+
+	// Without a digest the hashes stay empty; a client with none sends an empty list.
+	TlsHandshakeAssembler plain;
+	plain.Add(Stream(Key(), 1, Concat(Record(ClientHello({})), Record(CertificateMessage({}))), 1));
+	done = plain.Finish();
+	assert(done.size() == 1 && done[0].client_certificates.present && done[0].client_certificates.values.empty());
+	assert(!done[0].server_certificates.present);
+
+	// A broken client certificate keeps its place and warns on the client side.
+	TlsHandshakeAssembler broken;
+	broken.Add(
+	    Stream(Key(), 1, Concat(Record(ClientHello({})), Record(CertificateMessage({{0x30, 0x03, 0x02, 0x01}}))), 1));
+	done = broken.Finish();
+	assert(done.size() == 1 && done[0].client_certificates.values.size() == 1);
+	assert(!done[0].client_certificates.values[0].parsed && HasWarning(done[0], "client_certificate_malformed"));
+	assert(!HasWarning(done[0], "server_certificate_malformed"));
+
+	// Without a hello first, a Certificate message is not reported.
+	TlsHandshakeAssembler orphan;
+	orphan.Add(Stream(Key(), 1, Record(CertificateMessage({leaf})), 1));
+	assert(orphan.Finish().empty());
+}
+
 // JA3S fingerprints the ServerHello's legacy_version, which supported_versions
 // replaces as the negotiated version.
 void TestServerLegacyVersion() {
@@ -840,6 +886,240 @@ void TestTruncationsTerminate() {
 	}
 }
 
+std::vector<uint8_t> Bytes(const std::string &text) {
+	return std::vector<uint8_t>(text.begin(), text.end());
+}
+
+// Pairs a client prefix and hello with a server prefix and hello.
+TlsHandshake Tunnelled(const std::vector<uint8_t> &client_prefix, const std::vector<uint8_t> &server_prefix) {
+	TlsHandshakeAssembler assembler;
+	const auto key = Key();
+	assembler.Add(Stream(key, 1, Concat(client_prefix, Record(ClientHello(ServerNameExtension("inner.example")))), 1));
+	auto done = assembler.Add(Stream(key.Reverse(), 2, Concat(server_prefix, Record(ServerHello(0x009C))), 2));
+	assert(done.size() == 1);
+	assert(done[0].has_client_hello && done[0].has_server_hello);
+	assert(done[0].sni == "inner.example" && done[0].cipher_suite == 0x009C);
+	assert(done[0].client_prefix_bytes == client_prefix.size());
+	assert(done[0].server_prefix_bytes == server_prefix.size());
+	return done[0];
+}
+
+void TestSocks5Tunnels() {
+	// No authentication, an IPv4 destination.
+	const std::vector<uint8_t> greeting = {5, 1, 0};
+	const std::vector<uint8_t> request = {5, 1, 0, 1, 65, 55, 196, 251, 1, 187};
+	const std::vector<uint8_t> reply = {5, 0, 0, 1, 65, 55, 196, 251, 1, 187};
+	auto handshake = Tunnelled(Concat(greeting, request), Concat({5, 0}, reply));
+	assert(handshake.client_tunnel == "socks5" && handshake.server_tunnel == "socks5");
+	assert(handshake.tunnel_destination == "65.55.196.251:443");
+	assert(handshake.status == "complete" && handshake.warnings.empty());
+
+	// RFC 1929 username and password, and a name.
+	std::vector<uint8_t> client = {5, 2, 0, 2, 1, 4, 'u', 's', 'e', 'r', 2, 'p', 'w'};
+	const std::string host = "login.live.com";
+	client.insert(client.end(), {5, 1, 0, 3, static_cast<uint8_t>(host.size())});
+	client.insert(client.end(), host.begin(), host.end());
+	client.insert(client.end(), {1, 187});
+	handshake = Tunnelled(client, Concat({5, 2, 1, 0}, reply));
+	assert(handshake.client_tunnel == "socks5" && handshake.server_tunnel == "socks5");
+	assert(handshake.tunnel_destination == "login.live.com:443");
+
+	// An IPv6 destination is bracketed so the port stays unambiguous.
+	std::vector<uint8_t> v6 = {5, 1, 0, 4, 0x20, 0x01, 0x0d, 0xb8};
+	v6.insert(v6.end(), 11, 0);
+	v6.insert(v6.end(), {1, 0x20, 0xFB});
+	handshake = Tunnelled(Concat(greeting, v6), Concat({5, 0}, reply));
+	assert(handshake.tunnel_destination == "[2001:db8::1]:8443");
+
+	// The Neris botnet sends one stray byte before a standard greeting. The TLS
+	// is still read, the prefix is not called SOCKS, and the row says so.
+	handshake = Tunnelled(Concat({0x7E}, Concat(greeting, request)), Concat({5, 0}, reply));
+	assert(handshake.client_tunnel.empty() && handshake.server_tunnel == "socks5");
+	assert(handshake.tunnel_destination.empty());
+	assert(handshake.status == "complete");
+	assert((handshake.warnings == std::vector<std::string> {"client_tunnel_unrecognized"}));
+
+	// A request other than CONNECT is not a tunnel TLS could follow.
+	handshake = Tunnelled(Concat(greeting, {5, 2, 0, 1, 1, 2, 3, 4, 0, 80}), Concat({5, 0}, reply));
+	assert(handshake.client_tunnel.empty() && HasWarning(handshake, "client_tunnel_unrecognized"));
+	// A refused reply, or one byte too many, is not recognised either.
+	handshake = Tunnelled(Concat(greeting, request), Concat({5, 0, 5, 1, 0, 1, 1, 2, 3, 4, 0, 80}, {}));
+	assert(handshake.server_tunnel.empty() && HasWarning(handshake, "server_tunnel_unrecognized"));
+	handshake = Tunnelled(Concat(Concat(greeting, request), {0}), Concat({5, 0}, reply));
+	assert(handshake.client_tunnel.empty());
+}
+
+void TestSocks4AndHttpTunnels() {
+	const std::vector<uint8_t> granted = {0, 0x5A, 0, 0, 0, 0, 0, 0};
+	auto handshake = Tunnelled({4, 1, 1, 187, 198, 51, 100, 7, 'b', 'o', 't', 0}, granted);
+	assert(handshake.client_tunnel == "socks4" && handshake.server_tunnel == "socks4");
+	assert(handshake.tunnel_destination == "198.51.100.7:443");
+	assert(handshake.warnings.empty());
+
+	handshake = Tunnelled(Concat({4, 1, 1, 187, 0, 0, 0, 1, 0}, Bytes(std::string("c2.example") + '\0')), granted);
+	assert(handshake.client_tunnel == "socks4a" && handshake.server_tunnel == "socks4");
+	assert(handshake.tunnel_destination == "c2.example:443");
+
+	handshake = Tunnelled(Bytes("CONNECT c2.example:443 HTTP/1.1\r\nHost: c2.example:443\r\n\r\n"),
+	                      Bytes("HTTP/1.1 200 Connection established\r\nProxy-Agent: x\r\n\r\n"));
+	assert(handshake.client_tunnel == "http_connect" && handshake.server_tunnel == "http_connect");
+	assert(handshake.tunnel_destination == "c2.example:443");
+	assert(handshake.warnings.empty());
+
+	// A refusal is not a tunnel, and a head must end where TLS begins.
+	handshake = Tunnelled(Bytes("CONNECT c2.example:443 HTTP/1.0\r\n\r\nX"), Bytes("HTTP/1.1 407 Auth\r\n\r\n"));
+	assert(handshake.client_tunnel.empty() && handshake.server_tunnel.empty());
+	assert(
+	    (handshake.warnings == std::vector<std::string> {"client_tunnel_unrecognized", "server_tunnel_unrecognized"}));
+
+	// SMTP STARTTLS is found the same way, and not named.
+	handshake = Tunnelled(Bytes("EHLO client.example\r\nSTARTTLS\r\n"),
+	                      Bytes("220 mx ESMTP\r\n250-mx\r\n250 STARTTLS\r\n220 Ready\r\n"));
+	assert(handshake.client_tunnel.empty() && handshake.server_tunnel.empty());
+	assert(handshake.status == "complete" && handshake.tunnel_destination.empty());
+}
+
+void TestTunnelPrefixLimit() {
+	TlsHandshakeLimits limits;
+	limits.max_tunnel_prefix_bytes = 64;
+	const auto hello = Record(ClientHello(ServerNameExtension("far.example")));
+	for (size_t prefix = 63; prefix <= 65; ++prefix) {
+		TlsHandshakeAssembler assembler(limits);
+		assembler.Add(Stream(Key(), 1, Concat(std::vector<uint8_t>(prefix, 'x'), hello), 1));
+		const auto done = assembler.Finish();
+		assert(done.size() == (prefix <= 64 ? 1U : 0U));
+		if (!done.empty()) {
+			assert(done[0].client_prefix_bytes == prefix && done[0].sni == "far.example");
+		}
+	}
+}
+
+// Past the stream's start the whole hello must be in one record and parse:
+// something that only looks like a record header is not TLS.
+void TestTunnelSearchIsStrict() {
+	auto hello = Record(ClientHello(ServerNameExtension("x.example")));
+	// A hello cut short, a broken hello and a record of another type.
+	std::vector<std::vector<uint8_t>> decoys;
+	decoys.push_back(std::vector<uint8_t>(hello.begin(), hello.end() - 1));
+	// The session id length, after the record and message headers, the version
+	// and the random, now runs past the hello.
+	auto broken = hello;
+	broken[5 + 4 + 2 + 32] = 0xFF;
+	decoys.push_back(broken);
+	decoys.push_back(Record(ClientHello(ServerNameExtension("x.example")), 23));
+	for (const auto &decoy : decoys) {
+		TlsHandshakeAssembler assembler;
+		assembler.Add(Stream(Key(), 1, Concat(Bytes("junk"), decoy), 1));
+		assert(assembler.Finish().empty());
+	}
+	// A stream that begins with TLS is not searched, so its prefix stays zero.
+	TlsHandshakeAssembler assembler;
+	assembler.Add(Stream(Key(), 1, hello, 1));
+	const auto done = assembler.Finish();
+	assert(done.size() == 1 && done[0].client_prefix_bytes == 0 && done[0].client_tunnel.empty());
+}
+
+// Review findings on the first version of the tunnel search.
+void TestTunnelEdges() {
+	// A proxy that wants a login refuses the first CONNECT with a 407 whose page
+	// is longer than a SOCKS exchange would ever be; the client asks again.
+	const std::string page(3000, 'x');
+	auto handshake =
+	    Tunnelled(Bytes("CONNECT c2.example:443 HTTP/1.1\r\n\r\n"
+	                    "CONNECT c2.example:443 HTTP/1.1\r\nProxy-Authorization: Basic dTpw\r\n\r\n"),
+	              Bytes("HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: " + std::to_string(page.size()) +
+	                    "\r\n\r\n" + page + "HTTP/1.1 200 OK\r\n\r\n"));
+	assert(handshake.client_tunnel == "http_connect" && handshake.server_tunnel == "http_connect");
+	assert(handshake.tunnel_destination == "c2.example:443" && handshake.warnings.empty());
+	// A second request to another target is not the same tunnel.
+	handshake = Tunnelled(Bytes("CONNECT a:443 HTTP/1.1\r\n\r\nCONNECT b:443 HTTP/1.1\r\n\r\n"),
+	                      Bytes("HTTP/1.1 200 OK\r\n\r\n"));
+	assert(handshake.client_tunnel.empty() && handshake.server_tunnel == "http_connect");
+
+	// Bytes that frame as a non-handshake record are a prefix, not TLS.
+	handshake = Tunnelled({0x17, 0x03, 0x03, 0x00, 0x02, 0xAA, 0xBB}, {5, 0, 5, 0, 0, 1, 1, 2, 3, 4, 1, 187});
+	assert(handshake.client_prefix_bytes == 7 && HasWarning(handshake, "client_tunnel_unrecognized"));
+
+	// Sides that recognise different tunnels say so.
+	handshake = Tunnelled({5, 1, 0, 5, 1, 0, 1, 1, 2, 3, 4, 1, 187}, Bytes("HTTP/1.1 200 OK\r\n\r\n"));
+	assert(handshake.client_tunnel == "socks5" && handshake.server_tunnel == "http_connect");
+	assert((handshake.warnings == std::vector<std::string> {"tunnel_mismatch"}));
+
+	// A stream that begins with a handshake record is not searched, even when
+	// its first record is cut short and holds something hello-shaped.
+	TlsHandshakeAssembler cut;
+	cut.Add(Stream(Key(), 1, Concat({0x16, 0x03, 0x01, 0x40, 0x00}, Record(ClientHello({}))), 1));
+	assert(cut.Finish().empty());
+
+	// Without its SYN a stream begins mid-conversation, so a hello past its start
+	// is data, not a tunnel. On CTU-13 Neris one sat inside a binary mail body.
+	auto midstream = Stream(Key(), 1, Concat(Bytes("DATA body "), Record(ClientHello({}))), 1, "unanchored");
+	midstream.syn_seen = false;
+	TlsHandshakeAssembler unanchored;
+	unanchored.Add(midstream);
+	assert(unanchored.Finish().empty());
+
+	// The search applies the per-message limit that the stream-start parse does.
+	TlsHandshakeLimits small;
+	small.max_message_bytes = 16;
+	TlsHandshakeAssembler limited(small);
+	limited.Add(Stream(Key(), 1, Concat(Bytes("xx"), Record(ClientHello({}))), 1));
+	assert(limited.Finish().empty());
+
+	// A 2xx to CONNECT has no body whatever it declares, and header whitespace
+	// may be a tab.
+	handshake = Tunnelled(Bytes("CONNECT c2.example:443 HTTP/1.1\r\n\r\n"),
+	                      Bytes("HTTP/1.1 407 No\r\nContent-Length:\t2\r\n\r\nxxHTTP/1.1 200 OK\r\n"
+	                            "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"));
+	assert(handshake.server_tunnel == "http_connect" && handshake.warnings.empty());
+
+	// Every handshake on a tunnelled connection reports the tunnel: a
+	// HelloRetryRequest's second ClientHello is the one that completes.
+	TlsHandshakeAssembler assembler;
+	const auto key = Key();
+	const std::vector<uint8_t> socks = {5, 1, 0, 5, 1, 0, 1, 1, 2, 3, 4, 1, 187};
+	assembler.Add(Stream(key, 1, Concat(socks, Concat(Record(ClientHello({})), Record(ClientHello({})))), 1));
+	const auto done = assembler.Finish();
+	assert(done.size() == 2);
+	assert(done[0].client_prefix_bytes == socks.size() && done[0].client_tunnel == "socks5");
+	assert(done[1].client_prefix_bytes == socks.size() && done[1].client_tunnel == "socks5");
+}
+
+void TestTunnelFuzz() {
+	std::mt19937 rng(20260925);
+	std::uniform_int_distribution<int> byte(0, 255);
+	std::uniform_int_distribution<size_t> length(0, 64);
+	const auto hello = Record(ClientHello(ServerNameExtension("fuzz.example")));
+	const std::vector<std::vector<uint8_t>> seeds = {
+	    {5, 2, 0, 2, 1, 1, 'u', 1, 'p', 5, 1, 0, 3, 3, 'a', 'b', 'c', 0, 1},
+	    {4, 1, 0, 1, 0, 0, 0, 1, 0, 'h', 0},
+	    Bytes("CONNECT h:1 HTTP/1.1\r\n\r\n")};
+	size_t reported = 0;
+	for (size_t round = 0; round < 20000; ++round) {
+		std::vector<uint8_t> prefix = seeds[round % seeds.size()];
+		for (size_t flips = length(rng) % 4; flips > 0 && !prefix.empty(); --flips) {
+			prefix[static_cast<size_t>(byte(rng)) % prefix.size()] = static_cast<uint8_t>(byte(rng));
+		}
+		if (round % 5 == 0) {
+			prefix.resize(prefix.size() * static_cast<size_t>(byte(rng)) / 256);
+		}
+		for (size_t extra = length(rng) % 3; extra > 0; --extra) {
+			prefix.push_back(static_cast<uint8_t>(byte(rng)));
+		}
+		TlsHandshakeAssembler assembler;
+		assembler.Add(Stream(Key(), 1, Concat(prefix, hello), 1));
+		for (const auto &handshake : assembler.Finish()) {
+			++reported;
+			// Found where it is, or at the start when the prefix happens to frame
+			// as records that lead to it.
+			assert(handshake.sni == "fuzz.example");
+			assert(handshake.client_prefix_bytes == prefix.size() || handshake.client_prefix_bytes == 0);
+			assert(!handshake.client_tunnel.empty() || handshake.tunnel_destination.empty());
+		}
+	}
+	printf("tunnel fuzz: %zu of 20000 prefixed hellos reported\n", reported);
+}
+
 } // namespace
 
 int main() {
@@ -873,7 +1153,14 @@ int main() {
 	TestServerCertificates();
 	TestMalformedCertificates();
 	TestCertificateLimits();
+	TestClientCertificates();
 	TestListFuzz();
-	printf("TLS handshake pairing, orphans, renegotiation, resumption, limits and hello lists passed\n");
+	TestSocks5Tunnels();
+	TestSocks4AndHttpTunnels();
+	TestTunnelPrefixLimit();
+	TestTunnelSearchIsStrict();
+	TestTunnelEdges();
+	TestTunnelFuzz();
+	printf("TLS handshake pairing, orphans, renegotiation, resumption, limits, hello lists and tunnels passed\n");
 	return 0;
 }
