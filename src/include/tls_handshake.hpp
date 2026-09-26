@@ -4,6 +4,8 @@
 #include "tls_record.hpp"
 #include "x509_certificate.hpp"
 
+#include <deque>
+
 namespace packetquapture {
 
 struct TlsHandshakeLimits {
@@ -186,12 +188,25 @@ private:
 	static std::vector<TlsHandshake> Merge(const Direction &client, const Direction *server);
 	static bool Confirms(const Direction &peer, const Direction &found);
 	static std::vector<TlsHandshake> ReportAlone(const Direction &direction);
-	bool Hold(const Direction &direction);
+	bool Hold(Direction &direction);
 	void Release(std::map<TcpFlowKey, Direction>::iterator it);
+	void Refute(const TcpStream &stream);
+	bool Refuted(const Direction &found) const;
 	TlsHandshakeLimits limits;
 	std::map<TcpFlowKey, Direction> pending;
-	// How many held directions still need confirmation.
+	// How many held directions still need confirmation, and their keys in the
+	// order they were held, oldest first; keys no longer held are skipped.
 	size_t unconfirmed = 0;
+	std::deque<TcpFlowKey> unconfirmed_order;
+	// Recent streams that were plainly not TLS, keyed as a waiting find on
+	// their other side would be, with the packets they span. A find that
+	// arrives after its non-TLS peer is refuted from here. Oldest first.
+	struct Refuter {
+		TcpFlowKey key;
+		bool client_side;
+		PacketStamp first, last;
+	};
+	std::deque<Refuter> refuters;
 };
 
 } // namespace packetquapture

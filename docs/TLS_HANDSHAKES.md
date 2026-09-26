@@ -314,18 +314,23 @@ is searched the same way, but its first byte is not where a tunnel would start, 
 hello-shaped run inside ordinary data is not TLS. On CTU-13 Neris an unanchored SMTP
 direction held exactly that, a complete ClientHello inside a binary mail body. So a hello
 found there is reported only when the other direction of the same connection confirms
-it: that direction holds a hello of the other kind that parsed, and its stream overlaps
-the searched one in capture order. A later connection reusing the tuple begins after
-the earlier one ends, so it confirms nothing. The row then says
-`client_prefix_unanchored` or `server_prefix_unanchored`.
+it: that direction holds a hello of the other kind that parsed, was not itself found by
+searching, and its stream overlaps the searched one in capture order. Two searched
+directions do not confirm each other, since data moved both ways can hold hello-shaped
+runs in either role, and a later connection reusing the tuple begins after the earlier
+one ends, so it confirms nothing either. The row then says `client_prefix_unanchored`
+or `server_prefix_unanchored`.
 
-Until confirmed, the find waits. It is dropped when an overlapping other direction
-arrives that is plainly not TLS (reconstructed from its first byte, without a record
-header there; a failed or truncated stream refutes nothing), at the end of the file, and
-when there is no room: such finds take at most a quarter of `max_pending` and give their
-place to a direction that needs no confirmation. It never displaces a direction held for
-the same side that stands on its own, such as the start of a connection that resumed
-after idle eviction. The prefix counts from the first captured byte, and is usually
+Until confirmed, the find waits. It is dropped when an overlapping other direction is
+plainly not TLS, whether that direction comes before or after it: reconstructed from its
+first byte, which does not begin a TLS record. A failed or truncated stream, or one that
+begins with any record, such as an alert, refutes nothing. It is also dropped at the end
+of the file, and when there is no room: such finds take at most a quarter of
+`max_pending` (at least one place) and give their place, oldest first, to a direction
+that needs no confirmation. It never displaces a direction held for the same side that
+stands on its own, such as the start of a connection that resumed after idle eviction;
+a direction held from an earlier connection on the tuple is reported and gives way to
+it. The prefix counts from the first captured byte, and is usually
 `client_tunnel_unrecognized` as well, since the tunnel's own start was missed. On Neris
 this finds nothing new, and the mail-body hello stays unreported.
 

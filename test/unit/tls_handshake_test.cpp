@@ -950,27 +950,35 @@ void TestUnanchoredSearch() {
 		    (done[0].warnings == std::vector<std::string> {"client_tunnel_unrecognized", "client_prefix_unanchored"}));
 	}
 
-	// Both directions unanchored and both found by the search confirm each other.
+	// Two searched directions do not confirm each other: data moved both ways
+	// can hold hello-shaped runs in either role.
 	TlsHandshakeAssembler both;
 	both.Add(client);
 	auto done = both.Add(midstream(key.Reverse(), 2, Concat(Bytes("xyz"), reply)));
-	assert(done.size() == 1 && HasWarning(done[0], "client_prefix_unanchored") &&
-	       HasWarning(done[0], "server_prefix_unanchored"));
+	auto rest = both.Finish();
+	assert(done.empty() && rest.empty());
 
-	// A peer that came first and was not TLS left the find waiting. A later
-	// connection reusing the tuple does not overlap it, so its ServerHello
-	// confirms nothing and is reported alone.
+	// A non-TLS peer that came first refutes the find when it arrives. A later
+	// connection reusing the tuple does not overlap it either, so its
+	// ServerHello confirms nothing and is reported alone.
 	TlsHandshakeAssembler reused;
 	reused.Add(span(Stream(key.Reverse(), 2, Bytes("250 OK\r\n"), 2), 2, 9));
-	reused.Add(client);
+	assert(reused.Add(client).empty() && reused.Empty());
 	done = reused.Add(span(Stream(key.Reverse(), 3, reply, 20), 20, 25));
-	auto rest = reused.Finish();
+	rest = reused.Finish();
 	done.insert(done.end(), rest.begin(), rest.end());
 	assert(done.size() == 1 && !done[0].has_client_hello && done[0].cipher_suite == 0x009C && !has_found(done));
+	// A non-TLS stream that does not overlap refutes nothing.
+	TlsHandshakeAssembler earlier;
+	earlier.Add(span(Stream(key.Reverse(), 2, Bytes("250 OK\r\n"), 20), 20, 30));
+	earlier.Add(client);
+	assert(earlier.Add(server).size() == 1);
 
-	// A failed or truncated peer says nothing about TLS, so it refutes nothing.
+	// A failed or truncated peer, or one beginning with any TLS record such as
+	// an alert, says nothing about TLS, so it refutes nothing.
 	for (const auto &peer : {span(Stream(key.Reverse(), 2, Bytes("250 OK\r\n"), 2, "conflict"), 2, 9),
-	                         span(Stream(key.Reverse(), 2, {0x16, 0x03, 0x03, 0x40, 0x00, 0x02}, 2), 2, 9)}) {
+	                         span(Stream(key.Reverse(), 2, {0x16, 0x03, 0x03, 0x40, 0x00, 0x02}, 2), 2, 9),
+	                         span(Stream(key.Reverse(), 2, Record({2, 40}, 21), 2), 2, 9)}) {
 		TlsHandshakeAssembler kept;
 		kept.Add(client);
 		assert(kept.Add(peer).empty() && !kept.Empty());
@@ -1002,13 +1010,29 @@ void TestUnanchoredSearch() {
 	done = resumed.Add(server);
 	assert(done.size() == 1 && done[0].sni == "first.example" && done[0].has_server_hello);
 
-	// A second unconfirmed client direction on the tuple replaces the first
-	// without reporting it.
+	// A direction held from an earlier connection on the tuple gives way to an
+	// unconfirmed one that begins after it, which its own peer then confirms.
+	TlsHandshakeAssembler older;
+	done = older.Add(span(Stream(key.Reverse(), 5, reply, 1), 1, 1));
+	assert(done.empty());
+	done = older.Add(span(client, 5, 15));
+	assert(done.size() == 1 && !done[0].has_client_hello);
+	done = older.Add(span(server, 6, 14));
+	assert(done.size() == 1 && done[0].sni == "mid.example");
+
+	// Another client direction on the tuple replaces an unconfirmed one
+	// without reporting it, anchored or not.
 	TlsHandshakeAssembler replaced;
 	replaced.Add(client);
 	assert(replaced.Add(Stream(key, 3, Record(ClientHello(ServerNameExtension("next.example"))), 3)).empty());
 	done = replaced.Finish();
 	assert(done.size() == 1 && done[0].sni == "next.example");
+	TlsHandshakeAssembler replaced_unconfirmed;
+	replaced_unconfirmed.Add(client);
+	replaced_unconfirmed.Add(
+	    span(midstream(key, 3, Concat(Bytes("q"), Record(ClientHello(ServerNameExtension("later.example"))))), 11, 20));
+	done = replaced_unconfirmed.Add(span(Stream(key.Reverse(), 4, reply, 12), 12, 19));
+	assert(done.size() == 1 && done[0].sni == "later.example");
 
 	// Unconfirmed finds hold at most a quarter of max_pending, and give their
 	// place to a direction that needs none.
@@ -1022,6 +1046,24 @@ void TestUnanchoredSearch() {
 	}
 	done = crowded.Finish();
 	assert(done.size() == 4 && !has_found(done));
+	// The oldest find gives way first, whatever its key: here port 9's, held
+	// before port 8's, so port 8's is still confirmed.
+	TlsHandshakeLimits eight;
+	eight.max_pending = 8;
+	TlsHandshakeAssembler aged(eight);
+	aged.Add(midstream(Key(9), 1, Concat(Bytes("a"), hello)));
+	aged.Add(midstream(Key(8), 2, Concat(Bytes("b"), hello)));
+	for (uint16_t port = 20; port < 27; ++port) {
+		aged.Add(Stream(Key(port), port, Record(ClientHello({})), port));
+	}
+	done = aged.Add(span(Stream(Key(8).Reverse(), 30, reply, 3), 3, 9));
+	assert(done.size() == 1 && done[0].sni == "mid.example" && done[0].key.src_port == 8);
+	// With fewer than four places, a find may still take one.
+	TlsHandshakeLimits two;
+	two.max_pending = 2;
+	TlsHandshakeAssembler small(two);
+	small.Add(client);
+	assert(small.Add(server).size() == 1);
 
 	// A stream without its SYN that begins with a handshake record is read as
 	// it stands, as before, and needs no confirmation.
