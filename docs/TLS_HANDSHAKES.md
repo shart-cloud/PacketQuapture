@@ -132,6 +132,7 @@ whatever the status. It is `[]` when there are none and is never NULL.
 | `client_list_malformed`, `server_list_malformed` | At least one of that side's lists is NULL because it was malformed. On the server side this includes a malformed `supported_versions`, which leaves `negotiated_version` NULL. |
 | `server_certificate_malformed`, `client_certificate_malformed` | That side's Certificate message was malformed, so its column is NULL, or at least one certificate in it did not parse and is a NULL element. |
 | `client_tunnel_unrecognized`, `server_tunnel_unrecognized` | Bytes came before TLS in that direction but did not parse exactly as a known tunnel. The TLS columns are still sound; see below. |
+| `client_prefix_unanchored`, `server_prefix_unanchored` | That direction's SYN was not captured and its hello was found by searching from its first captured byte, so the prefix is counted from there; the other direction's hello confirmed it. See below. |
 | `tunnel_mismatch` | Each side's prefix parsed as a different tunnel; `tunnel.protocol` is the client's. |
 
 ## JA3 and JA3S
@@ -302,15 +303,36 @@ an error on the Neris capture.
 ## Tunnels
 
 A stream whose first bytes are a TLS handshake record header is read as it stands and
-never searched. Neither is a stream without its SYN: it begins mid-conversation, so its
-first byte is not where a tunnel would start, and a hello-shaped run inside ordinary data
-is not TLS. On CTU-13 Neris that is exactly what an unanchored SMTP direction held, a
-complete ClientHello inside a binary mail body. Any other stream is searched for a hello
-in its first 8 KiB
+never searched. Any other stream is searched for a hello in its first 8 KiB
 (`max_tunnel_prefix_bytes`). Past the start the test is stricter than at it: a whole
 ClientHello or ServerHello must sit inside the first record found, within
 `max_message_bytes`, and must parse. Bytes that merely look like a record header are not
-TLS, and parsing one record per candidate bounds the search.
+TLS, and parsing one record per candidate, where it lies, bounds the search.
+
+A stream without its SYN, one captured mid-conversation or resumed after idle eviction,
+is searched the same way, but its first byte is not where a tunnel would start, and a
+hello-shaped run inside ordinary data is not TLS. On CTU-13 Neris an unanchored SMTP
+direction held exactly that, a complete ClientHello inside a binary mail body. So a hello
+found there is reported only when the other direction of the same connection confirms
+it: that direction holds a hello of the other kind that parsed, was not itself found by
+searching, and its stream overlaps the searched one in capture order. Two searched
+directions do not confirm each other, since data moved both ways can hold hello-shaped
+runs in either role, and a later connection reusing the tuple begins after the earlier
+one ends, so it confirms nothing either. The row then says `client_prefix_unanchored`
+or `server_prefix_unanchored`.
+
+Until confirmed, the find waits. It is dropped when an overlapping other direction is
+plainly not TLS, whether that direction comes before or after it: reconstructed from its
+first byte, which does not begin a TLS record. A failed or truncated stream, or one that
+begins with any record, such as an alert, refutes nothing. It is also dropped at the end
+of the file, and when there is no room: such finds take at most a quarter of
+`max_pending` (at least one place) and give their place, oldest first, to a direction
+that needs no confirmation. It never displaces a direction held for the same side that
+stands on its own, such as the start of a connection that resumed after idle eviction;
+a direction held from an earlier connection on the tuple is reported and gives way to
+it. The prefix counts from the first captured byte, and is usually
+`client_tunnel_unrecognized` as well, since the tunnel's own start was missed. On Neris
+this finds nothing new, and the mail-body hello stays unreported.
 
 The bytes before the hello are then read as a tunnel, and must parse exactly, with no
 byte left over:

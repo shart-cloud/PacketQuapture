@@ -1,5 +1,6 @@
 #include "tls_handshake.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <random>
@@ -904,6 +905,174 @@ TlsHandshake Tunnelled(const std::vector<uint8_t> &client_prefix, const std::vec
 	return done[0];
 }
 
+// Without its SYN a stream begins mid-conversation, so a hello found past its
+// start may be data: on CTU-13 Neris one sat inside a binary mail body. It is
+// reported only when the other direction of the same connection confirms it:
+// a hello that parsed, in a stream overlapping it in capture order.
+void TestUnanchoredSearch() {
+	const auto key = Key();
+	const auto hello = Record(ClientHello(ServerNameExtension("mid.example")));
+	const auto reply = Record(ServerHello(0x009C));
+	// Streams span packets first..last, as a connection's directions interleave.
+	const auto span = [](TcpStream stream, uint64_t first, uint64_t last) {
+		stream.first = Stamp(first);
+		stream.last = Stamp(last);
+		return stream;
+	};
+	const auto midstream = [&](const TcpFlowKey &k, uint64_t id, const std::vector<uint8_t> &bytes) {
+		auto stream = Stream(k, id, bytes, id, "unanchored");
+		stream.syn_seen = false;
+		return span(stream, 1, 10);
+	};
+	const auto client = midstream(key, 1, Concat(Bytes("DATA body "), hello));
+	const auto server = span(Stream(key.Reverse(), 2, reply, 2), 2, 9);
+	const auto has_found = [](const std::vector<TlsHandshake> &rows) {
+		return std::any_of(rows.begin(), rows.end(), [](const TlsHandshake &row) { return row.sni == "mid.example"; });
+	};
+
+	// Alone, or with a peer that is plainly not TLS, nothing is reported.
+	TlsHandshakeAssembler alone;
+	assert(alone.Add(client).empty() && alone.Finish().empty());
+	TlsHandshakeAssembler refuted;
+	refuted.Add(client);
+	assert(refuted.Add(span(Stream(key.Reverse(), 2, Bytes("250 OK\r\n"), 2), 2, 9)).empty());
+	assert(refuted.Empty() && refuted.Finish().empty());
+
+	// A ServerHello from the other direction confirms it, in either order.
+	for (int order = 0; order < 2; ++order) {
+		TlsHandshakeAssembler confirmed;
+		auto done = order == 0 ? confirmed.Add(client) : confirmed.Add(server);
+		assert(done.empty());
+		done = order == 0 ? confirmed.Add(server) : confirmed.Add(client);
+		assert(done.size() == 1 && done[0].sni == "mid.example" && done[0].cipher_suite == 0x009C);
+		assert(done[0].client_prefix_bytes == 10 && done[0].server_prefix_bytes == 0);
+		assert(
+		    (done[0].warnings == std::vector<std::string> {"client_tunnel_unrecognized", "client_prefix_unanchored"}));
+	}
+
+	// Two searched directions do not confirm each other: data moved both ways
+	// can hold hello-shaped runs in either role.
+	TlsHandshakeAssembler both;
+	both.Add(client);
+	auto done = both.Add(midstream(key.Reverse(), 2, Concat(Bytes("xyz"), reply)));
+	auto rest = both.Finish();
+	assert(done.empty() && rest.empty());
+
+	// A non-TLS peer that came first refutes the find when it arrives. A later
+	// connection reusing the tuple does not overlap it either, so its
+	// ServerHello confirms nothing and is reported alone.
+	TlsHandshakeAssembler reused;
+	reused.Add(span(Stream(key.Reverse(), 2, Bytes("250 OK\r\n"), 2), 2, 9));
+	assert(reused.Add(client).empty() && reused.Empty());
+	done = reused.Add(span(Stream(key.Reverse(), 3, reply, 20), 20, 25));
+	rest = reused.Finish();
+	done.insert(done.end(), rest.begin(), rest.end());
+	assert(done.size() == 1 && !done[0].has_client_hello && done[0].cipher_suite == 0x009C && !has_found(done));
+	// A non-TLS stream that does not overlap refutes nothing.
+	TlsHandshakeAssembler earlier;
+	earlier.Add(span(Stream(key.Reverse(), 2, Bytes("250 OK\r\n"), 20), 20, 30));
+	earlier.Add(client);
+	assert(earlier.Add(server).size() == 1);
+
+	// A failed or truncated peer, or one beginning with any TLS record such as
+	// an alert, says nothing about TLS, so it refutes nothing.
+	for (const auto &peer : {span(Stream(key.Reverse(), 2, Bytes("250 OK\r\n"), 2, "conflict"), 2, 9),
+	                         span(Stream(key.Reverse(), 2, {0x16, 0x03, 0x03, 0x40, 0x00, 0x02}, 2), 2, 9),
+	                         span(Stream(key.Reverse(), 2, Record({2, 40}, 21), 2), 2, 9)}) {
+		TlsHandshakeAssembler kept;
+		kept.Add(client);
+		assert(kept.Add(peer).empty() && !kept.Empty());
+		assert(kept.Add(server).size() == 1);
+	}
+
+	// A peer whose ServerHello does not parse does not confirm: it is reported
+	// alone, and the find is dropped.
+	auto broken = reply;
+	broken[5 + 4] = 0x09; // legacy_version truncated inside a shortened body
+	broken.resize(5 + 4 + 1);
+	broken[3] = 0x00;
+	broken[4] = 0x05;
+	broken[5 + 1] = broken[5 + 2] = 0x00;
+	broken[5 + 3] = 0x01;
+	TlsHandshakeAssembler invalid;
+	invalid.Add(client);
+	done = invalid.Add(span(Stream(key.Reverse(), 2, broken, 2), 2, 9));
+	rest = invalid.Finish();
+	done.insert(done.end(), rest.begin(), rest.end());
+	assert(done.size() == 1 && done[0].status == "invalid" && !has_found(done));
+
+	// An unconfirmed direction does not displace one that stands on its own:
+	// a direction resumed after idle eviction is dropped, and the original
+	// pairs with its server.
+	TlsHandshakeAssembler resumed;
+	resumed.Add(span(Stream(key, 1, Record(ClientHello(ServerNameExtension("first.example"))), 1), 1, 3));
+	assert(resumed.Add(span(midstream(key, 3, Concat(Bytes("x"), hello)), 30, 40)).empty());
+	done = resumed.Add(server);
+	assert(done.size() == 1 && done[0].sni == "first.example" && done[0].has_server_hello);
+
+	// A direction held from an earlier connection on the tuple gives way to an
+	// unconfirmed one that begins after it, which its own peer then confirms.
+	TlsHandshakeAssembler older;
+	done = older.Add(span(Stream(key.Reverse(), 5, reply, 1), 1, 1));
+	assert(done.empty());
+	done = older.Add(span(client, 5, 15));
+	assert(done.size() == 1 && !done[0].has_client_hello);
+	done = older.Add(span(server, 6, 14));
+	assert(done.size() == 1 && done[0].sni == "mid.example");
+
+	// Another client direction on the tuple replaces an unconfirmed one
+	// without reporting it, anchored or not.
+	TlsHandshakeAssembler replaced;
+	replaced.Add(client);
+	assert(replaced.Add(Stream(key, 3, Record(ClientHello(ServerNameExtension("next.example"))), 3)).empty());
+	done = replaced.Finish();
+	assert(done.size() == 1 && done[0].sni == "next.example");
+	TlsHandshakeAssembler replaced_unconfirmed;
+	replaced_unconfirmed.Add(client);
+	replaced_unconfirmed.Add(
+	    span(midstream(key, 3, Concat(Bytes("q"), Record(ClientHello(ServerNameExtension("later.example"))))), 11, 20));
+	done = replaced_unconfirmed.Add(span(Stream(key.Reverse(), 4, reply, 12), 12, 19));
+	assert(done.size() == 1 && done[0].sni == "later.example");
+
+	// Unconfirmed finds hold at most a quarter of max_pending, and give their
+	// place to a direction that needs none.
+	TlsHandshakeLimits four;
+	four.max_pending = 4;
+	TlsHandshakeAssembler crowded(four);
+	crowded.Add(midstream(Key(1), 1, Concat(Bytes("a"), hello)));
+	crowded.Add(midstream(Key(2), 2, Concat(Bytes("b"), hello))); // over the quarter: dropped
+	for (uint16_t port = 3; port <= 6; ++port) {
+		assert(crowded.Add(Stream(Key(port), port, Record(ClientHello({})), port)).empty());
+	}
+	done = crowded.Finish();
+	assert(done.size() == 4 && !has_found(done));
+	// The oldest find gives way first, whatever its key: here port 9's, held
+	// before port 8's, so port 8's is still confirmed.
+	TlsHandshakeLimits eight;
+	eight.max_pending = 8;
+	TlsHandshakeAssembler aged(eight);
+	aged.Add(midstream(Key(9), 1, Concat(Bytes("a"), hello)));
+	aged.Add(midstream(Key(8), 2, Concat(Bytes("b"), hello)));
+	for (uint16_t port = 20; port < 27; ++port) {
+		aged.Add(Stream(Key(port), port, Record(ClientHello({})), port));
+	}
+	done = aged.Add(span(Stream(Key(8).Reverse(), 30, reply, 3), 3, 9));
+	assert(done.size() == 1 && done[0].sni == "mid.example" && done[0].key.src_port == 8);
+	// With fewer than four places, a find may still take one.
+	TlsHandshakeLimits two;
+	two.max_pending = 2;
+	TlsHandshakeAssembler small(two);
+	small.Add(client);
+	assert(small.Add(server).size() == 1);
+
+	// A stream without its SYN that begins with a handshake record is read as
+	// it stands, as before, and needs no confirmation.
+	TlsHandshakeAssembler at_start;
+	at_start.Add(midstream(key, 1, hello));
+	done = at_start.Finish();
+	assert(done.size() == 1 && done[0].warnings == std::vector<std::string> {"server_hello_missing"});
+}
+
 void TestSocks5Tunnels() {
 	// No authentication, an IPv4 destination.
 	const std::vector<uint8_t> greeting = {5, 1, 0};
@@ -1051,13 +1220,7 @@ void TestTunnelEdges() {
 	cut.Add(Stream(Key(), 1, Concat({0x16, 0x03, 0x01, 0x40, 0x00}, Record(ClientHello({}))), 1));
 	assert(cut.Finish().empty());
 
-	// Without its SYN a stream begins mid-conversation, so a hello past its start
-	// is data, not a tunnel. On CTU-13 Neris one sat inside a binary mail body.
-	auto midstream = Stream(Key(), 1, Concat(Bytes("DATA body "), Record(ClientHello({}))), 1, "unanchored");
-	midstream.syn_seen = false;
-	TlsHandshakeAssembler unanchored;
-	unanchored.Add(midstream);
-	assert(unanchored.Finish().empty());
+	TestUnanchoredSearch();
 
 	// The search applies the per-message limit that the stream-start parse does.
 	TlsHandshakeLimits small;

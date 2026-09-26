@@ -247,6 +247,7 @@ def reassembly_fixtures():
     idle_fixtures()
     certificate_fixtures()
     certificate_detail_fixtures()
+    unanchored_fixtures()
     tunnel_fixtures()
 
     # TCP that is not TLS at all.
@@ -495,6 +496,23 @@ def tunnel_fixtures():
         (False, b"HTTP/1.1 200 Connection established\r\n\r\n"),
         (True, hello("login.example")), (False, reply)], port=51007)
     pcap(DATA / "tunnels.pcap", packets)
+
+
+def unanchored_fixtures():
+    """Connections whose client SYN was not captured, so the search for a hello
+    starts mid-conversation and needs the server's hello to confirm it."""
+    hello = record(client_hello(server_name("midstream.example")))
+    reply = record(server_hello())
+    # The capture began after the client's SYN and a few bytes it sent; the
+    # server's side, from its SYN-ACK, was captured whole.
+    confirmed = [to_client(b"", 0, 52001, flags=0x12),
+                 to_server(b"...tail of earlier data" + hello, 100, 52001),
+                 to_client(reply, 1, 52001)]
+    # A hello inside a mail body, as on CTU-13 Neris: the server's side is SMTP,
+    # so nothing confirms it and no row is reported.
+    refuted = [to_server(b"DATA body " + hello, 100, 52002),
+               to_client(b"250 2.0.0 Ok: queued\r\n", 500, 52002)]
+    pcap(DATA / "unanchored.pcap", confirmed + refuted)
 
 
 def certificate_detail_fixtures():

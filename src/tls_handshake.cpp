@@ -79,6 +79,16 @@ public:
 		offset += count;
 		return true;
 	}
+	// The next count bytes as a reader of their own, without copying them.
+	bool Sub(size_t count, Reader &out) {
+		if (Remaining() < count) {
+			overrun = true;
+			return false;
+		}
+		out = Reader(data + offset, count);
+		offset += count;
+		return true;
+	}
 	bool TakeBytes(size_t count, std::vector<uint8_t> &out) {
 		if (Remaining() < count) {
 			overrun = true;
@@ -273,13 +283,12 @@ bool ParseExtensions(Reader &reader, bool client, const TlsHandshakeLimits &limi
 		if (++count > limits.max_extensions) {
 			return false;
 		}
-		std::vector<uint8_t> body;
-		if (!reader.TakeBytes(length, body)) {
+		Reader inner(nullptr, 0);
+		if (!reader.Sub(length, inner)) {
 			return false;
 		}
 		consumed += length;
 		types.values.push_back(type);
-		Reader inner(body.data(), body.size());
 		if (type == EXTENSION_SERVER_NAME && client) {
 			ParseServerName(inner, handshake);
 		} else if (type == EXTENSION_SUPPORTED_VERSIONS) {
@@ -308,9 +317,9 @@ bool ParseExtensions(Reader &reader, bool client, const TlsHandshakeLimits &limi
 
 // ClientHello and ServerHello share a prefix up to the extension list, differing
 // only in how the session id and cipher suites are encoded.
-bool ParseHello(const std::vector<uint8_t> &body, bool client, const TlsHandshakeLimits &limits,
+bool ParseHello(const uint8_t *body, size_t size, bool client, const TlsHandshakeLimits &limits,
                 TlsHandshake &handshake, std::vector<uint8_t> &session_id) {
-	Reader reader(body.data(), body.size());
+	Reader reader(body, size);
 	const uint16_t legacy_version = reader.U16();
 	if (reader.Overrun()) {
 		return false;
@@ -370,12 +379,12 @@ bool ParseHello(const std::vector<uint8_t> &body, bool client, const TlsHandshak
 // extension is. A certificate that does not parse keeps its place in the chain.
 // held counts the certificate text this direction already holds; a chain that
 // would take it past max_direction_certificate_bytes is over the limit.
-void ParseCertificates(const std::vector<uint8_t> &body, const TlsHandshakeLimits &limits, size_t &held,
+void ParseCertificates(const uint8_t *body, size_t size, const TlsHandshakeLimits &limits, size_t &held,
                        TlsList<TlsCertificate> &chain, TlsHandshake &handshake) {
 	if (Duplicate(chain)) {
 		return;
 	}
-	Reader reader(body.data(), body.size());
+	Reader reader(body, size);
 	const uint32_t list_length = reader.U24();
 	if (reader.Overrun() || reader.Remaining() != list_length) {
 		chain.malformed = true;
@@ -472,11 +481,12 @@ int HelloAt(const std::vector<uint8_t> &data, size_t offset, const TlsHandshakeL
 	    message_length > length - 4 || message_length > limits.max_message_bytes) {
 		return 0;
 	}
-	const std::vector<uint8_t> body(message + 4, message + 4 + message_length);
+	// Parsed where it lies: most candidates fail at once, and copying up to
+	// max_message_bytes for each would make the search quadratic.
 	TlsHandshake hello;
 	std::vector<uint8_t> session_id;
 	const bool client = type == HANDSHAKE_CLIENT_HELLO;
-	return ParseHello(body, client, limits, hello, session_id) ? (client ? 1 : 2) : 0;
+	return ParseHello(message + 4, message_length, client, limits, hello, session_id) ? (client ? 1 : 2) : 0;
 }
 
 // Reads a SOCKS address of the given type and the port after it as host:port.
@@ -760,14 +770,13 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 		return direction;
 	}
 	// Anything else may be a tunnel that carried the handshake, so look for a
-	// hello after a short prefix, and say what that prefix was. Only from the
-	// connection's first byte: past a missed SYN, or after idle eviction, offset
-	// 0 is mid-conversation, and a hello-shaped run inside ordinary data, such
-	// as a binary mail body, is not a tunnel. Candidates start with the
-	// handshake record type, so the scan jumps between those bytes.
-	if (!stream.syn_seen) {
-		return direction;
-	}
+	// hello after a short prefix, and say what that prefix was. Past a missed
+	// SYN, or after idle eviction, offset 0 is mid-conversation, and a
+	// hello-shaped run inside ordinary data, such as a binary mail body, is not
+	// a tunnel; such a find waits for the other direction to confirm it.
+	// Candidates start with the handshake record type, so the scan jumps
+	// between those bytes.
+	direction.needs_confirmation = !stream.syn_seen;
 	const size_t end = std::min(limits.max_tunnel_prefix_bytes + 1, data.size());
 	for (size_t start = 1; start < end; ++start) {
 		const void *found = std::memchr(data.data() + start, RECORD_HANDSHAKE, end - start);
@@ -879,10 +888,9 @@ void TlsHandshakeAssembler::ParseRecords(const TcpStream &stream, const TcpStrea
 			TlsHandshake handshake;
 			handshake.has_client_hello = client;
 			handshake.has_server_hello = !client;
-			std::vector<uint8_t> body(handshake_bytes.begin() + static_cast<long>(message_offset + 4),
-			                          handshake_bytes.begin() + static_cast<long>(message_offset + 4 + length));
 			std::vector<uint8_t> session_id;
-			if (!ParseHello(body, client, limits, handshake, session_id)) {
+			if (!ParseHello(handshake_bytes.data() + message_offset + 4, length, client, limits, handshake,
+			                session_id)) {
 				handshake.status = "invalid";
 				handshake.error = client ? "ClientHello is malformed" : "ServerHello is malformed";
 				ClearHello(handshake);
@@ -903,9 +911,8 @@ void TlsHandshakeAssembler::ParseRecords(const TcpStream &stream, const TcpStrea
 			// the ClientHello. One with no hello before it is not reported.
 			auto &handshake = direction.handshakes.back();
 			auto &chain = handshake.has_server_hello ? handshake.server_certificates : handshake.client_certificates;
-			std::vector<uint8_t> body(handshake_bytes.begin() + static_cast<long>(message_offset + 4),
-			                          handshake_bytes.begin() + static_cast<long>(message_offset + 4 + length));
-			ParseCertificates(body, limits, certificate_bytes, chain, handshake);
+			ParseCertificates(handshake_bytes.data() + message_offset + 4, length, limits, certificate_bytes, chain,
+			                  handshake);
 			const auto span = locator.Locate(message_offset, length + 4);
 			if (span.second > 0) {
 				const auto provenance = chunk.Provenance(span.first, span.second);
@@ -1068,6 +1075,14 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 		if (handshake.server_prefix_bytes > 0 && handshake.server_tunnel.empty()) {
 			handshake.warnings.push_back("server_tunnel_unrecognized");
 		}
+		// A prefix counted from the first captured byte, not the connection's
+		// first: the SYN was missed, so the other direction had to confirm it.
+		if (from_client != nullptr && client.needs_confirmation) {
+			handshake.warnings.push_back("client_prefix_unanchored");
+		}
+		if (from_server != nullptr && server->needs_confirmation) {
+			handshake.warnings.push_back("server_prefix_unanchored");
+		}
 		// Both sides recognised, as different tunnels. A SOCKS4 reply is the same
 		// for 4a, so that pair agrees.
 		const auto &said = handshake.client_tunnel, &answered = handshake.server_tunnel;
@@ -1079,46 +1094,201 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 	return result;
 }
 
+// A direction reported without a peer. One that needs confirmation never is.
+std::vector<TlsHandshake> TlsHandshakeAssembler::ReportAlone(const Direction &direction) {
+	if (direction.needs_confirmation) {
+		return std::vector<TlsHandshake>();
+	}
+	return direction.client ? Merge(direction, nullptr) : Merge(Direction(), &direction);
+}
+
+namespace {
+
+// Whether two streams share packets' span in capture order, as the two
+// directions of one connection do. A later connection reusing the tuple
+// begins after the earlier one ends.
+bool Overlaps(const PacketStamp &first, const PacketStamp &last, const PacketStamp &other_first,
+              const PacketStamp &other_last) {
+	return first.number <= other_last.number && other_first.number <= last.number;
+}
+
+// A stream that plainly did not carry TLS: reconstructed from its first byte,
+// which does not begin a TLS record header. A failed or truncated stream, or
+// one beginning with any record, says nothing either way.
+bool PlainlyNotTls(const TcpStream &stream) {
+	if (stream.status == "conflict" || stream.status == "limit" || stream.chunks.empty() ||
+	    stream.chunks.front().offset != 0 || stream.chunks.front().data.empty()) {
+		return false;
+	}
+	const auto &data = stream.chunks.front().data;
+	const bool record =
+	    data.size() >= RECORD_HEADER_LENGTH && data[0] >= 20 && data[0] <= 24 && RecordHeaderValid(data.data());
+	return !record && !(data.size() < RECORD_HEADER_LENGTH && data[0] >= 20 && data[0] <= 24);
+}
+
+} // namespace
+
+// Whether peer confirms a hello found by searching an unanchored stream: the
+// other side of the same connection, overlapping it in capture order, with a
+// hello that parsed and was not itself found by searching. Two searched
+// streams could each hold a hello-shaped run in data, in either role.
+bool TlsHandshakeAssembler::Confirms(const Direction &peer, const Direction &found) {
+	return peer.client != found.client && !peer.needs_confirmation && !peer.handshakes.empty() &&
+	       peer.handshakes.front().status != "invalid" && Overlaps(peer.first, peer.last, found.first, found.last);
+}
+
+void TlsHandshakeAssembler::Release(std::map<TcpFlowKey, Direction>::iterator it) {
+	unconfirmed -= it->second.needs_confirmation ? 1 : 0;
+	pending.erase(it);
+}
+
+// Remembers a stream that was plainly not TLS for a find on its other side
+// that has yet to arrive: a client find is keyed by its own tuple, the
+// reverse of this stream's; a server find by its client's, this stream's.
+void TlsHandshakeAssembler::Refute(const TcpStream &stream) {
+	const size_t room = std::max<size_t>(1, limits.max_pending);
+	for (const bool client_side : {true, false}) {
+		const auto key = client_side ? stream.key.Reverse() : stream.key;
+		auto waiting = pending.find(key);
+		if (waiting != pending.end() && waiting->second.needs_confirmation && waiting->second.client == client_side &&
+		    Overlaps(stream.first, stream.last, waiting->second.first, waiting->second.last)) {
+			Release(waiting);
+			continue;
+		}
+		if (refuters.size() >= room) {
+			refuters.pop_front();
+		}
+		refuters.push_back(Refuter {key, client_side, stream.first, stream.last});
+	}
+}
+
+bool TlsHandshakeAssembler::Refuted(const Direction &found) const {
+	return std::any_of(refuters.begin(), refuters.end(), [&](const Refuter &refuter) {
+		return refuter.client_side == found.client && !(refuter.key < found.oriented_key) &&
+		       !(found.oriented_key < refuter.key) && Overlaps(refuter.first, refuter.last, found.first, found.last);
+	});
+}
+
+// Holds a direction for its peer, if there is room. Unconfirmed finds may
+// take at most a quarter of the room, at least one place, and give theirs up,
+// oldest first, to a direction that needs no confirmation, so a capture
+// begun mid-way cannot crowd out the handshakes that pair on their own.
+bool TlsHandshakeAssembler::Hold(Direction &direction) {
+	if (limits.max_pending == 0 ||
+	    (direction.needs_confirmation && unconfirmed >= std::max<size_t>(1, limits.max_pending / 4))) {
+		return false;
+	}
+	if (pending.size() >= limits.max_pending) {
+		if (direction.needs_confirmation || unconfirmed == 0) {
+			return false;
+		}
+		while (!unconfirmed_order.empty()) {
+			auto oldest = pending.find(unconfirmed_order.front());
+			unconfirmed_order.pop_front();
+			if (oldest != pending.end() && oldest->second.needs_confirmation) {
+				Release(oldest);
+				break;
+			}
+		}
+	}
+	if (direction.needs_confirmation) {
+		++unconfirmed;
+		unconfirmed_order.push_back(direction.oriented_key);
+		// Keys of finds since released stay behind; keep the queue near the
+		// number held.
+		if (unconfirmed_order.size() > 2 * limits.max_pending) {
+			std::deque<TcpFlowKey> live;
+			for (const auto &key : unconfirmed_order) {
+				auto held = pending.find(key);
+				if (held != pending.end() && held->second.needs_confirmation) {
+					live.push_back(key);
+				}
+			}
+			unconfirmed_order.swap(live);
+		}
+	}
+	const auto key = direction.oriented_key;
+	pending.insert(std::make_pair(key, std::move(direction)));
+	return true;
+}
+
+// A hello found by searching an unanchored stream is reported only with its
+// peer's; held alone, it is dropped when a peer that is plainly not TLS
+// overlaps it, whichever arrives first, when it cannot be held, and at Finish.
 std::vector<TlsHandshake> TlsHandshakeAssembler::Add(const TcpStream &stream) {
 	std::vector<TlsHandshake> result;
 	auto direction = Parse(stream, limits);
 	if (direction.handshakes.empty()) {
 		// Nothing identified this direction as TLS, so it is not reported. A
 		// transport failure on a stream we cannot classify is not a TLS finding.
+		if (PlainlyNotTls(stream)) {
+			Refute(stream);
+		}
+		return result;
+	}
+	if (direction.needs_confirmation && Refuted(direction)) {
 		return result;
 	}
 	auto existing = pending.find(direction.oriented_key);
+	if (existing != pending.end() && existing->second.client == direction.client) {
+		// The same side twice: separate connections reusing the tuple, or a
+		// direction resumed after idle eviction. An unconfirmed newcomer does
+		// not displace a direction that stands on its own; otherwise report the
+		// one held and keep the newcomer.
+		if (direction.needs_confirmation && !existing->second.needs_confirmation) {
+			return result;
+		}
+		result = ReportAlone(existing->second);
+		Release(existing);
+		existing = pending.end();
+	}
+	if (existing != pending.end()) {
+		const Direction &held = existing->second;
+		const bool unconfirmed_pair = (direction.needs_confirmation && !Confirms(held, direction)) ||
+		                              (held.needs_confirmation && !Confirms(direction, held));
+		if (unconfirmed_pair) {
+			// Not the same connection, or not a peer that confirms. One held
+			// from an earlier connection on the tuple is reported and gives way;
+			// otherwise the unconfirmed one is dropped.
+			if (held.last.number < direction.first.number) {
+				result = ReportAlone(held);
+				Release(existing);
+			} else if (direction.needs_confirmation) {
+				return result;
+			} else {
+				Release(existing);
+			}
+			existing = pending.end();
+		}
+	}
 	if (existing == pending.end()) {
-		if (pending.size() >= limits.max_pending) {
+		if (!Hold(direction)) {
 			// Report rather than drop: emit this direction alone instead of
 			// holding it past the limit.
-			return Merge(direction.client ? direction : Direction(), direction.client ? nullptr : &direction);
+			auto alone = ReportAlone(direction);
+			result.insert(result.end(), std::make_move_iterator(alone.begin()), std::make_move_iterator(alone.end()));
 		}
-		pending.insert(std::make_pair(direction.oriented_key, direction));
-		return result;
-	}
-	if (existing->second.client == direction.client) {
-		// The same side twice, so these are separate connections reusing the
-		// tuple. Report the one already held and keep the newcomer.
-		result = existing->second.client ? Merge(existing->second, nullptr) : Merge(Direction(), &existing->second);
-		existing->second = direction;
 		return result;
 	}
 	const Direction &client = direction.client ? direction : existing->second;
 	const Direction &server = direction.client ? existing->second : direction;
-	result = Merge(client, &server);
-	pending.erase(existing);
+	auto merged = Merge(client, &server);
+	result.insert(result.end(), std::make_move_iterator(merged.begin()), std::make_move_iterator(merged.end()));
+	Release(existing);
 	return result;
 }
 
 std::vector<TlsHandshake> TlsHandshakeAssembler::Finish() {
 	std::vector<TlsHandshake> result;
 	for (std::map<TcpFlowKey, Direction>::iterator it = pending.begin(); it != pending.end(); ++it) {
-		auto handshakes = it->second.client ? Merge(it->second, nullptr) : Merge(Direction(), &it->second);
+		auto handshakes = ReportAlone(it->second);
 		result.insert(result.end(), std::make_move_iterator(handshakes.begin()),
 		              std::make_move_iterator(handshakes.end()));
 	}
 	pending.clear();
+	unconfirmed = 0;
+	unconfirmed_order.clear();
+	refuters.clear();
 	return result;
 }
 

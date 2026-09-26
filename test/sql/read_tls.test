@@ -509,9 +509,20 @@ SELECT client_port, warnings FROM read_tls('test/data/tls/tunnels.pcap') ORDER B
 
 # TLS that begins its stream has no tunnel.
 query I
-SELECT count(*) FROM read_tls('test/data/tls/*.pcap') WHERE tunnel IS NOT NULL AND filename NOT LIKE '%tunnels.pcap';
+SELECT count(*) FROM read_tls('test/data/tls/*.pcap') WHERE tunnel IS NOT NULL
+  AND filename NOT LIKE '%tunnels.pcap' AND filename NOT LIKE '%unanchored.pcap';
 ----
 0
+
+# A client direction whose SYN was missed is searched too, from its first
+# captured byte, but a hello found there is reported only when the server's
+# hello confirms it. Port 52002 holds one inside a mail body, answered by SMTP,
+# and has no row.
+query ITTIIT
+SELECT client_port, tls_sni, reassembly_status, tunnel.client_prefix_bytes, tunnel.server_prefix_bytes, warnings
+FROM read_tls('test/data/tls/unanchored.pcap');
+----
+52001	midstream.example	unanchored	23	0	[client_tunnel_unrecognized, client_prefix_unanchored]
 
 # A one-sided tunnel gives no length for the side that was not captured.
 query IIII

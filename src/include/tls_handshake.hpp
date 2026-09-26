@@ -4,6 +4,8 @@
 #include "tls_record.hpp"
 #include "x509_certificate.hpp"
 
+#include <deque>
+
 namespace packetquapture {
 
 struct TlsHandshakeLimits {
@@ -170,6 +172,10 @@ private:
 		std::string status, error;
 		// Bytes before the first TLS record, and what they parsed as.
 		uint32_t prefix_bytes = 0;
+		// Found by searching a stream whose SYN was not captured, so its first
+		// byte is mid-conversation. Reported only once the other direction of
+		// the same connection confirms it; see Add.
+		bool needs_confirmation = false;
 		std::string tunnel, tunnel_destination;
 		std::vector<TlsHandshake> handshakes;
 		// Kept beside each handshake rather than on the reported row: it is only
@@ -180,8 +186,27 @@ private:
 	static void ParseRecords(const TcpStream &stream, const TcpStreamChunk &chunk, size_t start,
 	                         const TlsHandshakeLimits &limits, Direction &direction);
 	static std::vector<TlsHandshake> Merge(const Direction &client, const Direction *server);
+	static bool Confirms(const Direction &peer, const Direction &found);
+	static std::vector<TlsHandshake> ReportAlone(const Direction &direction);
+	bool Hold(Direction &direction);
+	void Release(std::map<TcpFlowKey, Direction>::iterator it);
+	void Refute(const TcpStream &stream);
+	bool Refuted(const Direction &found) const;
 	TlsHandshakeLimits limits;
 	std::map<TcpFlowKey, Direction> pending;
+	// How many held directions still need confirmation, and their keys in the
+	// order they were held, oldest first; keys no longer held are skipped.
+	size_t unconfirmed = 0;
+	std::deque<TcpFlowKey> unconfirmed_order;
+	// Recent streams that were plainly not TLS, keyed as a waiting find on
+	// their other side would be, with the packets they span. A find that
+	// arrives after its non-TLS peer is refuted from here. Oldest first.
+	struct Refuter {
+		TcpFlowKey key;
+		bool client_side;
+		PacketStamp first, last;
+	};
+	std::deque<Refuter> refuters;
 };
 
 } // namespace packetquapture
