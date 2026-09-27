@@ -34,7 +34,7 @@ python3 scripts/benchmark_header_reads.py
 
 # Linux integration: observes /proc/self/fd, not a timing speedup threshold.
 c++ -std=c++17 -Wall -Wextra -Werror -O1 -pthread \
-  -isystem duckdb/src/include test/unit/parallel_scan_test.cpp \
+  -isystem duckdb/src/include -Isrc/include test/unit/parallel_scan_test.cpp \
   -Lbuild/release/src -Wl,-rpath,"$PWD/build/release/src" \
   -lduckdb -o build/parallel_scan_test
 timeout 120s ./build/parallel_scan_test

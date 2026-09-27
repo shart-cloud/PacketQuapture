@@ -412,8 +412,8 @@ the public key's own bytes. DTLS and QUIC hellos, the `d` and `q` JA4
 variants, are not read.
 
 Handshakes can still go missing on very busy captures. The transport core tracks
-1,024 TCP directions per file and evicts those idle for 300 seconds (see
-[TCP streams](TCP_STREAMS.md)). If more than 1,024 are active at once, each new packet
+1,024 TCP directions per file and evicts those idle for 300 seconds, or for
+`tcp_idle_timeout` (see [TCP streams](TCP_STREAMS.md)). If more than 1,024 are active at once, each new packet
 becomes its own one-packet stream with status `limit`. This reader cannot tell whether
 such a stream carried TLS, so it reports nothing for it.
 

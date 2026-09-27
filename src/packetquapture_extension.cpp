@@ -953,6 +953,8 @@ struct PcapBindData : public TableFunctionData {
 	shared_ptr<FlowPlanCount> flow_plan;
 	packetquapture::FlowLimits flow_limits;
 	bool flow_scan = false;
+	packetquapture::TcpReassemblyLimits stream_limits;
+	bool stream_scan = false;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<PcapBindData>();
@@ -971,6 +973,8 @@ struct PcapBindData : public TableFunctionData {
 		result->flow_plan = flow_plan;
 		result->flow_limits = flow_limits;
 		result->flow_scan = flow_scan;
+		result->stream_limits = stream_limits;
+		result->stream_scan = stream_scan;
 		if (flow_plan) {
 			flow_plan->scans.fetch_add(1);
 		}
@@ -985,7 +989,8 @@ struct PcapBindData : public TableFunctionData {
 		if (catalog != other.catalog || catalog_immutable != other.catalog_immutable || flow_scan != other.flow_scan ||
 		    flow_limits.tcp_idle_us != other.flow_limits.tcp_idle_us ||
 		    flow_limits.udp_idle_us != other.flow_limits.udp_idle_us ||
-		    flow_limits.max_flows != other.flow_limits.max_flows || files.size() != other.files.size() ||
+		    flow_limits.max_flows != other.flow_limits.max_flows || stream_scan != other.stream_scan ||
+		    stream_limits.tcp_idle_us != other.stream_limits.tcp_idle_us || files.size() != other.files.size() ||
 		    types != other.types || column_stages != other.column_stages || dns_scan != other.dns_scan ||
 		    selected_indices != other.selected_indices || base_column_count != other.base_column_count ||
 		    hive_partitioning != other.hive_partitioning || partition_keys != other.partition_keys ||
@@ -1198,6 +1203,30 @@ static unique_ptr<FunctionData> DnsBind(ClientContext &context, TableFunctionBin
 	return result;
 }
 
+// Idle timeouts are fixed INTERVALs: a month has no fixed length.
+static int64_t IdleTimeoutMicros(const Value &value, const char *what) {
+	if (value.IsNull()) {
+		throw BinderException("%s idle timeout must not be NULL", what);
+	}
+	const auto interval = value.GetValue<interval_t>();
+	int64_t micros;
+	if (interval.months || !Interval::TryGetMicro(interval, micros) || micros < 0) {
+		throw BinderException("%s idle timeout must be a nonnegative fixed interval without months", what);
+	}
+	return micros;
+}
+
+// The stream readers share one transport core; tcp_idle_timeout is its only exposed limit.
+static void BindStreamOptions(FunctionData &result, const TableFunctionBindInput &input) {
+	auto &bind = result.Cast<PcapBindData>();
+	bind.stream_scan = true;
+	for (auto &entry : input.named_parameters) {
+		if (StringUtil::CIEquals(entry.first, "tcp_idle_timeout")) {
+			bind.stream_limits.tcp_idle_us = IdleTimeoutMicros(entry.second, "TCP");
+		}
+	}
+}
+
 template <table_function_bind_t BIND>
 static unique_ptr<FunctionData> BindCapture(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &types, vector<string> &names) {
@@ -1231,6 +1260,9 @@ static unique_ptr<FunctionData> BindCapture(ClientContext &context, TableFunctio
 		if (bind.flow_scan && (StringUtil::CIEquals(entry.first, "tcp_idle_timeout") ||
 		                       StringUtil::CIEquals(entry.first, "udp_idle_timeout") ||
 		                       StringUtil::CIEquals(entry.first, "max_active_flows"))) {
+			continue;
+		}
+		if (bind.stream_scan && StringUtil::CIEquals(entry.first, "tcp_idle_timeout")) {
 			continue;
 		}
 		if (!reader->ParseOption(entry.first, entry.second, options, context)) {
@@ -2029,7 +2061,7 @@ static bool NextStreamEvent(ClientContext &context, const PcapBindData &bind, St
 			state.file_index = bind.selected_indices[work_index];
 			const auto &file = bind.files[state.file_index];
 			state.filename = file.path;
-			state.reassembler = packetquapture::TcpReassembler();
+			state.reassembler = packetquapture::TcpReassembler(bind.stream_limits);
 			state.reader = make_uniq<CaptureReader>(context, file, global.options, &global.progress, work_index);
 		}
 		PacketRecord record;
@@ -2056,6 +2088,7 @@ static bool NextStreamEvent(ClientContext &context, const PcapBindData &bind, St
 static unique_ptr<FunctionData> DnsMessagesBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &types, vector<string> &names) {
 	auto result = DnsBind(context, input, types, names);
+	BindStreamOptions(*result, input);
 	// Keep the dns_* columns and drop the per-packet ones: this reader reports one
 	// row per reassembled message, not per packet.
 	vector<LogicalType> dns_types(types.begin() + DNS_COLUMN_BEGIN, types.end());
@@ -2288,7 +2321,7 @@ static void DnsMessagesScan(ClientContext &context, TableFunctionInput &input, D
 	if (!count) {
 		std::vector<packetquapture::TcpStream>().swap(state.streams);
 		std::vector<packetquapture::TcpDnsMessage>().swap(state.pending);
-		state.reassembler = packetquapture::TcpReassembler();
+		state.reassembler = packetquapture::TcpReassembler(bind.stream_limits);
 		state.reservation.reset();
 	}
 }
@@ -2335,6 +2368,7 @@ static LogicalType TlsTunnelType() {
 static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBindInput &input,
                                         vector<LogicalType> &types, vector<string> &names) {
 	auto result = PcapBind(context, input, types, names);
+	BindStreamOptions(*result, input);
 	names = {"filename",
 	         "section_number",
 	         "interface_id",
@@ -2914,7 +2948,7 @@ static void TlsScan(ClientContext &context, TableFunctionInput &input, DataChunk
 		std::vector<packetquapture::TcpStream>().swap(state.streams);
 		std::vector<packetquapture::TlsHandshake>().swap(state.tls_pending);
 		state.tls_assembler = NewTlsAssembler(state.tls_digest);
-		state.reassembler = packetquapture::TcpReassembler();
+		state.reassembler = packetquapture::TcpReassembler(bind.stream_limits);
 		state.reservation.reset();
 	}
 }
@@ -2932,6 +2966,7 @@ static LogicalType TcpGapType() {
 static unique_ptr<FunctionData> TcpStreamsBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &types, vector<string> &names) {
 	auto result = PcapBind(context, input, types, names);
+	BindStreamOptions(*result, input);
 	names = {"filename",
 	         "section_number",
 	         "interface_id",
@@ -3160,7 +3195,7 @@ static void TcpStreamsScan(ClientContext &context, TableFunctionInput &input, Da
 	if (!count) {
 		std::vector<packetquapture::TcpStream>().swap(state.streams);
 		std::vector<packetquapture::TcpDnsMessage>().swap(state.pending);
-		state.reassembler = packetquapture::TcpReassembler();
+		state.reassembler = packetquapture::TcpReassembler(bind.stream_limits);
 		state.reservation.reset();
 	}
 }
@@ -3243,14 +3278,7 @@ static unique_ptr<FunctionData> FlowsBind(ClientContext &context, TableFunctionB
 			bind.flow_limits.max_flows = value;
 		} else if (StringUtil::CIEquals(entry.first, "tcp_idle_timeout") ||
 		           StringUtil::CIEquals(entry.first, "udp_idle_timeout")) {
-			if (entry.second.IsNull()) {
-				throw BinderException("Flow idle timeout must not be NULL");
-			}
-			const auto interval = entry.second.GetValue<interval_t>();
-			int64_t micros;
-			if (interval.months || !Interval::TryGetMicro(interval, micros) || micros < 0) {
-				throw BinderException("Flow idle timeout must be a nonnegative fixed interval without months");
-			}
+			const auto micros = IdleTimeoutMicros(entry.second, "Flow");
 			if (StringUtil::CIEquals(entry.first, "tcp_idle_timeout")) {
 				bind.flow_limits.tcp_idle_us = micros;
 			} else {
@@ -4331,6 +4359,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	messages.table_scan_progress = CaptureScanProgress;
 	messages.pushdown_complex_filter = PruneCaptureFiles;
 	AddCaptureOptions(messages);
+	messages.named_parameters["tcp_idle_timeout"] = LogicalType::INTERVAL;
 	// Segment-level predicates could remove bytes required to reconstruct a matching message.
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(messages));
 	TableFunction tls("read_tls", {LogicalType::VARCHAR}, TlsScan, BindCapture<TlsBind>, TlsInit, StreamInitLocal);
@@ -4340,6 +4369,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// to reconstruct a handshake that would have matched it.
 	tls.pushdown_complex_filter = PruneCaptureFiles;
 	AddCaptureOptions(tls);
+	tls.named_parameters["tcp_idle_timeout"] = LogicalType::INTERVAL;
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(tls));
 	TableFunction streams("read_tcp_streams", {LogicalType::VARCHAR}, TcpStreamsScan, BindCapture<TcpStreamsBind>,
 	                      TcpStreamsInit, StreamInitLocal);
@@ -4347,6 +4377,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	streams.table_scan_progress = CaptureScanProgress;
 	streams.pushdown_complex_filter = PruneCaptureFiles;
 	AddCaptureOptions(streams);
+	streams.named_parameters["tcp_idle_timeout"] = LogicalType::INTERVAL;
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(streams));
 }
 

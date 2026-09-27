@@ -88,7 +88,8 @@ ambiguous message rows. Diagnostic rows have `dns_valid = false`, null DNS field
 
 ## Bounds and query behavior
 
-Defaults are fixed for this experimental release:
+Defaults are fixed for this experimental release, except the idle timeout, which
+`tcp_idle_timeout` sets (see [TCP streams](TCP_STREAMS.md#resource-policy-and-validation)):
 
 - 1,024 tracked TCP directions per file, including completed directions retained for overlap checking.
   A direction idle for 300 seconds is finalized as `idle_timeout` and frees its slot.

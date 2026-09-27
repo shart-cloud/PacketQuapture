@@ -107,7 +107,7 @@ The core retains the existing limits: 1,024 tracked directions per file, 32 MiB 
 per file. Metadata, reconstruction, and output use additional bounded memory. Quarantined directions emit
 explicit diagnostics rather than silent eviction.
 
-A direction with no packet for 300 seconds is finalized with `finalized_by = 'idle_timeout'`, freeing its
+A direction with no packet for 300 seconds, by default, is finalized with `finalized_by = 'idle_timeout'`, freeing its
 slot, as `read_flows` does with its default `tcp_idle_timeout`. Idle is judged per capture interface by the
 latest timestamp seen on it; a direction that has any packet without a timestamp is never evicted.
 If that clock steps back by more than the timeout, it restarts from the earlier time, so directions opened
@@ -117,8 +117,23 @@ later packet became a one-packet `limit` stream. The status still describes the 
 direction is usually `contiguous`. Two costs: traffic that resumes after eviction starts a new direction,
 reported `unanchored` because its SYN belonged to the old one, and a retransmission that arrives after
 eviction can no longer be checked against the bytes already emitted. Only more than 1,024 directions active
-within 300 seconds of each other still produce direction-limit rows.
-The DNS framer independently limits messages per direction to 4,096.
+within the timeout of each other still produce direction-limit rows; with eviction disabled, more than 1,024
+over the whole file do.
+The DNS framer independently limits messages per direction to 4,096. A DNS message cut by eviction is
+reported `incomplete` with the error `incomplete DNS TCP frame at idle timeout`.
+
+`read_tcp_streams`, `read_dns_messages` and `read_tls` take the timeout as `tcp_idle_timeout`, an
+INTERVAL, with `read_flows`' rules: it must be a nonnegative fixed interval without months, `0 seconds`
+disables eviction, and NULL is an error. It is the only transport limit exposed.
+
+```sql
+SELECT * FROM read_tcp_streams('capture.pcap', tcp_idle_timeout = INTERVAL '60 seconds');
+```
+
+The name is shared with `read_flows`, not every rule. This clock is kept per section and interface and
+restarts when time steps back by more than the timeout; `read_flows` keeps one clock per interface, flushes
+every flow at a section change and never restarts its clock. The two can therefore end the same
+connection at different times on multi-section captures or ones whose timestamps step back.
 
 All transport payloads selected by the stream function are needed for reconstruction, including for count-only
 queries. SQL filters execute after reconstruction, so they cannot accidentally remove necessary segments.
