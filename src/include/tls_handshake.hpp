@@ -132,7 +132,9 @@ struct TlsHandshake {
 	// TLS began the stream. A tunnel is the usual cause.
 	uint32_t client_prefix_bytes = 0, server_prefix_bytes = 0;
 	// What each prefix parsed as, exactly: socks4, socks4a, socks5 or
-	// http_connect. Empty when there is no prefix or it was not recognised.
+	// http_connect, or smtp, imap, pop3 or ftp for a STARTTLS upgrade, which
+	// names no destination. Empty when there is no prefix or it was not
+	// recognised.
 	std::string client_tunnel, server_tunnel;
 	// The host:port the client asked its tunnel to reach, escaped as tls_sni is.
 	// Only a recognised client prefix names one.
