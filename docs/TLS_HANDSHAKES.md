@@ -75,7 +75,7 @@ one row. That is a different shape, and it needs rules the DNS reader never had.
 | `ja4s`, `ja4s_r` | JA4S server fingerprint and its raw form. **FoxIO License 1.1**, see [NOTICE](../NOTICE). |
 | `server_certificates` | The server's certificate chain, a `LIST(STRUCT)` with the fields below, leaf first. NULL when no Certificate message was read, which includes every TLS 1.3 handshake. See below. |
 | `client_certificates` | The client's certificates, the same type, when the server asked for them in TLS 1.2 or earlier. `[]` when the client was asked and had none; NULL when it sent no Certificate message. |
-| `tunnel` | `STRUCT(protocol, destination, client_prefix_bytes, server_prefix_bytes)` when bytes came before TLS in a captured direction, such as a SOCKS or HTTP CONNECT exchange; NULL when TLS began every captured stream. See below. |
+| `tunnel` | `STRUCT(protocol, destination, client_prefix_bytes, server_prefix_bytes)` when bytes came before TLS in a captured direction, such as a SOCKS or HTTP CONNECT exchange or a STARTTLS upgrade; NULL when TLS began every captured stream. See below. |
 
 ## Hello lists
 
@@ -235,11 +235,15 @@ WHERE server_certificates IS NOT NULL;
 | `ja4x`, `ja4x_r` | JA4X certificate fingerprint and its raw form. **FoxIO License 1.1**, see [NOTICE](../NOTICE). See below. |
 | `sha1`, `sha256` | The whole DER certificate's hashes as lowercase hex, which is what certificate blocklists such as abuse.ch SSLBL key on. |
 | `signature_algorithm`, `public_key_algorithm` | As `openssl x509 -text` prints them: `sha256WithRSAEncryption`, `ecdsa-with-SHA256`, `rsaEncryption`, `id-ecPublicKey`, `ED25519`. The names come from a table of about 45 RSA, RSA-PSS, DSA, ECDSA, EdDSA, SHA-3, SM2 and GOST algorithms, each checked against OpenSSL 3.0.13; any other algorithm is its dotted OID, even where OpenSSL has a name. |
-| `public_key_bits` | RSA or RSA-PSS modulus size, DSA prime size, or a named EC curve's size, as OpenSSL's `Public-Key: (N bit)`. NULL for other keys, an unknown or explicitly specified curve, or a key body that does not parse. |
-| `public_key_curve` | An EC key's named curve as OpenSSL's `ASN1 OID` line prints it, such as `prime256v1` or `secp384r1`; an unknown curve is its OID. |
+| `public_key_bits` | RSA or RSA-PSS modulus size, DSA prime size, a named EC curve's size, or for an EC key with explicit curve parameters the bit length of the group order, each as OpenSSL's `Public-Key: (N bit)`. NULL for other keys, an unknown named curve, or a key body that does not parse. |
+| `public_key_curve` | An EC key's named curve as OpenSSL's `ASN1 OID` line prints it, such as `prime256v1` or `secp384r1`; an unknown curve is its OID. NULL for explicit curve parameters, which have no name. CAs do not issue such keys, and they were the vehicle of CVE-2020-0601, so a sized EC key with a NULL curve is worth a look. |
 | `is_ca`, `path_length` | basicConstraints' cA flag and pathLenConstraint. `is_ca` is NULL without the extension; `path_length` is NULL without a constraint. |
 | `key_usage` | keyUsage bits by their RFC 5280 names, in bit order: `digitalSignature`, `nonRepudiation`, `keyEncipherment`, `dataEncipherment`, `keyAgreement`, `keyCertSign`, `cRLSign`, `encipherOnly`, `decipherOnly`. NULL without the extension. |
 | `extended_key_usage` | extendedKeyUsage purposes by their RFC 5280 names (`serverAuth`, `clientAuth`, `codeSigning`, `emailProtection`, `timeStamping`, `OCSPSigning`, `anyExtendedKeyUsage`), others as dotted OIDs, in wire order. NULL without the extension. |
+| `subject_key_id`, `authority_key_id` | subjectKeyIdentifier, and authorityKeyIdentifier's keyIdentifier, as lowercase hex; OpenSSL prints the same octets as colon-separated uppercase. A certificate's `authority_key_id` equals its issuer's `subject_key_id`, which links a chain without comparing names. NULL without the extension, or without a keyIdentifier. |
+| `ocsp_urls`, `ca_issuers_urls` | authorityInfoAccess OCSP and caIssuers locations that are URIs, escaped as `tls_sni` is, in wire order. Other name forms and access methods are skipped. Both NULL without the extension. |
+| `crl_urls` | cRLDistributionPoints URIs from each point's full name, escaped and in wire order; a relative name has none. NULL without the extension. |
+| `policies` | certificatePolicies identifiers as dotted OIDs, such as `2.23.140.1.2.1` (CA/Browser Forum domain-validated); anyPolicy is `2.5.29.32.0`. Qualifiers are not kept. NULL without the extension. |
 
 The algorithms and curve use OpenSSL's names so they can be read beside `openssl x509
 -text`; the usage lists use RFC 5280's, which are identifiers rather than prose (OpenSSL
@@ -249,8 +253,14 @@ is described, not checked, and an RSA modulus is sized without being tested.
 These fields only add to a certificate, so none of them can make it malformed. An
 algorithm or key that does not parse leaves its fields NULL. A basicConstraints, keyUsage
 or extendedKeyUsage that is malformed or repeated, which RFC 5280 forbids, leaves that
-field NULL too, since neither copy is more believable. Only more than `max_list_entries`
-purposes is a limit. The hashes are computed only when a certificate column is projected.
+field NULL too, since neither copy is more believable, and so does each of the five
+extensions above. An empty authorityInfoAccess, cRLDistributionPoints or
+certificatePolicies is read as present and empty, as OpenSSL reads it, though RFC 5280
+requires at least one entry. Only more than `max_list_entries` purposes is a limit on the
+certificate; more than that many entries in one URL or policy list leaves that list NULL,
+since the certificate's own size, capped by `max_certificate_bytes`, already bounds its
+memory. Policy OIDs with arcs up to 140 bits, such as UUID OIDs under `2.25`, are written
+in full. The hashes are computed only when a certificate column is projected.
 
 Names follow RFC 4514 and match `openssl x509 -nameopt RFC2253,-esc_msb` character for
 character, with one exception. Attribute types in RFC 4514's own table use its short
@@ -291,7 +301,9 @@ SHA-256, or `000000000000` for an empty part.
 The definition is FoxIO-LLC/ja4 at `16b96d9`, which has no written specification for
 JA4X, only its two reference implementations. `ja4x` equals the rust one (`rust/ja4x`)
 on every certificate checked: 135 certificates, including this machine's CA bundle,
-the fixtures and the CTU-13 Neris capture. The python one (`python/ja4x.py`) differs in
+the fixtures and the CTU-13 Neris capture, and again on the 131 certificates of the
+fixtures and the CA bundle once the certificate detail and extension fields were added.
+The python one (`python/ja4x.py`) differs in
 three ways, all reference bugs: it writes an empty part as the hash of an empty
 string, `e3b0c44298fc`; it counts RDNs rather than attributes, so a multi-valued RDN
 shifts every later OID and it misses later certificates in the chain; and it stops with
@@ -342,6 +354,18 @@ byte left over:
 | `socks5` | RFC 1928 greeting, RFC 1929 username and password if offered, CONNECT request | Method choice, RFC 1929 status if it chose that method, success reply |
 | `socks4`, `socks4a` | CONNECT request, and for 4a (address `0.0.0.x`) a name | Granted reply; always `socks4`, since the reply cannot tell 4 from 4a |
 | `http_connect` | One or more `CONNECT target HTTP/1.x` heads to one target, as a client sends when a proxy asks it to log in | Refusals such as `407`, each body framed by `Content-Length`, then a `2xx` head, which has no body whatever it declares |
+| `smtp` | `EHLO` or `HELO`, then any of `EHLO`, `HELO`, `NOOP`, `RSET`, then `STARTTLS` (RFC 3207) | A `220` greeting, `250` replies (at least one) with `5xx` refusals among them, then `220` |
+| `imap` | Tagged `CAPABILITY` or `NOOP` commands, then a tagged `STARTTLS` (RFC 2595) | An untagged `* OK` greeting, untagged `CAPABILITY` or `OK` data and tagged `OK`, `NO` or `BAD` replies, then a tagged `OK` |
+| `pop3` | Any number of `CAPA`, then `STLS` (RFC 2595) | A `+OK` greeting, `+OK` or `-ERR` replies (`CAPA`'s multi-line one ending in a lone `.`), then `+OK` |
+| `ftp` | Any of `FEAT`, `SYST`, `NOOP` and refused `AUTH` attempts, then `AUTH TLS`, `AUTH SSL`, `AUTH TLS-C` or `AUTH TLS-P` (RFC 4217) | A `220` greeting, `2xx` or `5xx` replies, then `234` |
+
+The four STARTTLS exchanges are read line by line: every line must end in CRLF, and
+commands are matched without regard to case. A multi-line SMTP or FTP reply ends at its
+code alone or followed by a space; SMTP repeats the code and a hyphen on every line before
+that, while FTP allows any text there. A login, `MAIL`, or any command not listed before
+the upgrade leaves the prefix unrecognised, as does an IMAP `BYE` or `PREAUTH`. Each side
+is read on its own, so an IMAP server's final tag is not matched to the client's. These
+protocols name no destination, so `destination` is NULL for them.
 
 - `protocol` is the client's reading when its prefix was recognised, since only the
   client's request names the destination, and otherwise the server's. It is NULL when
@@ -428,18 +452,19 @@ that would have matched it.
 
 ## Not yet implemented
 
-Certificate extensions beyond subjectAltName, basicConstraints, keyUsage and
-extendedKeyUsage, such as the key identifiers, CRL and OCSP locations, and policies, and
-the public key's own bytes. DTLS and QUIC hellos, the `d` and `q` JA4
+Certificate extensions beyond subjectAltName, basicConstraints, keyUsage,
+extendedKeyUsage, the key identifiers, authorityInfoAccess, cRLDistributionPoints and
+certificatePolicies, such as nameConstraints and signed certificate timestamps; policy
+qualifiers; and the public key's own bytes. DTLS and QUIC hellos, the `d` and `q` JA4
 variants, are not read.
 
 Handshakes can still go missing on very busy captures. The transport core tracks
-1,024 TCP directions per file and evicts those idle for 300 seconds (see
-[TCP streams](TCP_STREAMS.md)). If more than 1,024 are active at once, each new packet
+1,024 TCP directions per file and evicts those idle for 300 seconds, or for
+`tcp_idle_timeout` (see [TCP streams](TCP_STREAMS.md)). If more than 1,024 are active at once, each new packet
 becomes its own one-packet stream with status `limit`. This reader cannot tell whether
 such a stream carried TLS, so it reports nothing for it.
 
-Tunnels other than SOCKS and HTTP CONNECT are read, but not named. STARTTLS, where TLS
-follows a plaintext SMTP, IMAP or similar exchange, is found the same way when that
-exchange fits in 8 KiB, and is reported with an unrecognised prefix. TLS after a longer
-prefix is not found.
+Tunnels other than SOCKS, HTTP CONNECT and SMTP, IMAP, POP3 and FTP STARTTLS are read,
+but not named: XMPP, LDAP and PostgreSQL upgrades, for example, are found the same way
+when their exchange fits in 8 KiB, and are reported with an unrecognised prefix. TLS after
+a longer prefix is not found.

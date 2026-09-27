@@ -133,6 +133,16 @@ def main():
         DATA / "malformed_dns.pcap",
         [segment(44000, 100, flags=2), segment(44000, 101, malformed_frame)],
     )
+    # A query that pauses for two seconds mid-message: whole under the default idle
+    # timeout, split in two by a one-second tcp_idle_timeout.
+    pcap(
+        DATA / "paused.pcap",
+        [
+            (1700000000, segment(45000, 100, flags=2)),
+            (1700000000, segment(45000, 101, frame[:10])),
+            (1700000002, segment(45000, 111, frame[10:])),
+        ],
+    )
     # More than one output vector from one persistent stream, without fragmenting the fixture.
     pcap(
         DATA / "chunks.pcap",
