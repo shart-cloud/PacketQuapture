@@ -26,6 +26,7 @@
 #include "tls_fingerprint.hpp"
 #include "tcp_reassembly.hpp"
 #include "dns_tcp_framer.hpp"
+#include "sparse_readahead.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -75,6 +76,11 @@ constexpr idx_t LOCAL_READ_WINDOW_SIZE = 256ULL * 1024ULL;
 // through costs less than the syscall saved by skipping. Larger payloads are still
 // skipped exactly, which keeps sparse metadata scans off the payload bytes.
 constexpr idx_t LOCAL_SKIP_THRESHOLD = 4ULL * 1024ULL;
+// Skipped gaps up to this size leave headers close enough that reading the whole
+// file sequentially beats a disk read per header on a cold cache (measured: a
+// 200,000-byte gap halves), so the kernel is asked to read ahead through them.
+// Wider gaps are left to seek.
+constexpr idx_t LOCAL_READAHEAD_MAX_GAP = 256ULL * 1024ULL;
 constexpr idx_t MAX_CAPTURED_PACKET_SIZE = 256ULL * 1024ULL * 1024ULL;
 constexpr idx_t MAX_INTERFACE_BLOCK_SIZE = 16ULL * 1024ULL * 1024ULL;
 constexpr uint32_t PCAPNG_INTERFACE_DESCRIPTION = 0x00000001;
@@ -830,6 +836,27 @@ private:
 	// yielding a complete record. Before that, a short read is indistinguishable
 	// from a misidentified or corrupt file, and a silently empty result would
 	// hide that, so it stays a hard error.
+	// Asks the kernel to read ahead of a sparse local scan. Decided once per
+	// file: only a file on disk, and a file system that cannot say so is not
+	// treated as one.
+	void Readahead(uint64_t next) {
+		if (!readahead_checked) {
+			readahead_checked = true;
+			bool on_disk = false;
+			try {
+				on_disk = handle->OnDiskFile();
+			} catch (std::exception &) {
+				on_disk = false;
+			}
+			if (on_disk) {
+				readahead = make_uniq<packetquapture::SparseReadahead>(handle->GetPath(), seekable_size);
+			}
+		}
+		if (readahead) {
+			readahead->Ahead(next);
+		}
+	}
+
 	[[noreturn]] void EndOfRecord(const char *description) {
 		if (header_complete && complete_records > 0) {
 			truncated_tail = true;
@@ -855,6 +882,9 @@ private:
 					// Window refills are positioned and leave the cursor behind; restore
 					// it before the next cursor read.
 					handle->Seek(position + length);
+					if (length <= LOCAL_READAHEAD_MAX_GAP) {
+						Readahead(position + length);
+					}
 				}
 			} else if (!cached_handle) {
 				handle->Seek(position + length);
@@ -886,6 +916,8 @@ private:
 	unsafe_unique_array<data_t> local_window;
 	idx_t local_start = 0, local_length = 0;
 	bool buffer_locally = false;
+	unique_ptr<packetquapture::SparseReadahead> readahead;
+	bool readahead_checked = false;
 	bool window_worthwhile = false;
 	const ScanOptions &options;
 	CaptureProgress *progress;

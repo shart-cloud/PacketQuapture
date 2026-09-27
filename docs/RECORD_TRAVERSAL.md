@@ -59,13 +59,52 @@ Cold-cache figures are not reported as gains. Evicting one file with
 `POSIX_FADV_DONTNEED` leaves the surrounding caches uncontrolled, and the cold
 `large_payloads` trials spanned 73× within a single run. The evidence file records every
 trial; the cold pathology that study identified for sparse large-payload captures is
-**not** addressed by this change and remains open.
+**not** addressed by this change. The readahead hint below addresses it.
 
-An earlier revision of this change served cursor-mode reads with positioned reads as
-well, which measured about 3.4× slower on `large_payloads`: reading at a header-sized
-stride through `pread` appears to defeat the kernel's sequential readahead detection.
-Cursor mode therefore keeps the handle cursor, and positioned reads are used only for
-window refills and oversized reads.
+## Readahead hint for sparse local captures
+
+A sparse scan reads a 16-byte header and seeks past the payload. On a cold page cache
+the seeks stop the kernel's sequential readahead, so each header costs its own disk read:
+`count(*)` over a cold 300 MB capture of 15,000-byte packets took 3.7 s against 0.2 s to
+read the whole file. When a local, on-disk capture skips a gap wider than
+`LOCAL_SKIP_THRESHOLD` (4 KiB) and no wider than `LOCAL_READAHEAD_MAX_GAP` (256 KiB), the
+reader now asks the kernel to read ahead up to 4 MiB past its position with
+`posix_fadvise(POSIX_FADV_WILLNEED)` (`src/sparse_readahead.cpp`). Wider gaps are left
+to seek; at 200,000 bytes the hint still halved the cold time.
+
+- The hint goes through a second read-only descriptor for the same path, since DuckDB's
+  `FileSystem` exposes neither a descriptor nor advice; the page cache is shared per file.
+  It is opened non-blocking and used only for a regular file of the size being read, and
+  only when the handle reports a file on disk (a file system that cannot say is not
+  treated as one). This is Linux only: macOS and Windows keep the one-read-per-header
+  pattern, and so does any path that cannot be reopened.
+- Linux caps each hint at the device's readahead window (128 KiB by default) and ignores
+  the rest, so the range is hinted in 128 KiB pieces. One 8 MiB hint measured no faster
+  than none.
+- Before hinting the next window the reader asks `mincore(2)` whether its last page is
+  already cached, and skips the hints if so. Hinting every piece of a warm file cost
+  about 3 ms per 300 MB; asking for the whole window cost more.
+- A hint is not a `read(2)`: the process reads exactly the bytes it did before, and the
+  byte totals `benchmark_header_reads.py` and `local_window_test.py` assert are unchanged.
+  `local_window_test.py` checks that a 16 KiB gap is hinted, at most once per piece, and
+  that a 512 KiB gap and a dense capture are not.
+
+`scripts/benchmark_cold_sparse.py main-cli candidate-cli 9` alternates two builds, nine
+trials each, with each capture's pages dropped before every cold trial. Medians on
+2026-09-26 (WSL2, ext4, `read_ahead_kb` 128), with the range in brackets:
+
+| Capture, about 300 MB | Cold before | Cold after | Warm before | Warm after |
+| --- | --- | --- | --- | --- |
+| 20,000 × 15,000 B | 3.691 s [3.20–4.32] | 0.164 s [0.13–0.31] | 0.034 s | 0.036 s |
+| 50,000 × 6,000 B | 1.633 s [1.17–2.15] | 0.185 s [0.16–0.24] | 0.070 s | 0.070 s |
+| 1,500 × 200,000 B | 0.278 s [0.25–0.34] | 0.145 s [0.14–0.16] | 0.020 s | 0.021 s |
+| 200,000 × 1,500 B (windowed, never hinted) | 0.354 s [0.27–0.43] | 0.429 s [0.29–0.48] | 0.128 s | 0.133 s |
+
+The last row runs identical code in both builds, so its differences are this run's noise;
+the warm differences above are within it. The evidence is
+[cold-sparse-readahead-2026-09-26.json](benchmarks/cold-sparse-readahead-2026-09-26.json).
+Under WSL2 the Windows host may still cache the virtual disk after an eviction, so these
+cold figures compare builds within one run; they are not a prediction for other disks.
 
 ## Validation
 
