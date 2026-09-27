@@ -327,11 +327,77 @@ def openssl_details(der):
     label, value = after("X509v3 Extended Key Usage:")
     details["extended_key_usage"] = None if label is None else [OPENSSL_PURPOSES.get(v.strip(), v.strip())
                                                                   for v in value.split(",")]
+
+    raw = text.splitlines()
+
+    def block(label):
+        """The lines under an extension's heading, indented deeper than it. None
+        when it is absent, or present twice, which read_tls does not believe."""
+        # A critical extension's heading ends in " critical".
+        found = [i for i, line in enumerate(raw) if line.strip() in (label, label + " critical")]
+        if len(found) != 1:
+            return None
+        start = found[0]
+        indent = len(raw[start]) - len(raw[start].lstrip())
+        body = []
+        for line in raw[start + 1:]:
+            if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                break
+            if line.strip():
+                body.append(line.strip())
+        return body
+
+    def hex_id(line):
+        # OpenSSL dumps an extension it cannot read as hex and text; only a
+        # colon-separated key identifier is one.
+        return line.replace(":", "").lower() if line and re.fullmatch(r"([0-9A-F]{2}:)*[0-9A-F]{2}", line) else None
+
+    body = block("X509v3 Subject Key Identifier:")
+    details["subject_key_id"] = hex_id(body[0]) if body else None
+    body = block("X509v3 Authority Key Identifier:")
+    # OpenSSL 3.0 labels the key identifier "keyid:" only when an issuer or
+    # serial follows it.
+    keyid = [line[len("keyid:"):] if line.startswith("keyid:") else line for line in body or []
+             if line.startswith("keyid:") or hex_id(line)]
+    details["authority_key_id"] = hex_id(keyid[0]) if keyid else None
+    body = block("Authority Information Access:")
+    readable = body is not None and all(" - " in line or line == "<EMPTY>" for line in body)
+    details["ocsp_urls"] = [line[len("OCSP - URI:"):] for line in body if line.startswith("OCSP - URI:")] \
+        if readable else None
+    details["ca_issuers_urls"] = [line[len("CA Issuers - URI:"):] for line in body
+                                  if line.startswith("CA Issuers - URI:")] if readable else None
+    body = block("X509v3 CRL Distribution Points:")
+    details["crl_urls"] = None
+    if body is not None:
+        # Only a full name's URIs count; a section heading such as "CRL Issuer:"
+        # or "Reasons:" ends it. A line of none of these shapes is OpenSSL
+        # dumping an extension it could not read.
+        urls, section = [], None
+        for line in body:
+            if line.endswith(":") and ":" not in line[:-1]:
+                section = line
+            elif line.startswith("Reasons:"):
+                section = "Reasons:"
+            elif section == "Full Name:" and line.startswith("URI:"):
+                urls.append(line[len("URI:"):])
+            elif section is None or re.fullmatch(r"[A-Za-z ]+:.*|[A-Za-z]+ = .*", line) is None:
+                urls = None
+                break
+        details["crl_urls"] = urls
+    body = block("X509v3 Certificate Policies:")
+    details["policies"] = None
+    if body is not None:
+        qualifier = re.compile(r"(CPS|User Notice|Explicit Text|Organization|Number|Unknown Qualifier): ?.*")
+        if all(line.startswith("Policy: ") or qualifier.fullmatch(line) for line in body):
+            details["policies"] = ["2.5.29.32.0" if line == "Policy: X509v3 Any Policy" else line[len("Policy: "):]
+                                   for line in body if line.startswith("Policy: ")]
     return details
 
 
 DETAIL_FIELDS = ("sha1", "sha256", "signature_algorithm", "public_key_algorithm", "public_key_bits",
-                 "public_key_curve", "is_ca", "path_length", "key_usage", "extended_key_usage")
+                 "public_key_curve", "is_ca", "path_length", "key_usage", "extended_key_usage", "subject_key_id",
+                 "authority_key_id", "ocsp_urls", "ca_issuers_urls", "crl_urls", "policies")
+LIST_FIELDS = ("key_usage", "extended_key_usage", "ocsp_urls", "ca_issuers_urls", "crl_urls", "policies")
 
 
 def our_certificates(path, duckdb, column="server_certificates"):
@@ -343,7 +409,12 @@ def our_certificates(path, duckdb, column="server_certificates"):
              "coalesce(c.public_key_algorithm, chr(2)), coalesce(c.public_key_bits::VARCHAR, chr(2)), "
              "coalesce(c.public_key_curve, chr(2)), coalesce(c.is_ca::VARCHAR, chr(2)), "
              "coalesce(c.path_length::VARCHAR, chr(2)), coalesce(array_to_string(c.key_usage, chr(29)), chr(2)), "
-             "coalesce(array_to_string(c.extended_key_usage, chr(29)), chr(2))) END")
+             "coalesce(array_to_string(c.extended_key_usage, chr(29)), chr(2)), "
+             "coalesce(c.subject_key_id, chr(2)), coalesce(c.authority_key_id, chr(2)), "
+             "coalesce(array_to_string(c.ocsp_urls, chr(29)), chr(2)), "
+             "coalesce(array_to_string(c.ca_issuers_urls, chr(29)), chr(2)), "
+             "coalesce(array_to_string(c.crl_urls, chr(29)), chr(2)), "
+             "coalesce(array_to_string(c.policies, chr(29)), chr(2))) END")
     query = (f"SELECT client_ip, client_port, server_ip, server_port, reassembly_status, "
              f"array_to_string(warnings, ',') AS warnings, "
              f"array_to_string(list_transform({column}, lambda c: {field}), chr(31)) AS chain, "
@@ -374,7 +445,7 @@ def our_certificates(path, duckdb, column="server_certificates"):
                         value = int(value)
                     elif name == "is_ca":
                         value = value == "true"
-                    elif name in ("key_usage", "extended_key_usage"):
+                    elif name in LIST_FIELDS:
                         value = value.split("\x1d") if value else []
                     certificate[name] = value
                 chain.append(certificate)

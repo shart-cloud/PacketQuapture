@@ -30,6 +30,9 @@ const uint8_t TAG_SUBJECT_UID = 0x82;    // [2] IMPLICIT
 const uint8_t TAG_EXTENSIONS = 0xA3;     // [3] EXPLICIT
 const uint8_t TAG_SAN_DNS_NAME = 0x82;   // GeneralName [2] IMPLICIT IA5String
 const uint8_t TAG_SAN_IP_ADDRESS = 0x87; // GeneralName [7] IMPLICIT OCTET STRING
+const uint8_t TAG_URI = 0x86;            // GeneralName [6] IMPLICIT IA5String
+const uint8_t TAG_CONTEXT_0 = 0x80;      // [0] IMPLICIT, primitive
+const uint8_t TAG_CONTEXT_0_SET = 0xA0;  // [0], constructed
 
 // One DER element: its tag, and its content and whole encoding as spans.
 struct Element {
@@ -113,6 +116,28 @@ std::string Hex(const uint8_t *data, size_t size, bool upper = false) {
 	return out;
 }
 
+// An arc wider than 64 bits as decimal, from its base-128 digits. UUID-based
+// OIDs (2.25, RFC 4122) carry 128-bit arcs.
+std::string WideArc(const uint8_t *digits, size_t count) {
+	std::vector<uint8_t> decimal(1, 0); // least significant first
+	for (size_t i = 0; i < count; ++i) {
+		unsigned carry = digits[i] & 0x7FU;
+		for (auto &digit : decimal) {
+			const unsigned value = digit * 128U + carry;
+			digit = static_cast<uint8_t>(value % 10);
+			carry = value / 10;
+		}
+		for (; carry != 0; carry /= 10) {
+			decimal.push_back(static_cast<uint8_t>(carry % 10));
+		}
+	}
+	std::string out;
+	for (auto it = decimal.rbegin(); it != decimal.rend(); ++it) {
+		out += static_cast<char>('0' + *it);
+	}
+	return out;
+}
+
 bool DecodeOid(const Element &element, std::string &out) {
 	if (element.length == 0 || (element.content[element.length - 1] & 0x80U)) {
 		return false;
@@ -126,7 +151,9 @@ bool DecodeOid(const Element &element, std::string &out) {
 		if (digits == 0 && byte == 0x80U) { // leading zero in an arc
 			return false;
 		}
-		if (++digits > 9) { // beyond 63 bits
+		// Past 63 bits an arc is kept as decimal text, up to 140 bits; the
+		// first, which also encodes the top arc, must fit.
+		if (++digits > 20 || (first && digits > 9)) {
 			return false;
 		}
 		value = (value << 7U) | (byte & 0x7FU);
@@ -138,7 +165,7 @@ bool DecodeOid(const Element &element, std::string &out) {
 			out = std::to_string(top) + "." + std::to_string(value - top * 40);
 			first = false;
 		} else {
-			out += "." + std::to_string(value);
+			out += "." + (digits > 9 ? WideArc(element.content + i + 1 - digits, digits) : std::to_string(value));
 		}
 		value = 0;
 		digits = 0;
@@ -621,12 +648,22 @@ void DecodePublicKey(const Element &info, X509Certificate &out) {
 	parameters.Next(skipped);
 	const bool has_parameter = !parameters.AtEnd() && parameters.Next(parameter);
 	if (oid == "1.2.840.10045.2.1") {
-		// A named curve; explicit curve parameters are not sized.
 		std::string curve;
 		if (has_parameter && parameter.tag == TAG_OID && DecodeOid(parameter, curve)) {
 			const NamedCurve *known = FindCurve(curve);
 			out.public_key_curve = known != nullptr ? known->name : curve;
 			out.public_key_bits = known != nullptr ? known->bits : 0;
+		} else if (has_parameter && parameter.tag == TAG_SEQUENCE) {
+			// RFC 3279 ECParameters, spelled out: version, fieldID, curve, base,
+			// order. The curve has no name; its size is the order's, as OpenSSL
+			// reports it. Legitimate CAs do not issue such keys.
+			Der values(parameter.content, parameter.length);
+			Element version, field, shape, base, order;
+			if (values.Expect(TAG_INTEGER, version) && values.Expect(TAG_SEQUENCE, field) &&
+			    values.Expect(TAG_SEQUENCE, shape) && values.Expect(TAG_OCTET_STRING, base) &&
+			    values.Expect(TAG_INTEGER, order)) {
+				out.public_key_bits = IntegerBits(order);
+			}
 		}
 	} else if (oid == "1.2.840.10040.4.1") {
 		Element prime;
@@ -761,6 +798,178 @@ X509Result DecodeSubjectAltName(const Element &value, size_t max_entries, X509Ce
 	return X509Result::OK;
 }
 
+// subjectKeyIdentifier ::= KeyIdentifier, an OCTET STRING.
+bool DecodeSubjectKeyId(const Element &value, X509Certificate &out) {
+	Der outer(value.content, value.length);
+	Element id;
+	if (!outer.Expect(TAG_OCTET_STRING, id) || !outer.AtEnd() || id.length == 0) {
+		return false;
+	}
+	out.subject_key_id = Hex(id.content, id.length);
+	return true;
+}
+
+// AuthorityKeyIdentifier ::= SEQUENCE { keyIdentifier [0] OPTIONAL,
+//     authorityCertIssuer [1] OPTIONAL, authorityCertSerialNumber [2] OPTIONAL }
+// Only the key identifier is kept; the others must still be in order.
+bool DecodeAuthorityKeyId(const Element &value, X509Certificate &out) {
+	Der outer(value.content, value.length);
+	Element sequence;
+	if (!outer.Expect(TAG_SEQUENCE, sequence) || !outer.AtEnd()) {
+		return false;
+	}
+	Der fields(sequence.content, sequence.length);
+	int last = -1;
+	while (!fields.AtEnd()) {
+		Element field;
+		// [0] and [2] are primitive, [1] (GeneralNames) constructed.
+		static const uint8_t tags[] = {0x80, 0xA1, 0x82};
+		if (!fields.Next(field) || (field.tag & 0x1FU) > 2 || field.tag != tags[field.tag & 0x1FU] ||
+		    static_cast<int>(field.tag & 0x1FU) <= last) {
+			return false;
+		}
+		last = field.tag & 0x1FU;
+		if (field.tag == TAG_CONTEXT_0) {
+			if (field.length == 0) {
+				return false;
+			}
+			out.authority_key_id = Hex(field.content, field.length);
+		}
+	}
+	return true;
+}
+
+// The URIs among a run of GeneralNames, escaped. Other forms are skipped. For
+// these lists, more than max_entries is not a limit on the certificate: the
+// extensions only add fields, so the list alone is left unknown.
+X509Result GeneralNameUris(Der &names, size_t max_entries, std::vector<std::string> &out) {
+	while (!names.AtEnd()) {
+		Element name;
+		if (!names.Next(name)) {
+			return X509Result::MALFORMED;
+		}
+		if (name.tag != TAG_URI) {
+			continue;
+		}
+		if (out.size() >= max_entries) {
+			return X509Result::OVER_LIMIT;
+		}
+		out.push_back(EscapeTlsText(std::string(reinterpret_cast<const char *>(name.content), name.length)));
+	}
+	return X509Result::OK;
+}
+
+// AuthorityInfoAccessSyntax ::= SEQUENCE SIZE (1..MAX) OF AccessDescription.
+// An empty list is read as present and empty, as OpenSSL reads it; so for the
+// CRL distribution points and policies below.
+// AccessDescription ::= SEQUENCE { accessMethod OID, accessLocation GeneralName }
+X509Result DecodeAuthorityInfoAccess(const Element &value, size_t max_entries, X509Certificate &out) {
+	Der outer(value.content, value.length);
+	Element sequence;
+	if (!outer.Expect(TAG_SEQUENCE, sequence) || !outer.AtEnd()) {
+		return X509Result::MALFORMED;
+	}
+	Der list(sequence.content, sequence.length);
+	out.has_authority_info_access = true;
+	while (!list.AtEnd()) {
+		Element description, method;
+		std::string oid;
+		if (!list.Expect(TAG_SEQUENCE, description)) {
+			return X509Result::MALFORMED;
+		}
+		Der fields(description.content, description.length);
+		Element location;
+		if (!fields.Expect(TAG_OID, method) || !DecodeOid(method, oid) || !fields.Next(location) || !fields.AtEnd()) {
+			return X509Result::MALFORMED;
+		}
+		auto *target = oid == "1.3.6.1.5.5.7.48.1"   ? &out.ocsp_urls
+		               : oid == "1.3.6.1.5.5.7.48.2" ? &out.ca_issuers_urls
+		                                             : nullptr;
+		if (target == nullptr || location.tag != TAG_URI) {
+			continue;
+		}
+		if (target->size() >= max_entries) {
+			return X509Result::OVER_LIMIT;
+		}
+		target->push_back(
+		    EscapeTlsText(std::string(reinterpret_cast<const char *>(location.content), location.length)));
+	}
+	return X509Result::OK;
+}
+
+// CRLDistributionPoints ::= SEQUENCE SIZE (1..MAX) OF DistributionPoint
+// DistributionPoint ::= SEQUENCE { distributionPoint [0] DistributionPointName
+//     OPTIONAL, reasons [1] OPTIONAL, cRLIssuer [2] OPTIONAL }
+// DistributionPointName ::= CHOICE { fullName [0] GeneralNames,
+//     nameRelativeToCRLIssuer [1] }
+// Only URIs in a fullName are kept.
+X509Result DecodeCrlDistributionPoints(const Element &value, size_t max_entries, X509Certificate &out) {
+	Der outer(value.content, value.length);
+	Element sequence;
+	if (!outer.Expect(TAG_SEQUENCE, sequence) || !outer.AtEnd()) {
+		return X509Result::MALFORMED;
+	}
+	Der list(sequence.content, sequence.length);
+	out.has_crl_distribution_points = true;
+	while (!list.AtEnd()) {
+		Element point, name;
+		if (!list.Expect(TAG_SEQUENCE, point)) {
+			return X509Result::MALFORMED;
+		}
+		Der fields(point.content, point.length);
+		if (fields.PeekTag() != TAG_CONTEXT_0_SET) {
+			continue;
+		}
+		Element wrapper;
+		if (!fields.Next(wrapper)) {
+			return X509Result::MALFORMED;
+		}
+		Der choice(wrapper.content, wrapper.length);
+		if (!choice.Next(name) || !choice.AtEnd()) {
+			return X509Result::MALFORMED;
+		}
+		if (name.tag != TAG_CONTEXT_0_SET) {
+			continue;
+		}
+		Der names(name.content, name.length);
+		const auto result = GeneralNameUris(names, max_entries, out.crl_urls);
+		if (result != X509Result::OK) {
+			return result;
+		}
+	}
+	return X509Result::OK;
+}
+
+// certificatePolicies ::= SEQUENCE SIZE (1..MAX) OF PolicyInformation
+// PolicyInformation ::= SEQUENCE { policyIdentifier OID, policyQualifiers OPTIONAL }
+X509Result DecodePolicies(const Element &value, size_t max_entries, X509Certificate &out) {
+	Der outer(value.content, value.length);
+	Element sequence;
+	if (!outer.Expect(TAG_SEQUENCE, sequence) || !outer.AtEnd()) {
+		return X509Result::MALFORMED;
+	}
+	Der list(sequence.content, sequence.length);
+	out.has_policies = true;
+	while (!list.AtEnd()) {
+		Element information, id;
+		std::string oid;
+		if (!list.Expect(TAG_SEQUENCE, information)) {
+			return X509Result::MALFORMED;
+		}
+		Der fields(information.content, information.length);
+		Element qualifiers;
+		if (!fields.Expect(TAG_OID, id) || !DecodeOid(id, oid) ||
+		    (!fields.AtEnd() && (!fields.Expect(TAG_SEQUENCE, qualifiers) || !fields.AtEnd()))) {
+			return X509Result::MALFORMED;
+		}
+		if (out.policies.size() >= max_entries) {
+			return X509Result::OVER_LIMIT;
+		}
+		out.policies.push_back(oid);
+	}
+	return X509Result::OK;
+}
+
 X509Result DecodeExtensions(const Element &wrapper, size_t max_entries, X509Certificate &out) {
 	Der explicit_tag(wrapper.content, wrapper.length);
 	Element extensions;
@@ -772,7 +981,8 @@ X509Result DecodeExtensions(const Element &wrapper, size_t max_entries, X509Cert
 	// other extensions read here only add fields, so a malformed or repeated
 	// one leaves its field unknown instead.
 	bool seen_san = false;
-	size_t basic_copies = 0, usage_copies = 0, purpose_copies = 0;
+	size_t basic_copies = 0, usage_copies = 0, purpose_copies = 0, subject_id_copies = 0, authority_id_copies = 0,
+	       access_copies = 0, crl_copies = 0, policy_copies = 0;
 	Der list(extensions.content, extensions.length);
 	while (!list.AtEnd()) {
 		Element extension, id, value;
@@ -821,6 +1031,35 @@ X509Result DecodeExtensions(const Element &wrapper, size_t max_entries, X509Cert
 			if (result != X509Result::OK) {
 				out.has_extended_key_usage = false;
 				out.extended_key_usage.clear();
+			}
+		} else if (oid == "2.5.29.14") {
+			if (++subject_id_copies > 1 || !DecodeSubjectKeyId(value, out)) {
+				out.subject_key_id.clear();
+			}
+		} else if (oid == "2.5.29.35") {
+			if (++authority_id_copies > 1 || !DecodeAuthorityKeyId(value, out)) {
+				out.authority_key_id.clear();
+			}
+		} else if (oid == "1.3.6.1.5.5.7.1.1") {
+			const auto result =
+			    ++access_copies > 1 ? X509Result::MALFORMED : DecodeAuthorityInfoAccess(value, max_entries, out);
+			if (result != X509Result::OK) {
+				out.has_authority_info_access = false;
+				out.ocsp_urls.clear();
+				out.ca_issuers_urls.clear();
+			}
+		} else if (oid == "2.5.29.31") {
+			const auto result =
+			    ++crl_copies > 1 ? X509Result::MALFORMED : DecodeCrlDistributionPoints(value, max_entries, out);
+			if (result != X509Result::OK) {
+				out.has_crl_distribution_points = false;
+				out.crl_urls.clear();
+			}
+		} else if (oid == "2.5.29.32") {
+			const auto result = ++policy_copies > 1 ? X509Result::MALFORMED : DecodePolicies(value, max_entries, out);
+			if (result != X509Result::OK) {
+				out.has_policies = false;
+				out.policies.clear();
 			}
 		}
 	}

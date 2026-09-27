@@ -356,6 +356,24 @@ void TestAlgorithmsAndKeys() {
 	cert = Ok(broken);
 	assert(cert.signature_algorithm.empty() && cert.public_key_algorithm == "id-ecPublicKey");
 
+	// Explicit EC parameters have no name; the size is the group order's bits.
+	Bytes order = {0x00, 0xFF};
+	order.insert(order.end(), 31, 0x11);
+	const Bytes parameters =
+	    Tlv(0x30, Cat({Tlv(0x02, {1}), Tlv(0x30, Cat({Oid({1, 2, 840, 10045, 1, 1}), Tlv(0x02, {0x7F})})),
+	                   Tlv(0x30, Cat({Tlv(0x04, {1}), Tlv(0x04, {2})})), Tlv(0x04, {0x04, 0x01}), Tlv(0x02, order),
+	                   Tlv(0x02, {1})}));
+	Spec explicit_curve;
+	explicit_curve.key =
+	    Tlv(0x30, Cat({Tlv(0x30, Cat({Oid({1, 2, 840, 10045, 2, 1}), parameters})), Tlv(0x03, {0x00, 0x04, 0x01})}));
+	cert = Ok(explicit_curve);
+	assert(cert.public_key_curve.empty() && cert.public_key_bits == 256);
+	// Parameters without an order leave the size unknown.
+	explicit_curve.key = Tlv(0x30, Cat({Tlv(0x30, Cat({Oid({1, 2, 840, 10045, 2, 1}), Tlv(0x30, Tlv(0x02, {1}))})),
+	                                    Tlv(0x03, {0x00, 0x04, 0x01})}));
+	cert = Ok(explicit_curve);
+	assert(cert.public_key_curve.empty() && cert.public_key_bits == 0);
+
 	// RSASSA-PSS keys have the RSA body, so they are sized the same way.
 	spec.key = Tlv(0x30, Cat({Tlv(0x30, Oid({1, 2, 840, 113549, 1, 1, 10})),
 	                          Tlv(0x03, Cat({{0x00}, Tlv(0x30, Cat({Tlv(0x02, modulus), Tlv(0x02, {1, 0, 1})}))}))}));
@@ -424,6 +442,126 @@ void TestConstraintsAndUsage() {
 	}
 }
 
+void TestIdentifiersAndLocations() {
+	const std::vector<uint64_t> subject_id = {2, 5, 29, 14}, authority_id = {2, 5, 29, 35},
+	                            access = {1, 3, 6, 1, 5, 5, 7, 1, 1}, crl = {2, 5, 29, 31}, policies = {2, 5, 29, 32};
+	const auto ocsp = Oid({1, 3, 6, 1, 5, 5, 7, 48, 1}), issuers = Oid({1, 3, 6, 1, 5, 5, 7, 48, 2});
+	const auto uri = [](const std::string &text) {
+		return Text(0x86, text);
+	};
+	Spec spec;
+	auto cert = Ok(spec);
+	assert(cert.subject_key_id.empty() && cert.authority_key_id.empty());
+	assert(!cert.has_authority_info_access && !cert.has_crl_distribution_points && !cert.has_policies);
+
+	spec.extensions = {
+	    Extension(subject_id, Tlv(0x04, {0x01, 0xAB})),
+	    Extension(authority_id, Tlv(0x30, Cat({Tlv(0x80, {0xCD, 0x02}), Tlv(0xA1, {}), Tlv(0x82, {0x07})}))),
+	    Extension(access,
+	              Tlv(0x30, Cat({Tlv(0x30, Cat({ocsp, uri("http://o")})), Tlv(0x30, Cat({issuers, uri("http://i")})),
+	                             Tlv(0x30, Cat({Oid({1, 2, 3}), uri("http://other")})),
+	                             Tlv(0x30, Cat({ocsp, Text(0x82, "dns.example")}))}))),
+	    Extension(crl,
+	              Tlv(0x30, Cat({Tlv(0x30, Tlv(0xA0, Tlv(0xA0, Cat({uri("http://c1"), Text(0x82, "x")})))),
+	                             Tlv(0x30, Tlv(0x81, {0x06, 0x40})), Tlv(0x30, Tlv(0xA0, Tlv(0xA1, Tlv(0x30, {})))),
+	                             Tlv(0x30, Tlv(0xA0, Tlv(0xA0, uri("http://c2\x01"))))}))),
+	    Extension(policies, Tlv(0x30, Cat({Tlv(0x30, Oid({2, 23, 140, 1, 2, 1})),
+	                                       Tlv(0x30, Cat({Oid({1, 2, 3}), Tlv(0x30, {})}))})))};
+	cert = Ok(spec);
+	assert(cert.subject_key_id == "01ab" && cert.authority_key_id == "cd02");
+	// Only OCSP and caIssuers URIs are kept; the name is escaped as tls_sni is.
+	assert((cert.ocsp_urls == std::vector<std::string> {"http://o"}));
+	assert((cert.ca_issuers_urls == std::vector<std::string> {"http://i"}));
+	assert((cert.crl_urls == std::vector<std::string> {"http://c1", "http://c2\\001"}));
+	assert((cert.policies == std::vector<std::string> {"2.23.140.1.2.1", "1.2.3"}));
+	const size_t lists = 4 + 2;
+	assert(cert.TextBytes() >= lists * sizeof(std::string) + cert.subject_key_id.size() + cert.authority_key_id.size());
+
+	// Empty lists are present and empty, as OpenSSL reads them.
+	spec.extensions = {Extension(access, Tlv(0x30, {})), Extension(crl, Tlv(0x30, {})),
+	                   Extension(policies, Tlv(0x30, {}))};
+	cert = Ok(spec);
+	assert(cert.has_authority_info_access && cert.ocsp_urls.empty() && cert.ca_issuers_urls.empty());
+	assert(cert.has_crl_distribution_points && cert.crl_urls.empty() && cert.has_policies && cert.policies.empty());
+
+	// Each of these only adds fields: malformed or repeated, it is unknown and
+	// the certificate still parses.
+	const std::vector<std::pair<std::vector<uint64_t>, Bytes>> bad = {
+	    {subject_id, Tlv(0x04, {})},                                                 // no identifier
+	    {subject_id, Tlv(0x30, {})},                                                 // not an OCTET STRING
+	    {authority_id, Tlv(0x30, Cat({Tlv(0x82, {0x07}), Tlv(0x80, {1})}))},         // out of order
+	    {authority_id, Tlv(0x30, Tlv(0xA0, {}))},                                    // [0] constructed
+	    {authority_id, Tlv(0x30, Tlv(0x83, {1}))},                                   // no such field
+	    {access, Tlv(0x30, Tlv(0x30, ocsp))},                                        // no location
+	    {access, Tlv(0x30, Tlv(0x30, Cat({ocsp, uri("a"), uri("b")})))},             // two locations
+	    {crl, Tlv(0x30, Tlv(0x30, Tlv(0xA0, Cat({Tlv(0xA0, {}), Tlv(0xA1, {})}))))}, // two names
+	    {policies, Tlv(0x30, Tlv(0x30, Tlv(0x05, {})))},                             // no identifier
+	    {policies, Tlv(0x31, {})},                                                   // not a SEQUENCE
+	};
+	for (const auto &item : bad) {
+		spec.extensions = {Extension(item.first, item.second)};
+		cert = Ok(spec);
+		assert(cert.subject_key_id.empty() && cert.authority_key_id.empty());
+		assert(!cert.has_authority_info_access && cert.ocsp_urls.empty() && cert.ca_issuers_urls.empty());
+		assert(!cert.has_crl_distribution_points && cert.crl_urls.empty());
+		assert(!cert.has_policies && cert.policies.empty());
+	}
+	for (const auto &oid : {subject_id, authority_id, access, crl, policies}) {
+		const Bytes value = oid == subject_id     ? Tlv(0x04, {1})
+		                    : oid == authority_id ? Tlv(0x30, Tlv(0x80, {1}))
+		                    : oid == policies     ? Tlv(0x30, Tlv(0x30, Oid({1, 2})))
+		                                          : Tlv(0x30, {});
+		spec.extensions = {Extension(oid, value), Extension(oid, value)};
+		cert = Ok(spec);
+		assert(cert.subject_key_id.empty() && cert.authority_key_id.empty() && !cert.has_authority_info_access &&
+		       !cert.has_crl_distribution_points && !cert.has_policies);
+	}
+
+	// A list longer than the limit is unknown, and the certificate stands: these
+	// extensions only add fields, and its own size already bounds its memory.
+	const std::vector<Bytes> three = {
+	    Extension(access, Tlv(0x30, Cat({Tlv(0x30, Cat({ocsp, uri("1")})), Tlv(0x30, Cat({ocsp, uri("2")})),
+	                                     Tlv(0x30, Cat({ocsp, uri("3")}))}))),
+	    Extension(crl, Tlv(0x30, Tlv(0x30, Tlv(0xA0, Tlv(0xA0, Cat({uri("1"), uri("2"), uri("3")})))))),
+	    Extension(policies, Tlv(0x30, Cat({Tlv(0x30, Oid({1, 2})), Tlv(0x30, Oid({1, 3})), Tlv(0x30, Oid({1, 4}))})))};
+	for (const auto &extension : three) {
+		spec.extensions = {extension};
+		X509Certificate out;
+		assert(Parse(Certificate(spec), out, 2) == X509Result::OK && !out.subject.empty());
+		assert(!out.has_authority_info_access && !out.has_crl_distribution_points && !out.has_policies);
+		assert(out.ocsp_urls.empty() && out.crl_urls.empty() && out.policies.empty());
+		out = X509Certificate();
+		assert(Parse(Certificate(spec), out, 3) == X509Result::OK);
+		assert(out.ocsp_urls.size() + out.crl_urls.size() + out.policies.size() == 3);
+		assert(out.TextBytes() >= 3 * sizeof(std::string));
+	}
+
+	// A UUID OID (2.25) has a 128-bit arc, printed in full as OpenSSL does.
+	const Bytes uuid = Tlv(0x06, {0x69, 0x83, 0xF0, 0x9D, 0xA7, 0xEB, 0xCF, 0xDE, 0xE0, 0xC7,
+	                              0xA1, 0xA7, 0xB2, 0xC0, 0x94, 0x8C, 0xC8, 0xF9, 0xD7, 0x76});
+	spec.extensions = {Extension(policies, Tlv(0x30, Cat({Tlv(0x30, Oid({2, 23, 140, 1, 2, 1})), Tlv(0x30, uuid)})))};
+	cert = Ok(spec);
+	assert(
+	    (cert.policies == std::vector<std::string> {"2.23.140.1.2.1", "2.25.329800735698586629295641978511506172918"}));
+	// Arcs past 140 bits are still refused, and so is a wide first arc.
+	Bytes wide = {0x69};
+	wide.insert(wide.end(), 20, 0xFF);
+	wide.push_back(0x01);
+	spec.extensions = {Extension(policies, Tlv(0x30, Tlv(0x30, Tlv(0x06, wide))))};
+	assert(!Ok(spec).has_policies);
+	// Qualifiers must be a SEQUENCE and nothing may follow them; an AKI issuer
+	// is constructed and its serial primitive.
+	for (const auto &value : {Tlv(0x30, Tlv(0x30, Cat({Oid({1, 2}), Tlv(0x02, {1})}))),
+	                          Tlv(0x30, Tlv(0x30, Cat({Oid({1, 2}), Tlv(0x30, {}), Tlv(0x05, {})})))}) {
+		spec.extensions = {Extension(policies, value)};
+		assert(!Ok(spec).has_policies);
+	}
+	for (const auto &value : {Tlv(0x30, Cat({Tlv(0x80, {1}), Tlv(0x81, {})})), Tlv(0x30, Tlv(0xA2, {}))}) {
+		spec.extensions = {Extension(authority_id, value)};
+		assert(Ok(spec).authority_key_id.empty());
+	}
+}
+
 // Random corruption never crashes, and never yields a partly filled result.
 void TestFuzz() {
 	std::mt19937 random(424242);
@@ -464,6 +602,7 @@ void TestFuzz() {
 int main() {
 	TestAlgorithmsAndKeys();
 	TestConstraintsAndUsage();
+	TestIdentifiersAndLocations();
 	TestFields();
 	TestNames();
 	TestTimes();
@@ -472,5 +611,5 @@ int main() {
 	TestFraming();
 	TestTextBytes();
 	TestFuzz();
-	std::printf("X.509 fields, RFC 4514 names, times, SANs, framing and fuzzing passed\n");
+	std::printf("X.509 fields, RFC 4514 names, times, SANs, extensions, framing and fuzzing passed\n");
 }
