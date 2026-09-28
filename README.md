@@ -167,10 +167,30 @@ features evolve without requiring captures to be rewritten.
 The implementation roadmap, architectural boundaries, acceptance criteria, and licensing notes are in
 [`docs/HANDOFF.md`](docs/HANDOFF.md).
 
-PacketQuapture is licensed under the MIT License, except that the `ja4s` and `ja4s_r`
-columns of `read_tls` implement JA4S, which is patent pending and licensed by FoxIO under
-the FoxIO License 1.1. That license does not permit monetization without an OEM license
-from FoxIO. See [`NOTICE`](NOTICE).
+Behavioral traffic analytics over normalized connection, DNS and TLS facts are specified
+in [`docs/TRAFFIC_ANALYTICS.md`](docs/TRAFFIC_ANALYTICS.md). The staged delivery plan
+starts with capture-backed talker, long-connection and beacon analysis while preserving
+a source-adapter boundary for future Zeek inputs; see
+[`docs/TRAFFIC_ANALYTICS_PLAN.md`](docs/TRAFFIC_ANALYTICS_PLAN.md).
+Generated golden cases and RAT04 measurements are recorded in
+[`docs/TRAFFIC_ANALYTICS_BENCHMARK.md`](docs/TRAFFIC_ANALYTICS_BENCHMARK.md).
+
+The connection slice is available directly over capture paths, lists and globs:
+
+```sql
+SELECT * FROM summarize_talkers('captures/*.pcap', ['10.0.0.0/8']);
+SELECT * FROM analyze_long_connections('captures/*.pcap', ['10.0.0.0/8']);
+SELECT * FROM analyze_beacons('captures/*.pcap', ['10.0.0.0/8'])
+ORDER BY score DESC NULLS LAST;
+SELECT * FROM analyze_dns_tunnels('captures/*.pcap')
+ORDER BY score DESC;
+```
+
+PacketQuapture's code is licensed under the MIT License, except that the `ja4s` and
+`ja4s_r` columns of `read_tls` implement JA4S, which is patent pending and licensed by
+FoxIO under the FoxIO License 1.1. That license does not permit monetization without an
+OEM license from FoxIO. The bundled Public Suffix List data is MPL 2.0. See
+[`NOTICE`](NOTICE).
 
 ## Session summaries
 

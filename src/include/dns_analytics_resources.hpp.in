@@ -1,0 +1,13 @@
+#pragma once
+
+namespace duckdb {
+
+static const char *const DNS_ANALYTICS_SQL = R"PQDNS(
+@DNS_ANALYTICS_SQL_CONTENT@
+)PQDNS";
+
+static const char *const PUBLIC_SUFFIX_LIST = R"PQPSL(
+@PUBLIC_SUFFIX_LIST_CONTENT@
+)PQPSL";
+
+} // namespace duckdb

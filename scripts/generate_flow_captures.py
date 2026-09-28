@@ -27,6 +27,26 @@ def write(path, records):
     path.write_bytes(data)
 
 
+def analytics_datagram(source_port, service_port, payload_size=3):
+    payload = bytes([service_port & 0xFF]) * payload_size
+    header = struct.pack("!HHHH", source_port, service_port, 8 + payload_size, 0)
+    return eth(ip4(header + payload, 17))
+
+
+def series(start, service_port, intervals, payload_sizes=None):
+    timestamps = [start]
+    for interval in intervals:
+        timestamps.append(timestamps[-1] + interval * 1_000_000)
+    sizes = payload_sizes or [3] * len(timestamps)
+    return [
+        (
+            timestamp,
+            analytics_datagram(40000 + index, service_port, sizes[index]),
+        )
+        for index, timestamp in enumerate(timestamps)
+    ]
+
+
 def main():
     DATA.mkdir(parents=True, exist_ok=True)
     handshake = [
@@ -52,6 +72,32 @@ def main():
             (40, eth(b"arp", 0x0806)),
             (20, datagram),
         ],
+    )
+    # Eight equal-size UDP observations at a fixed five-minute cadence. The
+    # one-minute idle timeout makes each packet a separate connection fact.
+    beacon_start = 1_700_000_000 * 1_000_000
+    write(
+        DATA / "analytics.pcap",
+        [(beacon_start + index * 300_000_000, datagram) for index in range(8)],
+    )
+    distributions = []
+    distributions += series(
+        beacon_start, 54, [240, 360, 270, 330, 240, 360, 300]
+    )
+    distributions += series(
+        beacon_start, 55, [73, 509, 181, 887, 293, 641, 419]
+    )
+    distributions += series(beacon_start, 56, [1, 1, 1, 897, 1, 1, 1])
+    distributions += series(
+        beacon_start,
+        57,
+        [300] * 7,
+        [3, 303, 3, 303, 3, 303, 3, 303],
+    )
+    write(DATA / "analytics_distributions.pcap", distributions)
+    write(
+        DATA / "simultaneous_open.pcap",
+        [(beacon_start, tcp(100, 2)), (beacon_start + 1, tcp(200, 2, True))],
     )
     shb = block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
     idb = block(1, struct.pack("<HHI", 1, 0, 65535))
