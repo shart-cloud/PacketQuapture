@@ -31,6 +31,15 @@ LLC, which FoxIO publishes under the BSD 3-Clause license with no patent
 claims. PacketQuapture's implementation is written from the specification and
 contains no FoxIO code.
 
+Public Suffix List (Mozilla Public License 2.0)
+------------------------------------------------
+
+`third_party/public_suffix_list/public_suffix_list.dat` is a pinned snapshot of
+the Public Suffix List published at https://publicsuffix.org/. The data file is
+licensed under the Mozilla Public License 2.0 and retains its upstream license
+notice. PacketQuapture's lookup and analytics code is independently written and
+remains MIT licensed.
+
 --------------------------------------------------------------------------------
 
 FoxIO License 1.1

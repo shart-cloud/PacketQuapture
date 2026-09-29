@@ -1,0 +1,386 @@
+# name: test/sql/traffic_analytics.test
+# description: Normalized connection facts, talkers, long connections and beacon scoring
+# group: [sql]
+
+require packetquapture
+
+query TTTT
+SELECT packetquapture_ip_in_cidrs('10.255.255.255', ['10.0.0.0/8']),
+       packetquapture_ip_in_cidrs('11.0.0.0', ['10.0.0.0/8']),
+       packetquapture_ip_in_cidrs('2001:db8:ffff::1', ['2001:db8::/32']),
+       packetquapture_ip_in_cidrs('2001:db9::1', ['2001:db8::/32']);
+----
+true	false	true	false
+
+query TTTTTTTTTT
+SELECT packetquapture_ip_in_cidrs('203.0.113.9', ['0.0.0.0/0']),
+       packetquapture_ip_in_cidrs('192.0.2.1', ['192.0.2.1/32']),
+       packetquapture_ip_in_cidrs('192.0.2.2', ['192.0.2.1/32']),
+       packetquapture_ip_in_cidrs('2001:db8:0:1:2:3:4:5', ['2001:db8:0:1:2:3:4:5/128']),
+       packetquapture_ip_in_cidrs('2001:db8:0:1:2:3:4:6', ['2001:db8:0:1:2:3:4:5/128']),
+       packetquapture_ip_in_cidrs('::1', ['::/0']),
+       packetquapture_ip_in_cidrs('::ffff:192.0.2.1', ['::ffff:192.0.2.1/128']),
+       packetquapture_ip_in_cidrs('2001::db8::1', ['::/0']) IS NULL,
+       packetquapture_ip_in_cidrs(NULL, ['10.0.0.0/8']) IS NULL,
+       packetquapture_ip_in_cidrs('10.0.0.1', NULL) IS NULL;
+----
+true	true	false	true	false	true	true	true	true	true
+
+query TT
+SELECT ip, packetquapture_ip_in_cidrs(ip, networks)
+FROM (VALUES ('10.0.0.1', ['10.0.0.0/8']),
+             ('192.0.2.1', ['10.0.0.0/8'])) addresses(ip, networks)
+ORDER BY ip;
+----
+10.0.0.1	true
+192.0.2.1	false
+
+statement error
+SELECT packetquapture_ip_in_cidrs('10.0.0.1', ['10.0.0.0/8', 'invalid']);
+----
+Invalid CIDR
+
+statement error
+SELECT packetquapture_ip_in_cidrs('10.0.0.1', ['10.0.0.0/33']);
+----
+Invalid CIDR
+
+statement error
+SELECT packetquapture_ip_in_cidrs('::1', ['::/129']);
+----
+Invalid CIDR
+
+statement error
+SELECT packetquapture_ip_in_cidrs('10.0.0.1', ['10.0.0.0/8', NULL]);
+----
+must not contain NULL
+
+query TTTTT
+SELECT direction, local_ip, remote_ip, initiator, source_record_id
+FROM packetquapture_connection_facts('test/data/flows/tcp.pcap', ['192.0.2.0/24'])
+ORDER BY source_record_id;
+----
+outbound	192.0.2.1	198.51.100.2	a	1:1
+outbound	192.0.2.1	198.51.100.2	a	1:7
+outbound	192.0.2.1	198.51.100.2	a	1:9
+
+query TTT
+SELECT direction, local_ip, remote_ip
+FROM packetquapture_connection_facts('test/data/flows/tcp.pcap', ['198.51.100.0/24'])
+ORDER BY source_record_id;
+----
+inbound	198.51.100.2	192.0.2.1
+inbound	198.51.100.2	192.0.2.1
+inbound	198.51.100.2	192.0.2.1
+
+query TII
+SELECT direction, count(*), count(DISTINCT local_ip)
+FROM packetquapture_connection_facts(
+    'test/data/flows/tcp.pcap', ['192.0.2.0/24', '198.51.100.0/24'])
+GROUP BY direction;
+----
+internal	3	1
+
+query TII
+SELECT direction, count(*), count(local_ip)
+FROM packetquapture_connection_facts('test/data/flows/tcp.pcap', ['203.0.113.0/24'])
+GROUP BY direction;
+----
+external	3	0
+
+query TTTT
+SELECT direction, initiator, local_ip, remote_ip
+FROM packetquapture_connection_facts(
+    'test/data/flows/simultaneous_open.pcap', ['192.0.2.0/24']);
+----
+unknown	unknown	192.0.2.1	198.51.100.2
+
+query II
+SELECT (SELECT count(*) FROM analyze_long_connections(
+           'test/data/flows/simultaneous_open.pcap', ['192.0.2.0/24'],
+           scope := 'outbound', min_duration := INTERVAL '0 seconds')),
+       (SELECT count(*) FROM analyze_long_connections(
+           'test/data/flows/simultaneous_open.pcap', ['192.0.2.0/24'],
+           scope := 'local_remote', min_duration := INTERVAL '0 seconds'));
+----
+0	1
+
+query TTT
+SELECT direction, local_ip, remote_ip
+FROM packetquapture_connection_facts(
+    'test/data/protocols/ethernet.pcap', ['2001:db8::/32'])
+WHERE endpoint_a_ip LIKE '%:%';
+----
+internal	2001:0db8:0000:0000:0000:0000:0000:0001	2001:0db8:0000:0000:0000:0000:0000:0002
+
+query TTT
+SELECT finalized_by, duration IS NULL, quality_flags
+FROM packetquapture_connection_facts('test/data/flows/scopes.pcapng', ['192.0.2.0/24'])
+WHERE duration IS NULL;
+----
+section_boundary	true	[missing_timestamps, partial_session, ambiguous_orientation, capture_boundary]
+
+query II
+SELECT count(*) FILTER (WHERE list_contains(quality_flags, 'late_packets')),
+       count(*) FILTER (WHERE finalized_by = 'idle_timeout')
+FROM packetquapture_connection_facts(
+    'test/data/flows/udp.pcap', ['192.0.2.0/24'], udp_idle_timeout := INTERVAL '10 microseconds');
+----
+2	2
+
+query I
+SELECT count(*)
+FROM packetquapture_connection_facts('test/data/flows/tcp.pcap', ['192.0.2.0/24'])
+WHERE finalized_by = 'reset' AND partial_session;
+----
+1
+
+query IIII
+SELECT sum(a_packets+b_packets), sum(a_captured_bytes+b_captured_bytes),
+       sum(a_reported_bytes+b_reported_bytes), sum(a_payload_bytes+b_payload_bytes)
+FROM packetquapture_connection_facts('test/data/protocols/ethernet.pcap', ['192.0.2.0/24']);
+----
+10	637	637	22
+
+query TTTT
+SELECT sum(local_packets) = sum(b_packets), sum(remote_packets) = sum(a_packets),
+       sum(local_captured_bytes + remote_captured_bytes) = sum(a_captured_bytes + b_captured_bytes),
+       sum(local_payload_bytes + remote_payload_bytes) = sum(a_payload_bytes + b_payload_bytes)
+FROM packetquapture_connection_facts('test/data/flows/tcp.pcap', ['198.51.100.0/24']);
+----
+true	true	true	true
+
+query IITII
+SELECT rank, selected_metric_value, endpoint_ip, connection_count, peer_count
+FROM summarize_talkers('test/data/flows/tcp.pcap', ['192.0.2.0/24'])
+ORDER BY rank;
+----
+1	0	192.0.2.1	3	1
+2	0	198.51.100.2	3	1
+
+query TTITT
+SELECT grouping, metric, selected_metric_value, transport, port
+FROM summarize_talkers('test/data/flows/analytics.pcap', ['192.0.2.0/24'],
+                       "by"='service', metric='connections', scope='outbound', max_results=1);
+----
+service	connections	8	udp	5353
+
+query II
+SELECT (SELECT count(*) FROM analyze_long_connections(
+           'test/data/flows/tcp.pcap', ['192.0.2.0/24'], min_duration := INTERVAL '0 microseconds')),
+       (SELECT count(*) FROM analyze_long_connections(
+           'test/data/flows/tcp.pcap', ['192.0.2.0/24'], min_duration := INTERVAL '1 microsecond'));
+----
+3	2
+
+query IIII
+SELECT (SELECT count(*) FROM analyze_long_connections(
+           'test/data/flows/tcp.pcap', ['192.0.2.0/24'], min_duration := INTERVAL '0 microseconds')),
+       (SELECT count(*) FROM analyze_long_connections(
+           'test/data/flows/tcp.pcap', ['192.0.2.0/24'], min_duration := INTERVAL '1 microsecond')),
+       (SELECT count(*) FROM analyze_long_connections(
+           'test/data/flows/tcp.pcap', ['192.0.2.0/24'], min_duration := INTERVAL '2 microseconds')),
+       (SELECT count(*) FROM analyze_long_connections(
+           'test/data/flows/tcp.pcap', ['192.0.2.0/24'], min_duration := INTERVAL '6 microseconds'));
+----
+3	2	1	0
+
+query IIIIIRRRRRTTII
+SELECT connection_count, timed_connection_count, epoch_ms(observation_span),
+       median_interval_ms::BIGINT, interval_mad_ms::BIGINT,
+       timing_score, size_score, support_score, span_score, score,
+       quality_flags, reasons, array_length(evidence), evidence_truncated::INTEGER
+FROM analyze_beacons('test/data/flows/analytics.pcap', ['192.0.2.0/24'], evidence_rows := 3);
+----
+8	8	2100000	300000	0	100.000000	100.000000	66.666667	100.000000	95.000000	[partial_session, ambiguous_orientation, capture_boundary, evidence_truncated]	[connection starts have low interval dispersion, connection payload sizes have low dispersion, observations span the configured minimum]	3	1
+
+# Repeated source occurrences remain repeated, but equal timestamps do not make zero intervals.
+query III
+SELECT connection_count, timed_connection_count, median_interval_ms::BIGINT
+FROM analyze_beacons(['test/data/flows/analytics.pcap', 'test/data/flows/analytics.pcap'],
+                     ['192.0.2.0/24']);
+----
+16	16	300000
+
+query TT
+SELECT timing_score IS NULL, list_contains(quality_flags, 'missing_timestamps')
+FROM analyze_beacons('test/data/flows/scopes.pcapng', ['192.0.2.0/24'],
+                     min_connections := 2, min_span := INTERVAL '0 seconds');
+----
+true	true
+
+# Independently calculated timing and size distributions.
+query IIIIIIII
+SELECT remote_port, median_interval_ms::BIGINT, interval_mad_ms::BIGINT,
+       median_payload_bytes::BIGINT, payload_mad_bytes::BIGINT,
+       round(timing_score)::BIGINT, round(size_score)::BIGINT, round(score)::BIGINT
+FROM analyze_beacons('test/data/flows/analytics_distributions.pcap', ['192.0.2.0/24'])
+ORDER BY remote_port;
+----
+54	300000	60000	3	0	20	100	55
+55	419000	222000	3	0	0	100	45
+56	1000	0	3	0	100	100	95
+57	300000	0	153	150	100	0	75
+
+# Input ordering changes occurrence-local evidence IDs, but not analytical metrics.
+query I
+WITH forward AS (
+    SELECT local_ip, remote_ip, remote_port, connection_count, timed_connection_count,
+           observation_span, median_interval_ms, interval_mad_ms,
+           median_payload_bytes, payload_mad_bytes, timing_score, size_score,
+           support_score, span_score, score
+    FROM analyze_beacons(
+        ['test/data/flows/analytics.pcap', 'test/data/flows/analytics_distributions.pcap'],
+        ['192.0.2.0/24'])
+), reverse_order AS (
+    SELECT local_ip, remote_ip, remote_port, connection_count, timed_connection_count,
+           observation_span, median_interval_ms, interval_mad_ms,
+           median_payload_bytes, payload_mad_bytes, timing_score, size_score,
+           support_score, span_score, score
+    FROM analyze_beacons(
+        ['test/data/flows/analytics_distributions.pcap', 'test/data/flows/analytics.pcap'],
+        ['192.0.2.0/24'])
+)
+SELECT count(*) FROM (
+    (SELECT * FROM forward EXCEPT ALL SELECT * FROM reverse_order)
+    UNION ALL
+    (SELECT * FROM reverse_order EXCEPT ALL SELECT * FROM forward)
+);
+----
+0
+
+# An unrelated service does not change an existing group's metrics.
+query I
+WITH alone AS (
+    SELECT * EXCLUDE (finding_id, rank, evidence, evidence_truncated, quality_flags)
+    FROM analyze_beacons('test/data/flows/analytics.pcap', ['192.0.2.0/24'])
+), combined AS (
+    SELECT * EXCLUDE (finding_id, rank, evidence, evidence_truncated, quality_flags)
+    FROM analyze_beacons(
+        ['test/data/flows/analytics.pcap', 'test/data/flows/analytics_distributions.pcap'],
+        ['192.0.2.0/24'])
+    WHERE remote_port = 53
+)
+SELECT count(*) FROM (
+    (SELECT * FROM alone EXCEPT ALL SELECT * FROM combined)
+    UNION ALL
+    (SELECT * FROM combined EXCEPT ALL SELECT * FROM alone)
+);
+----
+0
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE expected_analytics AS
+SELECT * FROM analyze_beacons(
+    ['test/data/flows/analytics_distributions.pcap', 'test/data/flows/analytics.pcap'],
+    ['192.0.2.0/24']);
+
+statement ok
+SET threads=8;
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM analyze_beacons(
+        ['test/data/flows/analytics_distributions.pcap', 'test/data/flows/analytics.pcap'],
+        ['192.0.2.0/24']) EXCEPT ALL SELECT * FROM expected_analytics)
+    UNION ALL
+    (SELECT * FROM expected_analytics EXCEPT ALL SELECT * FROM analyze_beacons(
+        ['test/data/flows/analytics_distributions.pcap', 'test/data/flows/analytics.pcap'],
+        ['192.0.2.0/24']))
+);
+----
+0
+
+statement ok
+DROP TABLE expected_analytics;
+
+statement error
+SELECT * FROM analyze_beacons('test/data/flows/analytics.pcap', ['192.0.2.0/24'], profile := 'unknown');
+----
+profile must be balanced-v1
+
+statement error
+SELECT * FROM summarize_talkers('test/data/flows/analytics.pcap', ['192.0.2.0/24'], "by"='peer');
+----
+by must be host or service
+
+statement error
+SELECT * FROM summarize_talkers('test/data/flows/analytics.pcap', ['192.0.2.0/24'], metric='bytes');
+----
+metric is not supported
+
+statement error
+SELECT * FROM summarize_talkers('test/data/flows/analytics.pcap', ['192.0.2.0/24'], scope='unknown');
+----
+scope is not supported
+
+statement error
+SELECT * FROM summarize_talkers('test/data/flows/analytics.pcap', ['192.0.2.0/24'], max_results=0);
+----
+max_results must be positive
+
+statement error
+SELECT * FROM analyze_long_connections('test/data/flows/analytics.pcap', ['192.0.2.0/24'], scope := 'unknown');
+----
+scope is not supported
+
+statement error
+SELECT * FROM analyze_long_connections('test/data/flows/analytics.pcap', ['192.0.2.0/24'],
+                                       min_duration := INTERVAL '-1 microsecond');
+----
+min_duration must be nonnegative
+
+statement error
+SELECT * FROM analyze_long_connections('test/data/flows/analytics.pcap', ['192.0.2.0/24'], min_score := 101);
+----
+min_score must be between 0 and 100
+
+statement error
+SELECT * FROM analyze_long_connections('test/data/flows/analytics.pcap', ['192.0.2.0/24'], max_results := 0);
+----
+max_results must be positive
+
+statement error
+SELECT * FROM analyze_long_connections('test/data/flows/analytics.pcap', ['192.0.2.0/24'], profile := 'unknown');
+----
+profile must be balanced-v1
+
+statement error
+SELECT * FROM analyze_beacons('test/data/flows/analytics.pcap', ['192.0.2.0/24'], group_by := 'host');
+----
+group_by must be service
+
+statement error
+SELECT * FROM analyze_beacons('test/data/flows/analytics.pcap', ['192.0.2.0/24'], min_connections := 1);
+----
+min_connections must be at least 2
+
+statement error
+SELECT * FROM analyze_beacons('test/data/flows/analytics.pcap', ['192.0.2.0/24'],
+                              min_span := INTERVAL '-1 microsecond');
+----
+min_span must be nonnegative
+
+statement error
+SELECT * FROM analyze_beacons('test/data/flows/analytics.pcap', ['192.0.2.0/24'], min_score := -1);
+----
+min_score must be between 0 and 100
+
+statement error
+SELECT * FROM analyze_beacons('test/data/flows/analytics.pcap', ['192.0.2.0/24'], max_results := 0);
+----
+max_results must be positive
+
+statement error
+SELECT * FROM analyze_beacons('test/data/flows/analytics.pcap', ['192.0.2.0/24'], evidence_rows := 1025);
+----
+evidence_rows must be between 0 and 1024
+
+statement error
+SELECT * FROM analyze_beacons('test/data/flows/analytics.pcap', ['192.0.2.0/24'],
+                              "window" := INTERVAL '0 seconds');
+----
+window must be positive

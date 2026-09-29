@@ -1,0 +1,181 @@
+# name: test/sql/dns_analytics.test
+# description: Normalized DNS facts, pinned suffix resolution, and tunneling scores
+# group: [sql]
+
+require packetquapture
+
+query TTTT rowsort
+SELECT packetquapture_dns_public_suffix(name),
+       packetquapture_dns_registrable_domain(name),
+       packetquapture_dns_suffix_rule(name),
+       packetquapture_dns_suffix_section(name)
+FROM (VALUES ('a.b.ck'),
+             ('www.city.kawasaki.jp'),
+             ('foo.blogspot.com'),
+             ('host.corp.internal')) names(name);
+----
+b.ck	a.b.ck	*.ck	icann
+blogspot.com	foo.blogspot.com	blogspot.com	private
+internal	corp.internal	*	unknown
+kawasaki.jp	city.kawasaki.jp	!city.kawasaki.jp	icann
+
+query TTTT
+SELECT packetquapture_dns_public_suffix('COM.') = 'com',
+       packetquapture_dns_registrable_domain('EXAMPLE.COM.') = 'example.com',
+       packetquapture_dns_registrable_domain('com') = '',
+       packetquapture_dns_public_suffix('bad..name') = '';
+----
+true	true	true	true
+
+query IIIIII
+SELECT count(*), count(*) FILTER (WHERE dns_valid),
+       count(*) FILTER (WHERE message_direction = 'query'),
+       count(*) FILTER (WHERE message_direction = 'response'),
+       count(DISTINCT client_ip), count(DISTINCT grouping_domain)
+FROM packetquapture_dns_facts('test/data/dns/tunnel_analytics.pcap');
+----
+88	88	44	44	2	2
+
+query TTTT
+SELECT client_ip, resolver_ip, message_direction, grouping_domain
+FROM packetquapture_dns_facts('test/data/dns/tunnel_analytics.pcap')
+WHERE dns_id = 2000
+ORDER BY message_direction;
+----
+192.0.2.10	198.51.100.53	query	example.com
+192.0.2.10	198.51.100.53	response	example.com
+
+query IIII
+SELECT count(*), count(*) FILTER (WHERE transport = 'tcp'),
+       count(*) FILTER (WHERE dns_valid),
+       count(*) FILTER (WHERE list_contains(quality_flags, 'incomplete_reassembly'))
+FROM packetquapture_dns_facts('test/data/reassembly/streams.pcap');
+----
+26	26	17	9
+
+query TT
+SELECT list_contains(quality_flags, 'invalid_dns'),
+       list_contains(quality_flags, 'missing_question')
+FROM packetquapture_dns_facts('test/data/reassembly/malformed_dns.pcap');
+----
+true	true
+
+query IIIIII
+SELECT count(*), count(*) FILTER (WHERE answer_count = 2),
+       count(*) FILTER (WHERE dns_rcode = 3),
+       count(*) FILTER (WHERE dns_truncated),
+       count(*) FILTER (WHERE NOT dns_valid),
+       count(*) FILTER (WHERE list_contains(quality_flags, 'invalid_dns'))
+FROM packetquapture_dns_facts('test/data/dns/messages.pcap');
+----
+22	1	1	1	11	11
+
+query TIII
+SELECT question_name, answer_count, answers[1].type, answers[2].type
+FROM packetquapture_dns_facts('test/data/dns/messages.pcap')
+WHERE answer_count = 2;
+----
+example.com	2	5	1
+
+query TIIIIRRIIIIIIRIIIIIIIIITT
+SELECT client_ip, query_count, response_count, distinct_name_count,
+       distinct_left_payload_count,
+       round(mean_normalized_entropy, 6), round(mean_encoded_character_ratio, 6),
+       median_name_length::BIGINT, max_name_length,
+       median_left_payload_length::BIGINT, max_left_payload_length,
+       nxdomain_count, no_answer_count, round(queries_per_minute, 6),
+       round(length_score)::BIGINT, round(entropy_score)::BIGINT,
+       round(encoded_score)::BIGINT, round(uniqueness_score)::BIGINT,
+       round(failure_score)::BIGINT, round(rate_score)::BIGINT,
+       round(support_score)::BIGINT, round(span_score)::BIGINT,
+       round(score)::BIGINT, suffix_list_version, quality_flags
+FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap',
+                         min_span := INTERVAL '1 second')
+ORDER BY score DESC;
+----
+192.0.2.10	24	24	24	24	0.833333	1.000000	44	44	32	32	24	24	24.000000	50	83	100	100	100	80	60	100	83	psl-2023-09-30-02074b85	[evidence_truncated, cleartext_dns_only]
+192.0.2.20	20	20	4	4	0.243191	1.000000	16	18	4	6	0	0	2.105263	0	24	0	20	0	7	50	100	17	psl-2023-09-30-02074b85	[evidence_truncated, cleartext_dns_only]
+
+query II
+SELECT array_length(evidence), evidence_truncated::INTEGER
+FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap',
+                         min_span := INTERVAL '1 second', min_score := 80,
+                         evidence_rows := 3);
+----
+3	1
+
+query I
+SELECT count(*)
+FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap',
+                         "window" := INTERVAL '1 minute', min_queries := 20,
+                         min_span := INTERVAL '0 seconds');
+----
+1
+
+# Syntactically DNS-like bytes on DoH/DoT ports remain opaque and produce no finding.
+query I
+SELECT count(*) FROM analyze_dns_tunnels('test/data/dns/encrypted_dns_opaque.pcap', min_queries := 2);
+----
+0
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE expected_dns_analytics AS
+SELECT * FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap',
+                                  min_span := INTERVAL '1 second');
+
+statement ok
+SET threads=8;
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap',
+                                       min_span := INTERVAL '1 second')
+     EXCEPT ALL SELECT * FROM expected_dns_analytics)
+    UNION ALL
+    (SELECT * FROM expected_dns_analytics EXCEPT ALL
+     SELECT * FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap',
+                                       min_span := INTERVAL '1 second'))
+);
+----
+0
+
+statement ok
+DROP TABLE expected_dns_analytics;
+
+statement error
+SELECT * FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap', "window" := INTERVAL '0 seconds');
+----
+window must be positive
+
+statement error
+SELECT * FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap', min_queries := 1);
+----
+min_queries must be at least 2
+
+statement error
+SELECT * FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap', min_span := INTERVAL '-1 microsecond');
+----
+min_span must be nonnegative
+
+statement error
+SELECT * FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap', min_score := 101);
+----
+min_score must be between 0 and 100
+
+statement error
+SELECT * FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap', max_results := 0);
+----
+max_results must be positive
+
+statement error
+SELECT * FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap', evidence_rows := 1025);
+----
+evidence_rows must be between 0 and 1024
+
+statement error
+SELECT * FROM analyze_dns_tunnels('test/data/dns/tunnel_analytics.pcap', profile := 'unknown');
+----
+profile must be balanced-v1

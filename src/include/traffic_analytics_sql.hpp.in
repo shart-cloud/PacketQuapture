@@ -1,0 +1,9 @@
+#pragma once
+
+namespace duckdb {
+
+static const char *const TRAFFIC_ANALYTICS_SQL = R"PQSQL(
+@TRAFFIC_ANALYTICS_SQL_CONTENT@
+)PQSQL";
+
+} // namespace duckdb

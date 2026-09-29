@@ -26,7 +26,9 @@
 #include "tls_fingerprint.hpp"
 #include "tcp_reassembly.hpp"
 #include "dns_tcp_framer.hpp"
+#include "dns_analytics.hpp"
 #include "sparse_readahead.hpp"
+#include "traffic_analytics.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -4433,6 +4435,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	AddCaptureOptions(streams);
 	streams.named_parameters["tcp_idle_timeout"] = LogicalType::INTERVAL;
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(streams));
+	RegisterTrafficAnalytics(loader);
+	RegisterDnsAnalytics(loader);
 }
 
 } // namespace
