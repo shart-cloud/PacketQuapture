@@ -164,13 +164,12 @@ int main() {
 		Push(a, Packet(1, 0), rows);
 		auto x = Packet(2, 0);
 		x.packet.src_port++;
-		bool failed = false;
-		try {
-			Push(a, x, rows);
-		} catch (const std::runtime_error &) {
-			failed = true;
-		}
-		assert(failed);
+		// A full table gives up its session nearest expiry, labelled limit, and
+		// the new packet still gets its own session.
+		Push(a, x, rows);
+		assert(rows.size() == 1 && rows[0].finalized_by == "limit" && rows[0].first_packet == 1);
+		Finish(a, rows);
+		assert(rows.size() == 2 && rows[1].first_packet == 2 && rows[1].finalized_by == "eof");
 	}
 
 	{

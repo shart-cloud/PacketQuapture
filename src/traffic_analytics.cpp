@@ -1,4 +1,5 @@
 #include "traffic_analytics.hpp"
+#include "pq_assert.hpp"
 #include "traffic_analytics_sql.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -212,6 +213,13 @@ static void IpInCidrs(DataChunk &args, ExpressionState &, Vector &result) {
 	auto output = FlatVector::GetData<bool>(result);
 	auto &validity = FlatVector::Validity(result);
 	validity.SetAllValid(args.size());
+	// local_networks is almost always one constant list, so a list is parsed only
+	// when a row names a different one than the row before; parsing it per row
+	// dominated the function.
+	vector<ParsedAddress> networks;
+	vector<uint8_t> prefixes;
+	bool parsed = false;
+	list_entry_t parsed_entry(0, 0);
 	for (idx_t row = 0; row < args.size(); ++row) {
 		const auto ip_index = ips.sel->get_index(row);
 		const auto list_index = lists.sel->get_index(row);
@@ -219,11 +227,16 @@ static void IpInCidrs(DataChunk &args, ExpressionState &, Vector &result) {
 			throw InvalidInputException("local_networks must not be NULL");
 		}
 		const auto entry = list_values[list_index];
-		vector<ParsedAddress> networks;
-		vector<uint8_t> prefixes;
-		networks.reserve(entry.length);
-		prefixes.reserve(entry.length);
-		for (idx_t i = 0; i < entry.length; ++i) {
+		const bool same = parsed && entry.offset == parsed_entry.offset && entry.length == parsed_entry.length;
+		if (!same) {
+			networks.clear();
+			prefixes.clear();
+			networks.reserve(entry.length);
+			prefixes.reserve(entry.length);
+			parsed = true;
+			parsed_entry = entry;
+		}
+		for (idx_t i = 0; !same && i < entry.length; ++i) {
 			const auto child_index = child_data.sel->get_index(entry.offset + i);
 			if (!child_data.validity.RowIsValid(child_index)) {
 				throw InvalidInputException("local_networks must not contain NULL");
@@ -244,11 +257,10 @@ static void IpInCidrs(DataChunk &args, ExpressionState &, Vector &result) {
 			validity.SetInvalid(row);
 			continue;
 		}
+		PQ_ASSERT(networks.size() == prefixes.size());
 		bool contained = false;
-		for (idx_t i = 0; i < networks.size(); ++i) {
-			if (PrefixContains(networks[i], prefixes[i], address)) {
-				contained = true;
-			}
+		for (idx_t i = 0; i < networks.size() && !contained; ++i) {
+			contained = PrefixContains(networks[i], prefixes[i], address);
 		}
 		output[row] = contained;
 	}

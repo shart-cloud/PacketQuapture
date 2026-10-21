@@ -105,7 +105,7 @@ PacketStamp Stamp(uint64_t number) {
 
 // Builds the stream the transport core would produce for one direction.
 TcpStream Stream(const TcpFlowKey &key, uint64_t stream_id, const std::vector<uint8_t> &bytes, uint64_t packet = 1,
-                 const std::string &status = "") {
+                 TcpStreamStatus status = TcpStreamStatus::UNSET) {
 	TcpStream stream;
 	stream.key = key;
 	stream.stream_id = stream_id;
@@ -147,7 +147,7 @@ void TestPairedHandshake() {
 	assert(handshake.has_sni && handshake.sni == "example.com");
 	assert(handshake.has_negotiated_version && handshake.negotiated_version == 0x0304);
 	assert(handshake.has_cipher_suite && handshake.cipher_suite == 0x1301);
-	assert(handshake.status == "complete");
+	assert(handshake.status == TlsStatus::COMPLETE);
 	assert(handshake.handshake_number == 1);
 	// The key is oriented client to server whichever direction arrived first.
 	assert(handshake.key.src_port == 51000 && handshake.key.dst_port == 443);
@@ -177,7 +177,7 @@ void TestOrphanClientHello() {
 	// Server-side fields stay unset rather than being invented.
 	assert(!done[0].has_negotiated_version && !done[0].has_cipher_suite);
 	assert(!done[0].has_server_stream);
-	assert(done[0].status == "one-sided");
+	assert(done[0].status == TlsStatus::ONE_SIDED);
 	assert((done[0].warnings == std::vector<std::string> {"server_hello_missing"}));
 	assert(assembler.Empty());
 }
@@ -191,7 +191,7 @@ void TestOrphanServerHello() {
 	assert(done[0].cipher_suite == 0x1302);
 	assert(!done[0].has_sni);
 	assert(!done[0].has_client_stream && done[0].server_stream_id == 7);
-	assert(done[0].status == "one-sided");
+	assert(done[0].status == TlsStatus::ONE_SIDED);
 	// Still oriented client to server, so it joins the others in a report.
 	assert(done[0].key.src_port == 51000 && done[0].key.dst_port == 443);
 }
@@ -208,7 +208,7 @@ void TestMessageSpanningRecords() {
 	auto done = assembler.Finish();
 	assert(done.size() == 1);
 	assert(done[0].has_sni && done[0].sni == "split.example.com");
-	assert(done[0].status == "one-sided");
+	assert(done[0].status == TlsStatus::ONE_SIDED);
 }
 
 // Several handshake messages inside one record must all be seen.
@@ -221,6 +221,40 @@ void TestMultipleMessagesInOneRecord() {
 	auto done = assembler.Finish();
 	assert(done.size() == 1);
 	assert(done[0].has_server_hello && done[0].cipher_suite == 0x1301);
+}
+
+// Provenance lookups must stay linear in the stream. Every byte here is its own
+// 1-byte record from its own packet, and the hello is followed by ~43K empty
+// Certificate messages: a per-message scan of every record and packet took
+// ~10^10 steps on this stream.
+void TestManyTinyRecordsStayLinear() {
+	auto messages = ClientHello({});
+	const auto empty_certificate = Message({}, 11);
+	while (messages.size() < 172000) {
+		messages.insert(messages.end(), empty_certificate.begin(), empty_certificate.end());
+	}
+	TcpStream stream = Stream(Key(), 1, {}, 1);
+	auto &chunk = stream.chunks[0];
+	chunk.origins.clear();
+	for (size_t i = 0; i < messages.size(); ++i) {
+		TcpByteOrigin origin;
+		origin.offset = chunk.data.size();
+		origin.length = 6;
+		origin.stamp = Stamp(i + 1);
+		chunk.origins.push_back(origin);
+		const auto record = Record(std::vector<uint8_t>(1, messages[i]));
+		chunk.data.insert(chunk.data.end(), record.begin(), record.end());
+	}
+	stream.expected_bytes = stream.captured_bytes = static_cast<uint32_t>(chunk.data.size());
+	TlsHandshakeAssembler assembler;
+	assembler.Add(stream);
+	auto done = assembler.Finish();
+	assert(done.size() == 1);
+	assert(done[0].has_client_hello);
+	// The hello's first byte came in packet 1, and the last Certificate's last
+	// byte in the last packet.
+	assert(done[0].first.number == 1);
+	assert(done[0].last.number == messages.size());
 }
 
 void TestRenegotiationNumbersHandshakes() {
@@ -253,8 +287,8 @@ void TestUnevenHandshakeCounts() {
 	assembler.Add(Stream(key, 1, client_bytes, 1));
 	auto done = assembler.Add(Stream(key.Reverse(), 2, Record(ServerHello(0x009C)), 2));
 	assert(done.size() == 2);
-	assert(done[0].has_server_hello && done[0].status == "complete");
-	assert(!done[1].has_server_hello && done[1].status == "one-sided");
+	assert(done[0].has_server_hello && done[0].status == TlsStatus::COMPLETE);
+	assert(!done[1].has_server_hello && done[1].status == TlsStatus::ONE_SIDED);
 	assert(done[1].sni == "b.example");
 }
 
@@ -327,7 +361,7 @@ void TestNonTlsStreamsAreIgnored() {
 	assert(assembler.Add(Stream(Key(), 1, bytes, 1)).empty());
 	assert(assembler.Add(Stream(Key(), 2, std::vector<uint8_t>(200, 0xFF), 2)).empty());
 	// A transport failure on a stream we cannot classify is not a TLS finding.
-	TcpStream failed = Stream(Key(), 3, std::vector<uint8_t>(), 3, "conflict");
+	TcpStream failed = Stream(Key(), 3, std::vector<uint8_t>(), 3, TcpStreamStatus::CONFLICT);
 	failed.chunks.clear();
 	assert(assembler.Add(failed).empty());
 	assert(assembler.Finish().empty());
@@ -358,7 +392,7 @@ void TestDirectionsWithDifferentVlansDoNotPair() {
 	auto done = assembler.Finish();
 	assert(done.size() == 2);
 	assert(done[0].has_client_hello != done[1].has_client_hello);
-	assert(done[0].status == "one-sided" && done[1].status == "one-sided");
+	assert(done[0].status == TlsStatus::ONE_SIDED && done[1].status == TlsStatus::ONE_SIDED);
 }
 
 void TestPendingLimit() {
@@ -389,7 +423,7 @@ void TestHandshakeCountLimit() {
 	assembler.Add(Stream(Key(), 1, bytes, 1));
 	auto done = assembler.Finish();
 	assert(done.size() == 3);
-	assert(done[0].status == "limit");
+	assert(done[0].status == TlsStatus::LIMIT);
 }
 
 // Random bytes must never be reported as a handshake, and must never crash.
@@ -511,7 +545,7 @@ void TestHelloLists() {
 	auto done = assembler.Add(Stream(key.Reverse(), 2, Record(ServerHello(0x1301, server_extensions)), 2));
 	assert(done.size() == 1);
 	const auto &h = done[0];
-	assert(h.status == "complete" && h.warnings.empty());
+	assert(h.status == TlsStatus::COMPLETE && h.warnings.empty());
 	assert(h.client_cipher_suites.present);
 	assert((h.client_cipher_suites.values == std::vector<uint16_t> {0x0A0A, 0xC02F, 0x1301}));
 	assert((h.client_extensions.values == std::vector<uint16_t> {0x1A1A, 0, 10, 11, 13, 16, 43}));
@@ -544,7 +578,7 @@ void TestMalformedLists() {
 	const auto odd =
 	    OrphanClient(ClientHelloWith({0x1301}, Concat(ServerNameExtension("odd"), Extension(10, odd_groups))));
 	assert(!odd.client_supported_groups.present && odd.client_supported_groups.malformed);
-	assert(odd.has_sni && odd.sni == "odd" && odd.status == "one-sided");
+	assert(odd.has_sni && odd.sni == "odd" && odd.status == TlsStatus::ONE_SIDED);
 	assert(HasWarning(odd, "client_list_malformed"));
 
 	// Trailing bytes after the vector inside an extension body.
@@ -587,7 +621,7 @@ void TestInvalidHelloReportsNoLists() {
 	auto hello = ClientHelloWith({0x0A0A, 0x1301}, Extension(10, Codes({0x001D})));
 	hello[hello.size() - 5] = 0xFF;
 	const auto invalid = OrphanClient(hello);
-	assert(invalid.status == "invalid");
+	assert(invalid.status == TlsStatus::INVALID);
 	assert(!invalid.client_cipher_suites.present && !invalid.client_extensions.present);
 	assert(HasWarning(invalid, "client_hello_invalid"));
 }
@@ -596,11 +630,11 @@ void TestListEntryLimit() {
 	TlsHandshakeLimits limits;
 	limits.max_list_entries = 4;
 	const auto within = OrphanClient(ClientHelloWith({1, 2, 3, 4}, {}), limits);
-	assert(within.client_cipher_suites.values.size() == 4 && within.status == "one-sided");
+	assert(within.client_cipher_suites.values.size() == 4 && within.status == TlsStatus::ONE_SIDED);
 	const auto over = OrphanClient(ClientHelloWith({1, 2, 3, 4, 5}, {}), limits);
 	assert(!over.client_cipher_suites.present && !over.client_cipher_suites.malformed);
 	assert(over.client_cipher_suites.over_limit && !over.client_cipher_suites.Known());
-	assert(over.status == "limit");
+	assert(over.status == TlsStatus::LIMIT);
 	// A list over the limit is not the same as a list the hello did not carry.
 	const auto groups = OrphanClient(ClientHelloWith({1}, Extension(10, Codes({1, 2, 3, 4, 5}))), limits);
 	assert(!groups.client_supported_groups.present && groups.client_supported_groups.over_limit);
@@ -660,7 +694,7 @@ TlsHandshake PairedWithServer(const std::vector<uint8_t> &server_bytes, TlsHands
 void TestServerCertificates() {
 	const auto leaf = LeafCertificate();
 	const auto chain = PairedWithServer(Record(Concat(ServerHello(0x009C), CertificateMessage({leaf, leaf}))));
-	assert(chain.status == "complete" && chain.warnings.empty());
+	assert(chain.status == TlsStatus::COMPLETE && chain.warnings.empty());
 	assert(chain.server_certificates.present && chain.server_certificates.values.size() == 2);
 	const auto &first = chain.server_certificates.values[0];
 	assert(first.parsed && first.fields.subject == "CN=leaf.example,O=Test" &&
@@ -689,7 +723,7 @@ void TestMalformedCertificates() {
 	    PairedWithServer(Record(Concat(ServerHello(0x009C), CertificateMessage({leaf, {0x30, 0x01}}))));
 	assert(bad_entry.server_certificates.values.size() == 2);
 	assert(bad_entry.server_certificates.values[0].parsed && !bad_entry.server_certificates.values[1].parsed);
-	assert(bad_entry.status == "complete" && HasWarning(bad_entry, "server_certificate_malformed"));
+	assert(bad_entry.status == TlsStatus::COMPLETE && HasWarning(bad_entry, "server_certificate_malformed"));
 
 	// A list length that disagrees with the message.
 	auto framing = CertificateMessage({leaf});
@@ -720,7 +754,7 @@ void TestCertificateLimits() {
 	count.max_certificates = 1;
 	const auto long_chain = PairedWithServer(server, count);
 	assert(long_chain.server_certificates.over_limit && !long_chain.server_certificates.present);
-	assert(long_chain.status == "limit" && !HasWarning(long_chain, "server_certificate_malformed"));
+	assert(long_chain.status == TlsStatus::LIMIT && !HasWarning(long_chain, "server_certificate_malformed"));
 	TlsHandshakeLimits size;
 	size.max_certificate_bytes = leaf.size() - 1;
 	assert(PairedWithServer(server, size).server_certificates.over_limit);
@@ -736,7 +770,7 @@ void TestCertificateLimits() {
 	assert(PairedWithServer(server, held).server_certificates.values.size() == 2);
 	held.max_direction_certificate_bytes = 2 * text - 1;
 	const auto over = PairedWithServer(server, held);
-	assert(over.server_certificates.over_limit && over.status == "limit");
+	assert(over.server_certificates.over_limit && over.status == TlsStatus::LIMIT);
 	// The budget spans every handshake in the direction.
 	const auto hello_and_chain = Concat(ServerHello(0x009C), CertificateMessage({leaf}));
 	const auto client_bytes = Concat(Record(ClientHello({})), Record(ClientHello({})));
@@ -823,7 +857,7 @@ void TestMalformedServerSupportedVersions() {
 		auto done = assembler.Add(Stream(Key().Reverse(), 2, Record(ServerHello(0x1301, extensions, session)), 2));
 		const auto rest = assembler.Finish();
 		done.insert(done.end(), rest.begin(), rest.end());
-		assert(done.size() == 1 && done[0].status == "complete");
+		assert(done.size() == 1 && done[0].status == TlsStatus::COMPLETE);
 		assert(!done[0].has_negotiated_version);
 		assert(done[0].has_server_legacy_version && done[0].server_legacy_version == 0x0303);
 		assert(!done[0].has_resumed); // resumption is undecidable without the version
@@ -920,7 +954,7 @@ void TestUnanchoredSearch() {
 		return stream;
 	};
 	const auto midstream = [&](const TcpFlowKey &k, uint64_t id, const std::vector<uint8_t> &bytes) {
-		auto stream = Stream(k, id, bytes, id, "unanchored");
+		auto stream = Stream(k, id, bytes, id, TcpStreamStatus::UNANCHORED);
 		stream.syn_seen = false;
 		return span(stream, 1, 10);
 	};
@@ -976,7 +1010,7 @@ void TestUnanchoredSearch() {
 
 	// A failed or truncated peer, or one beginning with any TLS record such as
 	// an alert, says nothing about TLS, so it refutes nothing.
-	for (const auto &peer : {span(Stream(key.Reverse(), 2, Bytes("250 OK\r\n"), 2, "conflict"), 2, 9),
+	for (const auto &peer : {span(Stream(key.Reverse(), 2, Bytes("250 OK\r\n"), 2, TcpStreamStatus::CONFLICT), 2, 9),
 	                         span(Stream(key.Reverse(), 2, {0x16, 0x03, 0x03, 0x40, 0x00, 0x02}, 2), 2, 9),
 	                         span(Stream(key.Reverse(), 2, Record({2, 40}, 21), 2), 2, 9)}) {
 		TlsHandshakeAssembler kept;
@@ -999,7 +1033,7 @@ void TestUnanchoredSearch() {
 	done = invalid.Add(span(Stream(key.Reverse(), 2, broken, 2), 2, 9));
 	rest = invalid.Finish();
 	done.insert(done.end(), rest.begin(), rest.end());
-	assert(done.size() == 1 && done[0].status == "invalid" && !has_found(done));
+	assert(done.size() == 1 && done[0].status == TlsStatus::INVALID && !has_found(done));
 
 	// An unconfirmed direction does not displace one that stands on its own:
 	// a direction resumed after idle eviction is dropped, and the original
@@ -1081,7 +1115,7 @@ void TestSocks5Tunnels() {
 	auto handshake = Tunnelled(Concat(greeting, request), Concat({5, 0}, reply));
 	assert(handshake.client_tunnel == "socks5" && handshake.server_tunnel == "socks5");
 	assert(handshake.tunnel_destination == "65.55.196.251:443");
-	assert(handshake.status == "complete" && handshake.warnings.empty());
+	assert(handshake.status == TlsStatus::COMPLETE && handshake.warnings.empty());
 
 	// RFC 1929 username and password, and a name.
 	std::vector<uint8_t> client = {5, 2, 0, 2, 1, 4, 'u', 's', 'e', 'r', 2, 'p', 'w'};
@@ -1105,7 +1139,7 @@ void TestSocks5Tunnels() {
 	handshake = Tunnelled(Concat({0x7E}, Concat(greeting, request)), Concat({5, 0}, reply));
 	assert(handshake.client_tunnel.empty() && handshake.server_tunnel == "socks5");
 	assert(handshake.tunnel_destination.empty());
-	assert(handshake.status == "complete");
+	assert(handshake.status == TlsStatus::COMPLETE);
 	assert((handshake.warnings == std::vector<std::string> {"client_tunnel_unrecognized"}));
 
 	// A request other than CONNECT is not a tunnel TLS could follow.
@@ -1168,7 +1202,7 @@ void TestStartTls() {
 	for (const auto &item : named) {
 		const auto handshake = Tunnelled(Bytes(item.client), Bytes(item.server));
 		assert(handshake.client_tunnel == item.protocol && handshake.server_tunnel == item.protocol);
-		assert(handshake.status == "complete" && handshake.tunnel_destination.empty());
+		assert(handshake.status == TlsStatus::COMPLETE && handshake.tunnel_destination.empty());
 		assert(handshake.warnings.empty());
 	}
 
@@ -1365,7 +1399,73 @@ void TestTunnelFuzz() {
 
 } // namespace
 
+// More extensions than max_extensions is a limit, not a malformed hello: padding
+// a hello must not hide the fields parsed before the cap.
+void TestExtensionCountIsALimit() {
+	auto extensions = ServerNameExtension("first.example");
+	for (int i = 0; i < 300; ++i) {
+		Append16(extensions, 0x1234);
+		Append16(extensions, 0);
+	}
+	TlsHandshakeAssembler assembler;
+	assembler.Add(Stream(Key(), 1, Record(ClientHello(extensions)), 1));
+	auto done = assembler.Finish();
+	assert(done.size() == 1);
+	assert(done[0].status == TlsStatus::LIMIT);
+	assert(done[0].has_sni && done[0].sni == "first.example");
+	assert(done[0].client_extensions.over_limit && !done[0].client_extensions.present);
+	assert(done[0].client_cipher_suites.present);
+	assert(!HasWarning(done[0], "client_hello_invalid"));
+}
+
+// A second server_name, or one whose list does not parse, leaves the name unset
+// and says so, instead of letting the last copy win or dropping it silently.
+void TestMalformedServerName() {
+	const auto twice = Concat(ServerNameExtension("first.example"), ServerNameExtension("second.example"));
+	TlsHandshakeAssembler assembler;
+	assembler.Add(Stream(Key(), 1, Record(ClientHello(twice)), 1));
+	auto done = assembler.Finish();
+	assert(done.size() == 1);
+	assert(!done[0].has_sni && done[0].sni.empty());
+	assert(HasWarning(done[0], "client_list_malformed"));
+	assert(!HasWarning(done[0], "client_hello_invalid"));
+	assert(done[0].client_cipher_suites.present);
+
+	// The list length claims one byte more than the extension holds.
+	auto broken = ServerNameExtension("broken.example");
+	broken[5] = static_cast<uint8_t>(broken[5] + 1);
+	TlsHandshakeAssembler second;
+	second.Add(Stream(Key(), 1, Record(ClientHello(broken)), 1));
+	done = second.Finish();
+	assert(done.size() == 1);
+	assert(!done[0].has_sni);
+	assert(HasWarning(done[0], "client_list_malformed"));
+}
+
+// A chain dropped as a duplicate holds nothing, so its certificate text goes back
+// to the direction's budget for later handshakes.
+void TestDroppedChainReturnsBudget() {
+	const auto leaf = LeafCertificate();
+	const auto one = PairedWithServer(Record(Concat(ServerHello(0x009C), CertificateMessage({leaf}))));
+	const size_t text = one.server_certificates.values[0].fields.TextBytes();
+	TlsHandshakeLimits held;
+	held.max_direction_certificate_bytes = text;
+	const auto chain = CertificateMessage({leaf});
+	const auto first = Concat(Concat(ServerHello(0x009C), chain), chain);
+	const auto second = Concat(ServerHello(0x009C), chain);
+	TlsHandshakeAssembler assembler(held);
+	assembler.Add(Stream(Key(), 1, Concat(Record(ClientHello({})), Record(ClientHello({}))), 1));
+	auto done = assembler.Add(Stream(Key().Reverse(), 2, Record(Concat(first, second)), 2));
+	assert(done.size() == 2);
+	assert(done[0].server_certificates.malformed);
+	assert(done[1].server_certificates.present && done[1].server_certificates.values.size() == 1);
+}
+
 int main() {
+	TestDroppedChainReturnsBudget();
+	TestExtensionCountIsALimit();
+	TestMalformedServerName();
+	TestManyTinyRecordsStayLinear();
 	TestPairedHandshake();
 	TestServerArrivingFirst();
 	TestOrphanClientHello();

@@ -24,6 +24,13 @@ jobs:
           python3 scripts/generate_inventory_captures.py
           python3 scripts/generate_tls_captures.py
           git diff --exit-code -- test/data
+      - name: Function length limit and always-on assertions
+        run: |
+          python3 scripts/function_lengths.py --check
+          mkdir -p build
+          c++ -std=c++11 -Wall -Wextra -Werror -g -O1 -Isrc/include test/unit/pq_assert_test.cpp \
+            -o build/pq_assert_test
+          ./build/pq_assert_test
       - name: Build standalone decoder with sanitizers
         run: |
           mkdir -p build

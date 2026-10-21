@@ -1,8 +1,9 @@
 #pragma once
 
+#include "text_escape.hpp"
+
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <string>
 
 namespace packetquapture {
@@ -21,6 +22,15 @@ enum TlsRecordType : uint8_t {
 	TLS_RECORD_APPLICATION_DATA = 23,
 	TLS_RECORD_HEARTBEAT = 24,
 };
+
+// The version and length checks every record header must pass: an SSL 3.0 to
+// TLS 1.3 version, and a non-empty body within TLS_MAX_RECORD_LENGTH. The major
+// version byte is 0x03 for every TLS and SSL 3.0 version, and TLS 1.3 still
+// writes a 1.2 value here for middlebox compatibility.
+inline bool TlsRecordHeaderValid(const uint8_t *header) {
+	const uint32_t length = static_cast<uint32_t>((header[3] << 8U) | header[4]);
+	return header[1] == 0x03 && header[2] <= 0x04 && length != 0 && length <= TLS_MAX_RECORD_LENGTH;
+}
 
 // The result of parsing one TCP payload as the start of a TLS record. Nothing
 // here spans packets: a field that needs bytes beyond this payload is reported
@@ -60,9 +70,7 @@ inline std::string EscapeTlsText(const std::string &raw) {
 		if (ch >= 33 && ch <= 126 && ch != '\\') {
 			text += static_cast<char>(ch);
 		} else {
-			char escaped[5];
-			std::snprintf(escaped, sizeof(escaped), "\\%03u", static_cast<unsigned>(ch));
-			text += escaped;
+			AppendDecimalEscape(text, ch);
 		}
 	}
 	return text;

@@ -78,10 +78,42 @@ struct TlsList {
 struct TlsCertificate {
 	bool parsed = false;
 	X509Certificate fields;
+	// What this certificate charged to its direction's
+	// max_direction_certificate_bytes, returned if the chain is later dropped.
+	size_t budget_bytes = 0;
 };
 
 // One reported handshake. The key is oriented client to server, whichever
 // direction was actually captured.
+// The reassembly status of a handshake row, or of one direction's parse. UNSET
+// means nothing has been decided yet; every reported row carries another value.
+// CONFLICT and LIMIT also carry a failed TCP stream's status through unchanged.
+enum class TlsStatus : uint8_t { UNSET, COMPLETE, ONE_SIDED, INCOMPLETE, UNANCHORED, INVALID, CONFLICT, LIMIT };
+
+// The reassembly_status text SQL reports for a status.
+inline const char *TlsStatusName(TlsStatus status) {
+	switch (status) {
+	case TlsStatus::UNSET:
+		return "";
+	case TlsStatus::COMPLETE:
+		return "complete";
+	case TlsStatus::ONE_SIDED:
+		return "one-sided";
+	case TlsStatus::INCOMPLETE:
+		return "incomplete";
+	case TlsStatus::UNANCHORED:
+		return "unanchored";
+	case TlsStatus::INVALID:
+		return "invalid";
+	case TlsStatus::CONFLICT:
+		return "conflict";
+	case TlsStatus::LIMIT:
+		return "limit";
+	}
+	PQ_ASSERT(false);
+	return "";
+}
+
 struct TlsHandshake {
 	TcpFlowKey key;
 	bool has_client_stream = false, has_server_stream = false;
@@ -92,6 +124,9 @@ struct TlsHandshake {
 	bool has_client_hello = false;
 	bool has_sni = false;
 	std::string sni;
+	// A server_name extension was seen; a second one, or one that does not parse,
+	// sets sni_malformed and leaves the name unset.
+	bool sni_seen = false, sni_malformed = false;
 	// legacy_version from the ClientHello, which is a compatibility value.
 	bool has_client_version = false;
 	uint16_t client_version = 0;
@@ -142,7 +177,8 @@ struct TlsHandshake {
 	// Only a recognised client prefix names one.
 	std::string tunnel_destination;
 
-	std::string status, error;
+	TlsStatus status = TlsStatus::UNSET;
+	std::string error;
 	// Conditions that leave some columns NULL without being a reassembly
 	// failure, such as an uncaptured side. Stable codes, in a fixed order.
 	std::vector<std::string> warnings;
@@ -171,7 +207,8 @@ private:
 		uint64_t stream_id = 0;
 		bool client = false;
 		PacketStamp first, last;
-		std::string status, error;
+		TlsStatus status = TlsStatus::UNSET;
+		std::string error;
 		// Bytes before the first TLS record, and what they parsed as.
 		uint32_t prefix_bytes = 0;
 		// Found by searching a stream whose SYN was not captured, so its first
@@ -187,9 +224,17 @@ private:
 	static Direction Parse(const TcpStream &stream, const TlsHandshakeLimits &limits);
 	static void ParseRecords(const TcpStream &stream, const TcpStreamChunk &chunk, size_t start,
 	                         const TlsHandshakeLimits &limits, Direction &direction);
-	static std::vector<TlsHandshake> Merge(const Direction &client, const Direction *server);
+	static bool ParseMessages(const TcpStreamChunk &chunk, const std::vector<uint8_t> &handshake_bytes,
+	                          const std::vector<std::pair<size_t, size_t>> &record_spans,
+	                          const TlsHandshakeLimits &limits, Direction &direction);
+	static std::vector<TlsHandshake> Merge(Direction &client, Direction *server);
+	static void MergeClient(const Direction &client, TlsHandshake &from_client, TlsHandshake &handshake);
+	static void MergeServer(const Direction &server, TlsHandshake &from_server, bool has_client,
+	                        TlsHandshake &handshake);
+	static void MergeWarnings(const Direction &client, const Direction *server, const TlsHandshake *from_client,
+	                          const TlsHandshake *from_server, TlsHandshake &handshake);
 	static bool Confirms(const Direction &peer, const Direction &found);
-	static std::vector<TlsHandshake> ReportAlone(const Direction &direction);
+	static std::vector<TlsHandshake> ReportAlone(Direction &direction);
 	bool Hold(Direction &direction);
 	void Release(std::map<TcpFlowKey, Direction>::iterator it);
 	void Refute(const TcpStream &stream);

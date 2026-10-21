@@ -60,10 +60,14 @@ SELECT * FROM read_flows('test/data/flows/tcp.pcap',max_active_flows=0);
 ----
 between 1 and 16384
 
-statement error
-SELECT * FROM read_flows('test/data/flows/scopes.pcapng',max_active_flows=1);
+# A full session table gives up the session nearest its idle deadline, labelled
+# limit, rather than failing the query; every packet is still counted once.
+query II
+SELECT count(*) FILTER (WHERE finalized_by = 'limit') > 0,
+       sum(orig_packets + resp_packets) = (SELECT sum(orig_packets + resp_packets) FROM read_flows('test/data/flows/scopes.pcapng'))
+FROM read_flows('test/data/flows/scopes.pcapng',max_active_flows=1);
 ----
-capacity exceeded
+true	true
 
 statement ok
 SET packetquapture_flow_memory_mb=47;

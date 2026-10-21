@@ -54,13 +54,13 @@ static void TestIdleEviction() {
 		}
 		assert(r.FlowCount() == 1024);
 		auto full = Send(r, Client(9000), 100, 2, {}, At(2000, idle));
-		assert(full.size() == 1 && full[0].status == "limit"); // exactly the timeout is not yet idle
+		assert(full.size() == 1 && full[0].status == TcpStreamStatus::LIMIT); // exactly the timeout is not yet idle
 		auto streams = Send(r, Client(9001), 100, 2, {}, At(2001, idle + 1));
 		assert(streams.empty()); // bare SYNs carry no bytes to report
 		assert(r.FlowCount() == 1);
 		Send(r, Client(9001), 101, 0x18, {'h', 'i'}, At(2002, idle + 1));
 		auto rest = r.FinishNext();
-		assert(rest.size() == 1 && rest[0].status == "contiguous" && rest[0].finalized_by == "eof");
+		assert(rest.size() == 1 && rest[0].status == TcpStreamStatus::CONTIGUOUS && rest[0].finalized_by == "eof");
 		assert(r.Empty());
 	}
 	{
@@ -72,7 +72,7 @@ static void TestIdleEviction() {
 		Send(r, Client(2), 101, 0x18, {'x'}, At(4, 250)); // activity moves the deadline
 		auto evicted = Send(r, Client(3), 100, 2, {}, At(5, 10 + idle + 1));
 		assert(evicted.size() == 1 && evicted[0].key.src_port == 1);
-		assert(evicted[0].status == "contiguous" && evicted[0].finalized_by == "idle_timeout");
+		assert(evicted[0].status == TcpStreamStatus::CONTIGUOUS && evicted[0].finalized_by == "idle_timeout");
 		assert(evicted[0].chunks.size() == 1 && evicted[0].chunks[0].data == std::vector<uint8_t>({'a', 'b', 'c'}));
 		assert(r.FlowCount() == 2 && r.BufferedBytes() == 1);
 		// Traffic after eviction starts a new direction, which lacks its SYN.
@@ -86,7 +86,7 @@ static void TestIdleEviction() {
 		size_t resumed = 0;
 		for (const auto &stream : rest) {
 			if (stream.key.src_port == 1) {
-				assert(stream.status == "unanchored" && stream.stream_id != evicted[0].stream_id);
+				assert(stream.status == TcpStreamStatus::UNANCHORED && stream.stream_id != evicted[0].stream_id);
 				++resumed;
 			}
 		}
@@ -133,7 +133,7 @@ static void TestIdleEviction() {
 		// Directions on the new clock still age normally.
 		auto evicted = Send(r, Client(3), 100, 2, {}, At(6, 2 + idle + 1));
 		assert(evicted.size() == 1 && evicted[0].key.src_port == 2 && evicted[0].finalized_by == "idle_timeout");
-		assert(evicted[0].status == "contiguous" && evicted[0].captured_bytes == 2);
+		assert(evicted[0].status == TcpStreamStatus::CONTIGUOUS && evicted[0].captured_bytes == 2);
 	}
 	{
 		// A zero timeout disables eviction.
@@ -147,7 +147,41 @@ static void TestIdleEviction() {
 	}
 }
 
+// A retransmission is dropped wherever it falls among the buffered segments, and
+// a segment with the same position but other bytes is kept for Finish to judge.
+// The lookup is a binary search, so a full direction stays cheap.
+static void TestDuplicateSegments() {
+	TcpReassembler r;
+	const auto key = Key();
+	assert(Send(r, key, 99, 2, {}, Stamp(1)).empty()); // SYN; data starts at 100
+	const uint32_t count = 4000;
+	uint64_t number = 2;
+	// Out of order: odd segments first, then even, then every one again.
+	for (uint32_t pass = 0; pass < 3; ++pass) {
+		for (uint32_t i = 0; i < count; ++i) {
+			if ((pass == 0 && i % 2 == 0) || (pass == 1 && i % 2 == 1)) {
+				continue;
+			}
+			std::vector<uint8_t> data(4, static_cast<uint8_t>(i));
+			assert(Send(r, key, 100 + i * 4, 0x18, data, Stamp(number++)).empty());
+		}
+	}
+	auto streams = r.FinishNext();
+	assert(streams.size() == 1);
+	assert(streams[0].status == TcpStreamStatus::CONTIGUOUS);
+	assert(streams[0].captured_bytes == count * 4);
+
+	// Same position, different bytes: kept, and reported as a conflict.
+	TcpReassembler conflicting;
+	assert(Send(conflicting, key, 99, 2, {}, Stamp(1)).empty());
+	assert(Send(conflicting, key, 100, 0x18, {1, 2, 3}, Stamp(2)).empty());
+	assert(Send(conflicting, key, 100, 0x18, {1, 9, 3}, Stamp(3)).empty());
+	streams = conflicting.FinishNext();
+	assert(streams.size() == 1 && streams[0].status == TcpStreamStatus::CONFLICT);
+}
+
 int main() {
+	TestDuplicateSegments();
 	std::mt19937 random(998877);
 	for (unsigned run = 0; run < 1000; ++run) {
 		TcpReassembler r;
@@ -174,7 +208,7 @@ int main() {
 		auto streams = r.FinishNext();
 		assert(streams.size() == 1);
 		const auto &stream = streams[0];
-		assert(stream.status == (syn ? "contiguous" : "unanchored"));
+		assert(stream.status == (syn ? TcpStreamStatus::CONTIGUOUS : TcpStreamStatus::UNANCHORED));
 		assert(stream.syn_seen == syn && stream.sequence == base);
 		assert(stream.chunks.size() == 1 && stream.chunks[0].data == data && stream.gaps.empty());
 		assert(stream.captured_bytes == 256 && stream.expected_bytes == 256 && stream.finalized_by == "eof");
@@ -195,7 +229,7 @@ int main() {
 		assert(stream.chunks[0].data == std::vector<uint8_t>({'A', 'B'}));
 		assert(stream.chunks[1].data == std::vector<uint8_t>({'E', 'F'}));
 		assert(stream.captured_bytes == 4 && stream.expected_bytes == 6);
-		assert(stream.status == (syn ? "gapped" : "unanchored"));
+		assert(stream.status == (syn ? TcpStreamStatus::GAPPED : TcpStreamStatus::UNANCHORED));
 	}
 	{
 		TcpReassembler r;
@@ -203,7 +237,7 @@ int main() {
 		Add(r, 101, {0, 255, 0}, 2);
 		Add(r, 102, {254}, 3);
 		auto stream = r.FinishNext()[0];
-		assert(stream.status == "conflict" && stream.chunks.empty());
+		assert(stream.status == TcpStreamStatus::CONFLICT && stream.chunks.empty());
 	}
 	TestIdleEviction();
 	std::cout << "Protocol-neutral TCP checks passed: 1,000 arbitrary binary streams, midstream capture, gaps, "

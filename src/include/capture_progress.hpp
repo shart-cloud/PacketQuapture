@@ -1,5 +1,6 @@
 #pragma once
 
+#include "pq_assert.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -67,7 +68,9 @@ public:
 		consumed.fetch_add(bytes, std::memory_order_relaxed);
 	}
 	void CompleteFile() {
-		if (completed_files.fetch_add(1, std::memory_order_relaxed) + 1 == sizes.size() && !defer_completion) {
+		const auto completed = completed_files.fetch_add(1, std::memory_order_relaxed) + 1;
+		PQ_ASSERT(completed <= sizes.size());
+		if (completed == sizes.size() && !defer_completion) {
 			Finish();
 		}
 	}

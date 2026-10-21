@@ -71,7 +71,7 @@ int main() {
 		auto messages = Finish(r);
 		assert(messages.size() == 2);
 		for (size_t i = 0; i < 2; ++i) {
-			assert(messages[i].status == "complete" && messages[i].data == body);
+			assert(messages[i].status == DnsFrameStatus::COMPLETE && messages[i].data == body);
 			assert(messages[i].sequence == static_cast<uint32_t>(syn + 1 + i * frame.size()));
 			assert(messages[i].message_number == i + 1);
 		}
@@ -84,7 +84,7 @@ int main() {
 		bad[10] ^= 1;
 		Add(r, Key(), 101, 0x18, bad);
 		auto messages = Finish(r);
-		assert(messages.size() == 1 && messages[0].status == "conflict");
+		assert(messages.size() == 1 && messages[0].status == DnsFrameStatus::CONFLICT);
 	}
 	{
 		TcpReassembler r;
@@ -92,12 +92,12 @@ int main() {
 		Add(r, Key(), 101, 0x18, std::vector<uint8_t>(frame.begin(), frame.begin() + 10));
 		Add(r, Key(), 112, 0x18, std::vector<uint8_t>(frame.begin() + 11, frame.end()));
 		auto messages = Finish(r);
-		assert(messages.size() == 1 && messages[0].status == "incomplete");
+		assert(messages.size() == 1 && messages[0].status == DnsFrameStatus::INCOMPLETE);
 	}
 	{
 		TcpReassembler r;
 		Add(r, Key(), 101, 0x18, frame);
-		assert(Finish(r)[0].status == "unanchored");
+		assert(Finish(r)[0].status == DnsFrameStatus::UNANCHORED);
 	}
 	{
 		TcpReassembler r;
@@ -116,7 +116,7 @@ int main() {
 		Add(r, Key().Reverse(), 201, 0x18, {0});
 		auto messages = Add(r, Key(), 102, 4, {});
 		assert(messages.size() == 2 && r.Empty());
-		assert(messages[0].status == "incomplete" && messages[1].status == "incomplete");
+		assert(messages[0].status == DnsFrameStatus::INCOMPLETE && messages[1].status == DnsFrameStatus::INCOMPLETE);
 		assert(r.BufferedBytes() == 0);
 	}
 	for (unsigned kind = 0; kind < 5; ++kind) {
@@ -139,7 +139,7 @@ int main() {
 		TcpReassembler r(limits);
 		auto immediate = Add(r, Key(), 100, 2, frame);
 		auto messages = kind == 4 ? immediate : Finish(r);
-		assert(messages.size() == 1 && messages[0].status == "limit");
+		assert(messages.size() == 1 && messages[0].status == DnsFrameStatus::LIMIT);
 		assert(r.BufferedBytes() == 0);
 	}
 	{
@@ -149,7 +149,8 @@ int main() {
 		Add(r, Key(), 100, 2, frame);
 		Add(r, Key(40001), 100, 2, frame);
 		auto messages = Finish(r);
-		assert(messages.size() == 2 && messages[0].status == "complete" && messages[1].status == "limit");
+		assert(messages.size() == 2 && messages[0].status == DnsFrameStatus::COMPLETE &&
+		       messages[1].status == DnsFrameStatus::LIMIT);
 	}
 	{
 		TcpReassemblyLimits limits;
@@ -170,7 +171,7 @@ int main() {
 			          static_cast<uint8_t>(random() & 0x1fU), data.data(), data.size(), declared, Stamp(i + 1));
 			assert(r.BufferedBytes() <= limits.max_total_bytes && r.FlowCount() <= limits.max_flows);
 			for (const auto &message : messages) {
-				assert(!message.status.empty() && message.captured_bytes <= limits.max_stream_bytes);
+				assert(message.status != TcpStreamStatus::UNSET && message.captured_bytes <= limits.max_stream_bytes);
 			}
 			if (i % 300 == 0) {
 				Finish(r);
@@ -184,7 +185,7 @@ int main() {
 		DnsFramingLimits limits;
 		limits.max_messages = 0;
 		auto messages = FrameTcpDns(r.FinishNext(), limits);
-		assert(messages.size() == 1 && messages[0].status == "limit");
+		assert(messages.size() == 1 && messages[0].status == DnsFrameStatus::LIMIT);
 	}
 	std::cout << "TCP reassembly checks passed: 2,000 reordered/retransmitted/wrapped streams and 20,000 bounded "
 	             "random packets\n";
