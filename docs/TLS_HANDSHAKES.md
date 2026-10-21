@@ -103,7 +103,9 @@ A list is never partial:
   `warnings` says so.
 - **Invalid hello:** a hello that fails to parse reports none of its lists.
 - **Over the limit:** a list longer than `max_list_entries` sets `reassembly_status` to
-  `limit`.
+  `limit`. So does a hello with more than `max_extensions` extensions: the walk stops
+  there, `client_extensions` (or `server_extensions`) is NULL rather than cut short, and
+  the fields parsed from the extensions before the cap are still reported.
 
 Expected values in `read_tls.test` come from tshark 4.2.2.
 `scripts/compare_tls_tshark.py` repeats the comparison for any capture:
@@ -129,7 +131,7 @@ whatever the status. It is `[]` when there are none and is never NULL.
 | `client_hello_missing` | No complete ClientHello was captured, so the client columns are NULL. |
 | `server_hello_missing` | No complete ServerHello was captured, so the server columns are NULL. |
 | `client_hello_invalid`, `server_hello_invalid` | That hello was seen but failed to parse. |
-| `client_list_malformed`, `server_list_malformed` | At least one of that side's lists is NULL because it was malformed. On the server side this includes a malformed `supported_versions`, which leaves `negotiated_version` NULL. |
+| `client_list_malformed`, `server_list_malformed` | At least one of that side's lists is NULL because it was malformed. On the client side this includes `tls_sni`, whose `server_name` extension is a list of names: a second `server_name` extension (RFC 8446 4.2) or one that does not parse leaves `tls_sni` NULL rather than reporting the last copy. On the server side it includes a malformed `supported_versions`, which leaves `negotiated_version` NULL. |
 | `server_certificate_malformed`, `client_certificate_malformed` | That side's Certificate message was malformed, so its column is NULL, or at least one certificate in it did not parse and is a NULL element. |
 | `client_tunnel_unrecognized`, `server_tunnel_unrecognized` | Bytes came before TLS in that direction but did not parse exactly as a known tunnel. The TLS columns are still sound; see below. |
 | `client_prefix_unanchored`, `server_prefix_unanchored` | That direction's SYN was not captured and its hello was found by searching from its first captured byte, so the prefix is counted from there; the other direction's hello confirmed it. See below. |

@@ -1,10 +1,29 @@
 #include "dns_tcp_framer.hpp"
 
+#include "pq_assert.hpp"
+
 #include <iterator>
 
 namespace packetquapture {
 namespace {
-TcpDnsMessage Diagnostic(const TcpStream &stream, const std::string &status, const std::string &error) {
+// The message status of a stream the transport could not reconstruct.
+DnsFrameStatus FailedStreamStatus(TcpStreamStatus status) {
+	switch (status) {
+	case TcpStreamStatus::CONFLICT:
+		return DnsFrameStatus::CONFLICT;
+	case TcpStreamStatus::LIMIT:
+		return DnsFrameStatus::LIMIT;
+	case TcpStreamStatus::UNSET:
+	case TcpStreamStatus::CONTIGUOUS:
+	case TcpStreamStatus::GAPPED:
+	case TcpStreamStatus::UNANCHORED:
+		break;
+	}
+	PQ_ASSERT(false);
+	return DnsFrameStatus::UNSET;
+}
+
+TcpDnsMessage Diagnostic(const TcpStream &stream, DnsFrameStatus status, const std::string &error) {
 	TcpDnsMessage result;
 	result.key = stream.key;
 	result.stream_id = stream.stream_id;
@@ -19,23 +38,26 @@ TcpDnsMessage Diagnostic(const TcpStream &stream, const std::string &status, con
 
 std::vector<TcpDnsMessage> FrameTcpDns(const TcpStream &stream, DnsFramingLimits limits) {
 	std::vector<TcpDnsMessage> result;
-	if (stream.status == "conflict" || stream.status == "limit") {
-		result.push_back(Diagnostic(stream, stream.status, stream.error));
+	if (stream.status == TcpStreamStatus::CONFLICT || stream.status == TcpStreamStatus::LIMIT) {
+		result.push_back(Diagnostic(stream, FailedStreamStatus(stream.status), stream.error));
 		return result;
 	}
 	if (!stream.syn_seen) {
-		result.push_back(
-		    Diagnostic(stream, "unanchored", "TCP SYN was not captured; DNS message alignment is unknown"));
+		result.push_back(Diagnostic(stream, DnsFrameStatus::UNANCHORED,
+		                            "TCP SYN was not captured; DNS message alignment is unknown"));
 		return result;
 	}
 	const auto *chunk = !stream.chunks.empty() && stream.chunks.front().offset == 0 ? &stream.chunks.front() : nullptr;
 	const size_t available = chunk ? chunk->data.size() : 0;
 	size_t offset = 0;
 	uint64_t number = 0;
+	// Each pass consumes one whole frame or stops.
 	while (available - offset >= 2) {
+		PQ_ASSERT(offset <= available);
 		const size_t length = (uint16_t(chunk->data[offset]) << 8U) | chunk->data[offset + 1];
 		if (length < 12) {
-			auto diagnostic = Diagnostic(stream, "invalid", "DNS TCP frame length is shorter than the DNS header");
+			auto diagnostic =
+			    Diagnostic(stream, DnsFrameStatus::INVALID, "DNS TCP frame length is shorter than the DNS header");
 			diagnostic.sequence += static_cast<uint32_t>(offset);
 			result.push_back(std::move(diagnostic));
 			return result;
@@ -45,10 +67,11 @@ std::vector<TcpDnsMessage> FrameTcpDns(const TcpStream &stream, DnsFramingLimits
 		}
 		if (number >= limits.max_messages) {
 			result.clear();
-			result.push_back(Diagnostic(stream, "limit", "DNS message count exceeds per-direction limit"));
+			result.push_back(
+			    Diagnostic(stream, DnsFrameStatus::LIMIT, "DNS message count exceeds per-direction limit"));
 			return result;
 		}
-		auto message = Diagnostic(stream, "complete", "");
+		auto message = Diagnostic(stream, DnsFrameStatus::COMPLETE, "");
 		message.message_number = ++number;
 		message.sequence += static_cast<uint32_t>(offset);
 		const auto provenance = chunk->Provenance(offset, length + 2);
@@ -62,7 +85,7 @@ std::vector<TcpDnsMessage> FrameTcpDns(const TcpStream &stream, DnsFramingLimits
 		// The idle timeout ends a direction as file end does, but a message cut
 		// there may resume later, so it is named rather than called truncated.
 		auto diagnostic =
-		    Diagnostic(stream, "incomplete",
+		    Diagnostic(stream, DnsFrameStatus::INCOMPLETE,
 		               !stream.gaps.empty()                    ? "missing TCP bytes leave a sequence gap"
 		               : stream.finalized_by == "idle_timeout" ? "incomplete DNS TCP frame at idle timeout"
 		                                                       : "incomplete DNS TCP frame at end of stream");

@@ -65,6 +65,8 @@ private:
 	PcapWriterOptions options;
 	State state = State::OPEN;
 	uint64_t packets = 0, bytes = 24;
+	// The largest captured length written, the default snaplen. It starts at 1, not
+	// 0, because a PCAP snaplen of 0 is invalid and a file may hold no packets.
 	uint32_t maximum_capture = 1;
 };
 

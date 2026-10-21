@@ -1,8 +1,7 @@
 // Linux integration test against the built DuckDB library (including this extension).
 // Observe live capture descriptors, interrupt actual queries, and reuse the connection.
 #include "duckdb.hpp"
-#include "stream_scan_budget.hpp"
-#include "flow_scan_budget.hpp"
+#include "scan_budget.hpp"
 
 #include <chrono>
 #include <filesystem>

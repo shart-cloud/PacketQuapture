@@ -599,7 +599,22 @@ void TestFuzz() {
 
 } // namespace
 
+// A name's attribute count has a fixed bound, so a hostile certificate cannot make
+// one subject string as large as the certificate allows.
+void TestNameAttributeLimit() {
+	std::vector<Bytes> attributes(256, Attribute(OU, Text(0x0C, "x")));
+	Spec spec;
+	spec.subject = Name(attributes);
+	X509Certificate out;
+	assert(Parse(Certificate(spec), out) == X509Result::OK);
+	attributes.push_back(Attribute(OU, Text(0x0C, "x")));
+	spec.subject = Name(attributes);
+	assert(Parse(Certificate(spec), out) == X509Result::OVER_LIMIT);
+	assert(out.subject.empty());
+}
+
 int main() {
+	TestNameAttributeLimit();
 	TestAlgorithmsAndKeys();
 	TestConstraintsAndUsage();
 	TestIdentifiersAndLocations();

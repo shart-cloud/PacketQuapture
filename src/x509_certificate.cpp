@@ -1,6 +1,7 @@
 #include "x509_certificate.hpp"
 
 #include "tls_record.hpp"
+#include "text_escape.hpp"
 
 #include <cstdio>
 
@@ -288,9 +289,7 @@ std::string EscapeRfc4514(const std::string &value) {
 		const auto ch = static_cast<unsigned char>(value[i]);
 		const size_t length = Utf8Length(value, i);
 		if (length == 0 || ch < 0x20 || ch == 0x7F) {
-			char escaped[4];
-			std::snprintf(escaped, sizeof(escaped), "\\%02X", static_cast<unsigned>(ch));
-			out += escaped;
+			AppendHexEscape(out, ch);
 			++i;
 			continue;
 		}
@@ -365,28 +364,37 @@ void AppendOid(const Element &oid, std::string &list) {
 	list += Hex(oid.content, oid.length);
 }
 
-bool DecodeName(const Element &name, std::string &out, std::string &types) {
+// Real names hold a handful of attributes; a name with more than this is
+// OVER_LIMIT rather than bounded only by the certificate's size. It is fixed, not
+// max_list_entries, whose documented reach is the SAN and EKU lists.
+const size_t MAX_NAME_ATTRIBUTES = 256;
+
+X509Result DecodeName(const Element &name, std::string &out, std::string &types) {
 	if (name.tag != TAG_SEQUENCE) {
-		return false;
+		return X509Result::MALFORMED;
 	}
 	std::vector<std::vector<std::string>> rdns;
+	size_t entries = 0;
 	Der sequence(name.content, name.length);
 	while (!sequence.AtEnd()) {
 		Element set;
 		if (!sequence.Expect(TAG_SET, set) || set.length == 0) {
-			return false;
+			return X509Result::MALFORMED;
 		}
 		std::vector<std::string> rdn;
 		Der attributes(set.content, set.length);
 		while (!attributes.AtEnd()) {
 			Element pair, type, value;
 			if (!attributes.Expect(TAG_SEQUENCE, pair)) {
-				return false;
+				return X509Result::MALFORMED;
 			}
 			Der fields(pair.content, pair.length);
 			std::string oid, text;
 			if (!fields.Expect(TAG_OID, type) || !fields.Next(value) || !fields.AtEnd() || !DecodeOid(type, oid)) {
-				return false;
+				return X509Result::MALFORMED;
+			}
+			if (++entries > MAX_NAME_ATTRIBUTES) {
+				return X509Result::OVER_LIMIT;
 			}
 			AppendOid(type, types);
 			const char *short_name = ShortName(oid);
@@ -411,7 +419,7 @@ bool DecodeName(const Element &name, std::string &out, std::string &types) {
 			out += ',';
 		}
 	}
-	return true;
+	return X509Result::OK;
 }
 
 bool Digits(const uint8_t *p, size_t count, int &out) {
@@ -625,6 +633,11 @@ uint32_t IntegerBits(const Element &integer) {
 	if (i == integer.length) {
 		return 0;
 	}
+	// Past 2^28 bytes the bit count would not fit; no real key is near that, and
+	// the size is reported unknown rather than truncated.
+	if (integer.length - i > (size_t(1) << 28)) {
+		return 0;
+	}
 	uint32_t bits = static_cast<uint32_t>((integer.length - i - 1) * 8);
 	for (uint8_t top = integer.content[i]; top != 0; top >>= 1U) {
 		++bits;
@@ -645,7 +658,9 @@ void DecodePublicKey(const Element &info, X509Certificate &out) {
 	}
 	Der parameters(algorithm.content, algorithm.length);
 	Element skipped, parameter;
-	parameters.Next(skipped);
+	if (!parameters.Next(skipped)) { // the OID AlgorithmOf just read
+		return;
+	}
 	const bool has_parameter = !parameters.AtEnd() && parameters.Next(parameter);
 	if (oid == "1.2.840.10045.2.1") {
 		std::string curve;
@@ -822,13 +837,19 @@ bool DecodeAuthorityKeyId(const Element &value, X509Certificate &out) {
 	int last = -1;
 	while (!fields.AtEnd()) {
 		Element field;
-		// [0] and [2] are primitive, [1] (GeneralNames) constructed.
+		// [0] and [2] are primitive, [1] (GeneralNames) constructed. The low five
+		// bits of a context tag are its number, which must be 0, 1 or 2, carry
+		// exactly the class and form above, and rise strictly: RFC 5280 4.2.1.1
+		// fixes the field order and DER forbids repeats.
 		static const uint8_t tags[] = {0x80, 0xA1, 0x82};
-		if (!fields.Next(field) || (field.tag & 0x1FU) > 2 || field.tag != tags[field.tag & 0x1FU] ||
-		    static_cast<int>(field.tag & 0x1FU) <= last) {
+		if (!fields.Next(field)) {
 			return false;
 		}
-		last = field.tag & 0x1FU;
+		const unsigned number = field.tag & 0x1FU;
+		if (number > 2 || field.tag != tags[number] || static_cast<int>(number) <= last) {
+			return false;
+		}
+		last = static_cast<int>(number);
 		if (field.tag == TAG_CONTEXT_0) {
 			if (field.length == 0) {
 				return false;
@@ -970,6 +991,94 @@ X509Result DecodePolicies(const Element &value, size_t max_entries, X509Certific
 	return X509Result::OK;
 }
 
+// How many times each extension read here has been seen in one certificate.
+struct ExtensionCopies {
+	bool seen_san = false;
+	size_t basic = 0, usage = 0, purpose = 0, subject_id = 0, authority_id = 0, access = 0, crl = 0, policy = 0;
+};
+
+// Frames one Extension ::= SEQUENCE { extnID OID, critical BOOLEAN DEFAULT
+// FALSE, extnValue OCTET STRING }, recording its OID.
+bool FrameExtension(const Element &extension, std::string &oid, Element &value, X509Certificate &out) {
+	Der fields(extension.content, extension.length);
+	Element id;
+	if (!fields.Expect(TAG_OID, id) || !DecodeOid(id, oid)) {
+		return false;
+	}
+	AppendOid(id, out.extension_oids);
+	if (fields.PeekTag() == TAG_BOOLEAN) {
+		Element critical;
+		if (!fields.Next(critical)) {
+			return false;
+		}
+	}
+	return fields.Expect(TAG_OCTET_STRING, value) && fields.AtEnd();
+}
+
+// Decodes one extension's value by its OID. Only a repeated or malformed
+// subjectAltName, or a list over the limit, fails the certificate.
+X509Result DecodeExtension(const std::string &oid, const Element &value, size_t max_entries, ExtensionCopies &copies,
+                           X509Certificate &out) {
+	if (oid == "2.5.29.17") {
+		if (copies.seen_san) {
+			return X509Result::MALFORMED;
+		}
+		copies.seen_san = true;
+		return DecodeSubjectAltName(value, max_entries, out);
+	} else if (oid == "2.5.29.19") {
+		if (++copies.basic > 1 || !DecodeBasicConstraints(value, out)) {
+			out.has_basic_constraints = out.is_ca = out.has_path_length = false;
+			out.path_length = 0;
+		}
+	} else if (oid == "2.5.29.15") {
+		if (++copies.usage > 1 || !DecodeKeyUsage(value, out)) {
+			out.has_key_usage = false;
+			out.key_usage.clear();
+		}
+	} else if (oid == "2.5.29.37") {
+		// Too many purposes is a limit, as too many names is: it bounds memory.
+		const auto result =
+		    ++copies.purpose > 1 ? X509Result::MALFORMED : DecodeExtendedKeyUsage(value, max_entries, out);
+		if (result == X509Result::OVER_LIMIT) {
+			return result;
+		}
+		if (result != X509Result::OK) {
+			out.has_extended_key_usage = false;
+			out.extended_key_usage.clear();
+		}
+	} else if (oid == "2.5.29.14") {
+		if (++copies.subject_id > 1 || !DecodeSubjectKeyId(value, out)) {
+			out.subject_key_id.clear();
+		}
+	} else if (oid == "2.5.29.35") {
+		if (++copies.authority_id > 1 || !DecodeAuthorityKeyId(value, out)) {
+			out.authority_key_id.clear();
+		}
+	} else if (oid == "1.3.6.1.5.5.7.1.1") {
+		const auto result =
+		    ++copies.access > 1 ? X509Result::MALFORMED : DecodeAuthorityInfoAccess(value, max_entries, out);
+		if (result != X509Result::OK) {
+			out.has_authority_info_access = false;
+			out.ocsp_urls.clear();
+			out.ca_issuers_urls.clear();
+		}
+	} else if (oid == "2.5.29.31") {
+		const auto result =
+		    ++copies.crl > 1 ? X509Result::MALFORMED : DecodeCrlDistributionPoints(value, max_entries, out);
+		if (result != X509Result::OK) {
+			out.has_crl_distribution_points = false;
+			out.crl_urls.clear();
+		}
+	} else if (oid == "2.5.29.32") {
+		const auto result = ++copies.policy > 1 ? X509Result::MALFORMED : DecodePolicies(value, max_entries, out);
+		if (result != X509Result::OK) {
+			out.has_policies = false;
+			out.policies.clear();
+		}
+	}
+	return X509Result::OK;
+}
+
 X509Result DecodeExtensions(const Element &wrapper, size_t max_entries, X509Certificate &out) {
 	Der explicit_tag(wrapper.content, wrapper.length);
 	Element extensions;
@@ -980,88 +1089,72 @@ X509Result DecodeExtensions(const Element &wrapper, size_t max_entries, X509Cert
 	// subjectAltName makes the certificate malformed, as it always has. The
 	// other extensions read here only add fields, so a malformed or repeated
 	// one leaves its field unknown instead.
-	bool seen_san = false;
-	size_t basic_copies = 0, usage_copies = 0, purpose_copies = 0, subject_id_copies = 0, authority_id_copies = 0,
-	       access_copies = 0, crl_copies = 0, policy_copies = 0;
+	ExtensionCopies copies;
 	Der list(extensions.content, extensions.length);
 	while (!list.AtEnd()) {
-		Element extension, id, value;
-		if (!list.Expect(TAG_SEQUENCE, extension)) {
-			return X509Result::MALFORMED;
-		}
-		Der fields(extension.content, extension.length);
+		Element extension, value;
 		std::string oid;
-		if (!fields.Expect(TAG_OID, id) || !DecodeOid(id, oid)) {
+		if (!list.Expect(TAG_SEQUENCE, extension) || !FrameExtension(extension, oid, value, out)) {
 			return X509Result::MALFORMED;
 		}
-		AppendOid(id, out.extension_oids);
-		if (fields.PeekTag() == TAG_BOOLEAN) {
-			Element critical;
-			fields.Next(critical);
+		const auto result = DecodeExtension(oid, value, max_entries, copies, out);
+		if (result != X509Result::OK) {
+			return result;
 		}
-		if (!fields.Expect(TAG_OCTET_STRING, value) || !fields.AtEnd()) {
+	}
+	return X509Result::OK;
+}
+
+// TBSCertificate ::= SEQUENCE { version [0] OPTIONAL, serialNumber, signature,
+//     issuer, validity, subject, subjectPublicKeyInfo, issuerUniqueID [1]
+//     OPTIONAL, subjectUniqueID [2] OPTIONAL, extensions [3] OPTIONAL }
+X509Result DecodeTbs(const Element &tbs, size_t max_entries, X509Certificate &out) {
+	Der fields(tbs.content, tbs.length);
+	Element element, serial, validity, issuer, subject;
+	if (fields.PeekTag() == TAG_VERSION && !fields.Next(element)) {
+		return X509Result::MALFORMED;
+	}
+	if (!fields.Expect(TAG_INTEGER, serial) || serial.length == 0) {
+		return X509Result::MALFORMED;
+	}
+	out.serial = Hex(serial.content, serial.length);
+	if (!fields.Expect(TAG_SEQUENCE, element) || !fields.Next(issuer)) {
+		return X509Result::MALFORMED;
+	}
+	const auto issuer_result = DecodeName(issuer, out.issuer, out.issuer_oids);
+	if (issuer_result != X509Result::OK) {
+		return issuer_result;
+	}
+	if (!fields.Expect(TAG_SEQUENCE, validity)) {
+		return X509Result::MALFORMED;
+	}
+	Der times(validity.content, validity.length);
+	Element not_before, not_after;
+	if (!times.Next(not_before) || !times.Next(not_after) || !times.AtEnd() ||
+	    !DecodeTime(not_before, out.not_before) || !DecodeTime(not_after, out.not_after)) {
+		return X509Result::MALFORMED;
+	}
+	if (!fields.Next(subject)) {
+		return X509Result::MALFORMED;
+	}
+	const auto subject_result = DecodeName(subject, out.subject, out.subject_oids);
+	if (subject_result != X509Result::OK) {
+		return subject_result;
+	}
+	if (!fields.Expect(TAG_SEQUENCE, element)) { // subjectPublicKeyInfo
+		return X509Result::MALFORMED;
+	}
+	DecodePublicKey(element, out);
+	for (const uint8_t optional : {TAG_ISSUER_UID, TAG_SUBJECT_UID}) {
+		if (fields.PeekTag() == optional && !fields.Next(element)) {
 			return X509Result::MALFORMED;
 		}
-		if (oid == "2.5.29.17") {
-			if (seen_san) {
-				return X509Result::MALFORMED;
-			}
-			seen_san = true;
-			const auto result = DecodeSubjectAltName(value, max_entries, out);
-			if (result != X509Result::OK) {
-				return result;
-			}
-		} else if (oid == "2.5.29.19") {
-			if (++basic_copies > 1 || !DecodeBasicConstraints(value, out)) {
-				out.has_basic_constraints = out.is_ca = out.has_path_length = false;
-				out.path_length = 0;
-			}
-		} else if (oid == "2.5.29.15") {
-			if (++usage_copies > 1 || !DecodeKeyUsage(value, out)) {
-				out.has_key_usage = false;
-				out.key_usage.clear();
-			}
-		} else if (oid == "2.5.29.37") {
-			// Too many purposes is a limit, as too many names is: it bounds memory.
-			const auto result =
-			    ++purpose_copies > 1 ? X509Result::MALFORMED : DecodeExtendedKeyUsage(value, max_entries, out);
-			if (result == X509Result::OVER_LIMIT) {
-				return result;
-			}
-			if (result != X509Result::OK) {
-				out.has_extended_key_usage = false;
-				out.extended_key_usage.clear();
-			}
-		} else if (oid == "2.5.29.14") {
-			if (++subject_id_copies > 1 || !DecodeSubjectKeyId(value, out)) {
-				out.subject_key_id.clear();
-			}
-		} else if (oid == "2.5.29.35") {
-			if (++authority_id_copies > 1 || !DecodeAuthorityKeyId(value, out)) {
-				out.authority_key_id.clear();
-			}
-		} else if (oid == "1.3.6.1.5.5.7.1.1") {
-			const auto result =
-			    ++access_copies > 1 ? X509Result::MALFORMED : DecodeAuthorityInfoAccess(value, max_entries, out);
-			if (result != X509Result::OK) {
-				out.has_authority_info_access = false;
-				out.ocsp_urls.clear();
-				out.ca_issuers_urls.clear();
-			}
-		} else if (oid == "2.5.29.31") {
-			const auto result =
-			    ++crl_copies > 1 ? X509Result::MALFORMED : DecodeCrlDistributionPoints(value, max_entries, out);
-			if (result != X509Result::OK) {
-				out.has_crl_distribution_points = false;
-				out.crl_urls.clear();
-			}
-		} else if (oid == "2.5.29.32") {
-			const auto result = ++policy_copies > 1 ? X509Result::MALFORMED : DecodePolicies(value, max_entries, out);
-			if (result != X509Result::OK) {
-				out.has_policies = false;
-				out.policies.clear();
-			}
+	}
+	if (!fields.AtEnd()) {
+		if (!fields.Expect(TAG_EXTENSIONS, element) || !fields.AtEnd()) {
+			return X509Result::MALFORMED;
 		}
+		return DecodeExtensions(element, max_entries, out);
 	}
 	return X509Result::OK;
 }
@@ -1084,52 +1177,8 @@ X509Result Parse(const uint8_t *data, size_t size, size_t max_entries, X509Certi
 		return X509Result::MALFORMED;
 	}
 	// Naming the algorithm adds a field; an OID that cannot be read leaves it unknown.
-	AlgorithmOf(algorithm, signature_oid, out.signature_algorithm);
-
-	Der fields(tbs.content, tbs.length);
-	Element element, serial, validity, issuer, subject;
-	if (fields.PeekTag() == TAG_VERSION && !fields.Next(element)) {
-		return X509Result::MALFORMED;
-	}
-	if (!fields.Expect(TAG_INTEGER, serial) || serial.length == 0) {
-		return X509Result::MALFORMED;
-	}
-	out.serial = Hex(serial.content, serial.length);
-	if (!fields.Expect(TAG_SEQUENCE, element) || !fields.Next(issuer) ||
-	    !DecodeName(issuer, out.issuer, out.issuer_oids)) {
-		return X509Result::MALFORMED;
-	}
-	if (!fields.Expect(TAG_SEQUENCE, validity)) {
-		return X509Result::MALFORMED;
-	}
-	Der times(validity.content, validity.length);
-	Element not_before, not_after;
-	if (!times.Next(not_before) || !times.Next(not_after) || !times.AtEnd() ||
-	    !DecodeTime(not_before, out.not_before) || !DecodeTime(not_after, out.not_after)) {
-		return X509Result::MALFORMED;
-	}
-	if (!fields.Next(subject) || !DecodeName(subject, out.subject, out.subject_oids)) {
-		return X509Result::MALFORMED;
-	}
-	if (!fields.Expect(TAG_SEQUENCE, element)) { // subjectPublicKeyInfo
-		return X509Result::MALFORMED;
-	}
-	DecodePublicKey(element, out);
-	for (const uint8_t optional : {TAG_ISSUER_UID, TAG_SUBJECT_UID}) {
-		if (fields.PeekTag() == optional && !fields.Next(element)) {
-			return X509Result::MALFORMED;
-		}
-	}
-	if (!fields.AtEnd()) {
-		if (!fields.Expect(TAG_EXTENSIONS, element) || !fields.AtEnd()) {
-			return X509Result::MALFORMED;
-		}
-		const auto result = DecodeExtensions(element, max_entries, out);
-		if (result != X509Result::OK) {
-			return result;
-		}
-	}
-	return X509Result::OK;
+	(void)AlgorithmOf(algorithm, signature_oid, out.signature_algorithm);
+	return DecodeTbs(tbs, max_entries, out);
 }
 
 } // namespace
@@ -1137,7 +1186,7 @@ X509Result Parse(const uint8_t *data, size_t size, size_t max_entries, X509Certi
 X509Result ParseX509Certificate(const uint8_t *data, size_t size, size_t max_entries, X509Certificate &out) {
 	X509Certificate parsed;
 	const auto result = Parse(data, size, max_entries, parsed);
-	out = result == X509Result::OK ? parsed : X509Certificate();
+	out = result == X509Result::OK ? std::move(parsed) : X509Certificate();
 	return result;
 }
 

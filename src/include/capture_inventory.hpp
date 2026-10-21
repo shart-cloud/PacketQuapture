@@ -57,15 +57,16 @@ struct InventoryTotals {
 		Add(packets, 1);
 		Add(captured, cap);
 		Add(reported, orig);
-		if (!has_time)
+		if (!has_time) {
 			Add(null_timestamps, 1);
-		else {
+		} else {
 			minimum = timed ? MinValue(minimum, time) : time;
 			maximum = timed ? MaxValue(maximum, time) : time;
 			timed = true;
 		}
-		if (!protocols)
+		if (!protocols) {
 			return;
+		}
 		Add(ipv4, p.network && p.ip_version == 4);
 		Add(ipv6, p.network && p.ip_version == 6);
 		Add(tcp, p.tcp);

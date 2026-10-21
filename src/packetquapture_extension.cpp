@@ -3,11 +3,9 @@
 #include "packetquapture_extension.hpp"
 #include "pcap_copy.hpp"
 #include "capture_progress.hpp"
-#include "stream_scan_budget.hpp"
-#include "flow_scan_budget.hpp"
+#include "scan_budget.hpp"
 #include "flow_aggregator.hpp"
 #include "capture_inventory.hpp"
-#include "inventory_scan_budget.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -29,6 +27,7 @@
 #include "dns_analytics.hpp"
 #include "sparse_readahead.hpp"
 #include "traffic_analytics.hpp"
+#include "pq_assert.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -84,6 +83,12 @@ constexpr idx_t LOCAL_SKIP_THRESHOLD = 4ULL * 1024ULL;
 // Wider gaps are left to seek.
 constexpr idx_t LOCAL_READAHEAD_MAX_GAP = 256ULL * 1024ULL;
 constexpr idx_t MAX_CAPTURED_PACKET_SIZE = 256ULL * 1024ULL * 1024ULL;
+// Packet bytes are read in steps no larger than this, so a header that lies
+// about its length costs at most one step before the read hits end of file.
+constexpr idx_t PACKET_READ_STEP = 1024ULL * 1024ULL;
+// Interfaces per PCAPNG section. Real captures have a handful; each one costs
+// memory for the rest of the section, so a file cannot add them without bound.
+constexpr idx_t MAX_PCAPNG_INTERFACES = 65536;
 constexpr idx_t MAX_INTERFACE_BLOCK_SIZE = 16ULL * 1024ULL * 1024ULL;
 constexpr uint32_t PCAPNG_INTERFACE_DESCRIPTION = 0x00000001;
 constexpr uint32_t PCAPNG_SIMPLE_PACKET = 0x00000003;
@@ -170,6 +175,24 @@ static_assert(static_cast<unsigned>(packetquapture::DecodeDepth::LINK) == STAGE_
 // read_dns appends its own after those. Value dispatch is index-based, so the
 // boundaries live here rather than as literals at each site.
 static const column_t PACKET_COLUMN_COUNT = 11;
+// Stream and flow scans end an output batch once its estimated size passes a
+// limit, so one batch of large rows cannot exhaust memory. The estimates are
+// deliberately conservative, not measured: a fixed share per row for its scalar
+// columns and vector overhead, plus each variable-size field.
+static const idx_t ROW_BASE_BYTES = 1024;
+// One list element: its list entry, validity bit and value.
+static const idx_t LIST_ENTRY_BYTES = 32;
+// Payload bytes are charged several times over: the row's own copy, the copies
+// a batch keeps while it is built, and string headers.
+static const idx_t PAYLOAD_COPIES = 4;
+// A decoded DNS resource record: its name, text form, raw data and struct.
+static const idx_t DNS_RECORD_BYTES = 4096;
+// A certificate struct's fixed fields, before its text.
+static const idx_t CERTIFICATE_BASE_BYTES = 512;
+// read_packets column groups, in schema order; PacketsBind checks them against the names.
+static const column_t NETWORK_COLUMNS_BEGIN = 15;
+static const column_t TRANSPORT_COLUMNS_BEGIN = 23;
+static const column_t TCP_FLAG_COLUMNS_BEGIN = 32;
 static const column_t TLS_COLUMN_BEGIN = 40;
 static const column_t TLS_COLUMN_COUNT = 6;
 static const column_t DNS_COLUMN_BEGIN = TLS_COLUMN_BEGIN + TLS_COLUMN_COUNT;
@@ -178,6 +201,8 @@ static const column_t DNS_COLUMN_COUNT = 14;
 // per-message columns, so it remaps into the block above.
 static const column_t MESSAGE_DNS_COLUMN_BEGIN = 20;
 static const column_t MESSAGE_DNS_COLUMN_END = MESSAGE_DNS_COLUMN_BEGIN + DNS_COLUMN_COUNT;
+
+class PacketFilter;
 
 struct ScanOptions {
 	bool materialize_packet_data = false;
@@ -188,7 +213,9 @@ struct ScanOptions {
 	bool reassemble_dns = false, reassemble_tcp = false;
 	packetquapture::DecodeDepth decode_depth = packetquapture::DecodeDepth::NONE;
 	std::array<bool, STAGE_COUNT> filter_stages {};
-	std::function<bool(const PacketRecord &, unsigned)> matches;
+	// The pushed-down filters of the scanning thread, set where filter_stages has
+	// any stage; owned by that thread's local state.
+	vector<unique_ptr<PacketFilter>> *filters = nullptr;
 };
 
 class PacketFilter {
@@ -205,7 +232,6 @@ public:
 		input.Reset();
 		input.SetCardinality(1);
 		SetRecordValue(input.data[0], 0, column, record);
-		SelectionVector selected(1);
 		return executor->SelectExpression(input, selected) == 1;
 	}
 	column_t column;
@@ -215,7 +241,19 @@ private:
 	unique_ptr<Expression> expression;
 	unique_ptr<ExpressionExecutor> executor;
 	DataChunk input;
+	SelectionVector selected {1}; // one row per call, allocated once
 };
+
+// Whether a record passes every filter that applies at stage.
+static bool FiltersMatch(vector<unique_ptr<PacketFilter>> *filters, const PacketRecord &record, unsigned stage) {
+	PQ_ASSERT(filters != nullptr); // a filtered stage implies installed filters
+	for (auto &filter : *filters) {
+		if (filter->stage == stage && !filter->Matches(record)) {
+			return false;
+		}
+	}
+	return true;
+}
 
 struct CaptureGlobalState : public GlobalTableFunctionState {
 	CaptureProgress progress;
@@ -279,6 +317,10 @@ public:
 				progress->CompleteFile();
 			}
 			return false;
+		} catch (const packetquapture::AssertionFailure &) {
+			// A bug, not a capture error: it keeps its own message and type so no
+			// handler further up mistakes it for a bad file.
+			throw;
 		} catch (const std::exception &exception) {
 			ErrorData error(exception);
 			if (error.Type() == ExceptionType::INTERRUPT) {
@@ -335,6 +377,7 @@ private:
 			window = cached_handle->Read(window_data, window_length, window_start);
 		}
 		const auto within_window = offset - window_start;
+		PQ_ASSERT(within_window < window_length);
 		const auto count = MinValue<idx_t>(length, window_length - within_window);
 		memcpy(buffer, window_data + within_window, count);
 		return count;
@@ -368,6 +411,8 @@ private:
 			fs.Read(*handle, local_window.get(), NumericCast<int64_t>(local_length), local_start);
 		}
 		const auto within_window = offset - local_start;
+		PQ_ASSERT(within_window < local_length);
+		PQ_ASSERT(local_length <= LOCAL_READ_WINDOW_SIZE);
 		const auto count = MinValue<idx_t>(length, local_length - within_window);
 		memcpy(buffer, local_window.get() + within_window, count);
 		return count;
@@ -470,7 +515,7 @@ private:
 		const auto original_length = ReadU32(header.data() + 12, order);
 		ValidatePacketLength(captured_length);
 
-		record = PacketRecord();
+		ResetRecord(record);
 		record.filename = file.path;
 		record.packet_number = ++packet_number;
 		record.has_timestamp = true;
@@ -485,6 +530,8 @@ private:
 		return true;
 	}
 
+	// Each pass consumes a block of at least 12 bytes (a section header 28) or
+	// returns, so the loop is bounded by the file's size over 12.
 	bool NextPcapNg(PacketRecord &record) {
 		while (true) {
 			std::array<uint8_t, 8> header {};
@@ -552,10 +599,12 @@ private:
 			}
 			offset += padded_length;
 		}
-		// Bound stream-worker metadata independently of capture size.
-		if ((options.reassemble_tcp || options.reassemble_dns || options.flow_scan || options.inventory_scan) &&
-		    interfaces.size() >= 65536) {
-			throw InvalidInputException("Stream scan exceeds 65536 PCAPNG interfaces per section in '%s'", file.path);
+		// Bound interface metadata independently of capture size, for every scan: a
+		// file of nothing but interface blocks would otherwise grow this list by one
+		// entry per 20 bytes. No real capture comes near the cap.
+		if (interfaces.size() >= MAX_PCAPNG_INTERFACES) {
+			throw InvalidInputException("Capture exceeds %d PCAPNG interfaces per section in '%s'",
+			                            MAX_PCAPNG_INTERFACES, file.path);
 		}
 		interfaces.push_back(interface);
 		if (options.inventory_scan) {
@@ -583,7 +632,7 @@ private:
 			throw InvalidInputException("Truncated PCAPNG packet in '%s'", file.path);
 		}
 
-		record = PacketRecord();
+		ResetRecord(record);
 		record.filename = file.path;
 		record.packet_number = ++packet_number;
 		record.has_timestamp = true;
@@ -612,6 +661,8 @@ private:
 		ReadExact(prefix.data(), prefix.size(), "PCAPNG simple packet block");
 		const auto original_length = ReadU32(prefix.data(), order);
 		const auto available = body_size - 4;
+		// A simple packet block records no captured length: it is the original
+		// length cut to the interface's snap length, where 0 means no limit.
 		const auto snap_length = interfaces[0].snap_length == 0 ? original_length : interfaces[0].snap_length;
 		const auto captured_length = static_cast<uint32_t>(MinValue<idx_t>(original_length, snap_length));
 		ValidatePacketLength(captured_length);
@@ -619,7 +670,7 @@ private:
 			throw InvalidInputException("Truncated PCAPNG simple packet in '%s'", file.path);
 		}
 
-		record = PacketRecord();
+		ResetRecord(record);
 		record.filename = file.path;
 		record.packet_number = ++packet_number;
 		record.captured_length = captured_length;
@@ -633,43 +684,105 @@ private:
 		ReadAndValidateTrailer(block_length);
 	}
 
-	void ReadPacketData(PacketRecord &record, idx_t length) {
-		class HeaderSource : public packetquapture::PacketSource {
-		public:
-			HeaderSource(CaptureReader &reader_p, idx_t length_p) : reader(reader_p), length(length_p) {
-			}
-			size_t Size() const override {
-				return length;
-			}
-			const uint8_t *ReadPrefix(size_t requested) override {
-				const auto previous = bytes.size();
-				if (requested > previous) {
-					bytes.resize(requested);
-					reader.ReadExact(bytes.data() + previous, requested - previous, "packet header");
-				}
-				return bytes.data();
-			}
-			idx_t Consumed() const {
-				return bytes.size();
-			}
-			vector<uint8_t> TakeBytes() {
-				return std::move(bytes);
-			}
+	// Clears a record for the next packet but keeps its buffers' capacity: one
+	// record is reused for a whole scan, so a packet costs no allocation once
+	// the buffers have grown to the capture's largest packet.
+	static void ResetRecord(PacketRecord &record) {
+		record.filename.clear();
+		record.packet_data.clear();
+		record.transport_data.clear();
+		record.packet_number = 0;
+		record.has_timestamp = false;
+		record.timestamp = timestamp_t();
+		record.captured_length = record.original_length = record.link_type = record.interface_id = 0;
+		record.packet_offset = 0;
+		record.format = CaptureFormat::PCAP;
+		record.section_number = 0;
+		record.decoded = packetquapture::DecodedPacket();
+		record.dns = packetquapture::DnsMessage();
+		record.tls = packetquapture::TlsRecord();
+		record.selected = true;
+	}
 
-		private:
-			CaptureReader &reader;
-			idx_t length;
-			vector<uint8_t> bytes;
-		};
-		HeaderSource source(*this, length);
-		auto accept = [&](unsigned stage) {
-			if (options.filter_stages[stage] && !options.matches(record, stage)) {
-				record.selected = false;
-				return false;
+	// The bytes of one packet record, read only as far as some consumer asks.
+	class PacketPrefix : public packetquapture::PacketSource {
+	public:
+		PacketPrefix(CaptureReader &reader_p, idx_t length_p, vector<uint8_t> &bytes_p)
+		    : reader(reader_p), length(length_p), bytes(bytes_p) {
+			bytes.clear();
+		}
+		size_t Size() const override {
+			return length;
+		}
+		// Grows in steps of at most PACKET_READ_STEP, so on a stream whose size
+		// is unknown a header claiming a huge packet costs one step of memory
+		// past the end of the file, not the whole claimed length.
+		const uint8_t *ReadPrefix(size_t requested) override {
+			PQ_ASSERT(requested <= length);
+			while (bytes.size() < requested) {
+				const auto previous = bytes.size();
+				const auto step = MinValue<idx_t>(requested - previous, PACKET_READ_STEP);
+				bytes.resize(previous + step);
+				reader.ReadExact(bytes.data() + previous, step, "packet header");
 			}
-			return true;
-		};
-		if (!accept(0)) {
+			return bytes.data();
+		}
+		// The rest of the record, after whatever the decoders read.
+		idx_t Unread() const {
+			PQ_ASSERT(bytes.size() <= length);
+			return length - bytes.size();
+		}
+		const vector<uint8_t> &Bytes() const {
+			return bytes;
+		}
+
+	private:
+		CaptureReader &reader;
+		idx_t length;
+		vector<uint8_t> &bytes;
+	};
+
+	// Whether the record passes the filters pushed down to stage; one that fails
+	// is deselected, and the caller skips the rest of its bytes.
+	bool Accept(PacketRecord &record, unsigned stage) const {
+		if (options.filter_stages[stage] && !FiltersMatch(options.filters, record, stage)) {
+			record.selected = false;
+			return false;
+		}
+		return true;
+	}
+
+	// read_dns parses one message per packet. Over TCP that is the RFC 1035 4.2.2
+	// framing with exactly one whole message in the segment; reassembled
+	// messages are read_dns_messages' job.
+	static void DecodeDnsPayload(PacketRecord &record, const uint8_t *bytes) {
+		const auto &packet = record.decoded;
+		const auto *message = bytes + packet.payload_offset;
+		auto message_length = packet.payload_length;
+		if (packet.tcp) {
+			if (message_length < 2 || ReadU16(message, ByteOrder::BIG) != message_length - 2) {
+				record.dns.error = "TCP DNS requires exactly one complete length-prefixed message per packet";
+				return;
+			}
+			message += 2;
+			message_length -= 2;
+		} else if (message_length != packet.udp_length - 8U) {
+			record.dns.error = "truncated UDP DNS payload";
+			return;
+		}
+		record.dns = packetquapture::DecodeDns(message, message_length);
+	}
+
+	// Reads the stages a scan needs, stopping at the first filter that rejects the
+	// packet, so a filtered scan reads and decodes no more than the filter needs.
+	// Each filtered decode depth decodes again from the link layer: the decoder
+	// keeps no state between depths, and the prefix bytes are already in memory.
+	void ReadPacketData(PacketRecord &record, idx_t length) {
+		// Checked before any read: a header claiming more bytes than the file has
+		// left is a truncated record, reported without first allocating for it.
+		RequireAvailable(length, "packet data");
+		PacketPrefix source(*this, length, packet_prefix);
+		if (!Accept(record, STAGE_PACKET)) {
 			Skip(length, "packet data");
 			return;
 		}
@@ -680,13 +793,15 @@ private:
 			}
 			record.decoded =
 			    packetquapture::DecodePacket(source, record.link_type, static_cast<packetquapture::DecodeDepth>(stage));
-			if (!accept(stage)) {
-				Skip(length - source.Consumed(), "packet data");
+			if (!Accept(record, stage)) {
+				Skip(source.Unread(), "packet data");
 				return;
 			}
 		}
+		const auto &packet = record.decoded;
 		if (options.reassemble_dns || options.reassemble_tcp) {
-			const auto &packet = record.decoded;
+			// TCP reassembly takes every TCP segment; DNS reassembly also takes UDP
+			// on port 53, which it passes through as single datagrams.
 			if (!packet.transport ||
 			    (options.reassemble_tcp ? !packet.tcp : (packet.src_port != 53 && packet.dst_port != 53))) {
 				record.selected = false;
@@ -695,60 +810,40 @@ private:
 				record.transport_data.assign(bytes + packet.payload_offset,
 				                             bytes + packet.payload_offset + packet.payload_length);
 			}
-			Skip(length - source.Consumed(), "packet data");
+			Skip(source.Unread(), "packet data");
 			return;
 		}
 		if (options.dns_scan) {
-			const auto &packet = record.decoded;
 			if (!packet.transport || (packet.src_port != 53 && packet.dst_port != 53) || packet.payload_length == 0) {
 				record.selected = false;
-				Skip(length - source.Consumed(), "packet data");
+				Skip(source.Unread(), "packet data");
 				return;
 			}
 			if (options.decode_dns) {
-				const auto *bytes = source.ReadPrefix(packet.payload_offset + packet.payload_length);
-				const auto *message = bytes + packet.payload_offset;
-				auto message_length = packet.payload_length;
-				bool complete = true;
-				if (packet.tcp) {
-					if (message_length < 2 || ReadU16(message, ByteOrder::BIG) != message_length - 2) {
-						complete = false;
-						record.dns.error = "TCP DNS requires exactly one complete length-prefixed message per packet";
-					} else {
-						message += 2;
-						message_length -= 2;
-					}
-				} else if (message_length != packet.udp_length - 8U) {
-					complete = false;
-					record.dns.error = "truncated UDP DNS payload";
-				}
-				if (complete) {
-					record.dns = packetquapture::DecodeDns(message, message_length);
-				}
+				DecodeDnsPayload(record, source.ReadPrefix(packet.payload_offset + packet.payload_length));
 			}
-			if (!accept(STAGE_DNS)) {
-				Skip(length - source.Consumed(), "packet data");
+			if (!Accept(record, STAGE_DNS)) {
+				Skip(source.Unread(), "packet data");
 				return;
 			}
 		}
 		if (options.decode_tls) {
-			const auto &packet = record.decoded;
 			// TLS runs over TCP; DTLS frames differently and is not parsed here.
 			if (packet.transport && packet.tcp && packet.payload_length > 0) {
 				const auto *bytes = source.ReadPrefix(packet.payload_offset + packet.payload_length);
 				record.tls = packetquapture::DecodeTlsRecord(bytes + packet.payload_offset, packet.payload_length);
 			}
-			if (!accept(STAGE_TLS)) {
-				Skip(length - source.Consumed(), "packet data");
+			if (!Accept(record, STAGE_TLS)) {
+				Skip(source.Unread(), "packet data");
 				return;
 			}
 		}
 		if (options.materialize_packet_data) {
 			source.ReadPrefix(length);
-			record.packet_data = source.TakeBytes();
-			accept(STAGE_PACKET_DATA);
+			record.packet_data.assign(source.Bytes().begin(), source.Bytes().end());
+			Accept(record, STAGE_PACKET_DATA);
 		} else {
-			Skip(length - source.Consumed(), "packet data");
+			Skip(source.Unread(), "packet data");
 		}
 	}
 
@@ -765,11 +860,19 @@ private:
 		return CheckedTimestamp(static_cast<long double>(ticks) * 1000000.0L / ticks_per_second);
 	}
 
+	// The bound is written as 2^63 rather than converted from INT64_MAX, which
+	// rounds up to 2^63 where long double is double and so would let 2^63 through
+	// to an undefined cast. INT64_MAX itself is DuckDB's infinity, so the largest
+	// finite timestamp is one below it.
 	timestamp_t CheckedTimestamp(long double micros) const {
-		if (!std::isfinite(micros) || micros > static_cast<long double>(std::numeric_limits<int64_t>::max())) {
+		if (!std::isfinite(micros) || micros >= 9223372036854775808.0L) {
 			throw InvalidInputException("Packet timestamp is out of range in '%s'", file.path);
 		}
-		return Timestamp::FromEpochMicroSeconds(static_cast<int64_t>(micros));
+		const auto value = static_cast<int64_t>(micros);
+		if (value == NumericLimits<int64_t>::Maximum()) {
+			throw InvalidInputException("Packet timestamp is out of range in '%s'", file.path);
+		}
+		return Timestamp::FromEpochMicroSeconds(value);
 	}
 
 	void ValidatePacketLength(uint32_t length) const {
@@ -833,11 +936,6 @@ private:
 		}
 	}
 
-	// A capture that stops inside a record was cut short mid-write, which is
-	// ordinary for real captures -- but only once the file has proven itself by
-	// yielding a complete record. Before that, a short read is indistinguishable
-	// from a misidentified or corrupt file, and a silently empty result would
-	// hide that, so it stays a hard error.
 	// Asks the kernel to read ahead of a sparse local scan. Decided once per
 	// file: only a file on disk, and a file system that cannot say so is not
 	// treated as one.
@@ -847,7 +945,9 @@ private:
 			bool on_disk = false;
 			try {
 				on_disk = handle->OnDiskFile();
-			} catch (std::exception &) {
+			} catch (const std::exception &) {
+				// Readahead is only a hint: a file system that cannot say whether a
+				// file is on disk is scanned without it, never failed for it.
 				on_disk = false;
 			}
 			if (on_disk) {
@@ -859,12 +959,25 @@ private:
 		}
 	}
 
+	// A capture that stops inside a record was cut short mid-write, which is
+	// ordinary for real captures -- but only once the file has proven itself by
+	// yielding a complete record. Before that, a short read is indistinguishable
+	// from a misidentified or corrupt file, and a silently empty result would
+	// hide that, so it stays a hard error.
 	[[noreturn]] void EndOfRecord(const char *description) {
 		if (header_complete && complete_records > 0) {
 			truncated_tail = true;
 			throw TruncatedTailSignal {};
 		}
 		throw IOException("Unexpected end of '%s' while reading %s", file.path, description);
+	}
+
+	// On a file whose size is known, a record that claims more bytes than remain
+	// is truncated. Ends the scan the way a short read would.
+	void RequireAvailable(idx_t length, const char *description) {
+		if (can_skip_by_seek && (position > seekable_size || length > seekable_size - position)) {
+			EndOfRecord(description);
+		}
 	}
 
 	void Skip(idx_t length, const char *description) {
@@ -903,7 +1016,7 @@ private:
 		}
 	}
 
-private:
+	// Reader state.
 	CaptureIdentity inventory_before;
 	std::set<uint32_t> inventory_links;
 	OpenFileInfo file;
@@ -931,6 +1044,8 @@ private:
 	// Records returned in full; gates tail tolerance alongside header_complete.
 	uint64_t complete_records = 0;
 	uint64_t seekable_size = 0;
+	// The bytes of the current packet read so far, reused across packets.
+	vector<uint8_t> packet_prefix;
 	CaptureFormat format = CaptureFormat::PCAP;
 	ByteOrder order = ByteOrder::LITTLE;
 	bool nanosecond_timestamps = false;
@@ -977,6 +1092,8 @@ struct PcapBindData : public TableFunctionData {
 		if (column < base_column_count || column >= types.size()) {
 			return false;
 		}
+		PQ_ASSERT(file_index < partition_values.size());
+		PQ_ASSERT(column - base_column_count < partition_values[file_index].size());
 		output.SetValue(row, partition_values[file_index][column - base_column_count]);
 		return true;
 	}
@@ -1099,6 +1216,7 @@ struct PcapLocalState : public LocalTableFunctionState {
 	ScanOptions options;
 	vector<unique_ptr<PacketFilter>> filters;
 	unique_ptr<CaptureReader> reader;
+	PacketRecord record; // reused for every packet
 };
 
 static idx_t NamedColumn(const vector<string> &names, const char *name) {
@@ -1109,6 +1227,8 @@ static idx_t NamedColumn(const vector<string> &names, const char *name) {
 	}
 	throw InternalException("capture bind has no column named %s", name);
 }
+
+constexpr column_t PCAP_TIMESTAMP_COLUMN = 2;
 
 static unique_ptr<FunctionData> PcapBind(ClientContext &context, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<string> &names) {
@@ -1121,18 +1241,22 @@ static unique_ptr<FunctionData> PcapBind(ClientContext &context, TableFunctionBi
 	return_types = {LogicalType::VARCHAR,  LogicalType::UBIGINT,  LogicalType::TIMESTAMP, LogicalType::UINTEGER,
 	                LogicalType::UINTEGER, LogicalType::UINTEGER, LogicalType::UINTEGER,  LogicalType::UBIGINT,
 	                LogicalType::VARCHAR,  LogicalType::BLOB,     LogicalType::UINTEGER};
+	// Every capture reader starts with these columns, and catalog pruning finds
+	// the timestamp by position.
+	PQ_ASSERT(names[PCAP_TIMESTAMP_COLUMN] == "timestamp");
 	result->types = return_types;
 	result->AppendStages(STAGE_PACKET, return_types.size());
 	result->column_stages[NamedColumn(names, "packet_data")] = STAGE_PACKET_DATA;
 	return std::move(result);
 }
 
-static unique_ptr<FunctionData> PacketsBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
-	auto result = PcapBind(context, input, return_types, names);
+using ColumnGroup = std::pair<ColumnStage, vector<std::pair<string, LogicalType>>>;
+
+// read_packets' decoded columns, after read_pcap's.
+static vector<ColumnGroup> DecodedColumnGroups() {
 	// Grouped by the decode stage that produces them, so a column added to a group
 	// takes that group's stage and no other column's stage moves.
-	const vector<std::pair<ColumnStage, vector<std::pair<string, LogicalType>>>> decoded = {
+	return {
 	    {STAGE_LINK,
 	     {{"src_mac", LogicalType::VARCHAR},
 	      {"dst_mac", LogicalType::VARCHAR},
@@ -1166,6 +1290,12 @@ static unique_ptr<FunctionData> PacketsBind(ClientContext &context, TableFunctio
 	      {"tcp_ece", LogicalType::BOOLEAN},
 	      {"tcp_cwr", LogicalType::BOOLEAN}}},
 	};
+}
+
+static unique_ptr<FunctionData> PacketsBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = PcapBind(context, input, return_types, names);
+	const auto decoded = DecodedColumnGroups();
 	// Parsed from the TCP payload of each packet on its own, with no reassembly:
 	// a field needing bytes from another segment is reported absent, and
 	// tls_truncated says whether it was absent or merely out of reach.
@@ -1186,6 +1316,11 @@ static unique_ptr<FunctionData> PacketsBind(ClientContext &context, TableFunctio
 	if (return_types.size() != TLS_COLUMN_BEGIN || tls.size() != TLS_COLUMN_COUNT) {
 		throw InternalException("read_packets column layout does not match the declared TLS boundaries");
 	}
+	// The cell writers find column groups by position.
+	PQ_ASSERT(names[PACKET_COLUMN_COUNT] == "src_mac");
+	PQ_ASSERT(names[NETWORK_COLUMNS_BEGIN] == "ip_version");
+	PQ_ASSERT(names[TRANSPORT_COLUMNS_BEGIN] == "src_port");
+	PQ_ASSERT(names[TCP_FLAG_COLUMNS_BEGIN] == "tcp_fin");
 	for (const auto &column : tls) {
 		names.push_back(column.first);
 		return_types.push_back(column.second);
@@ -1195,17 +1330,27 @@ static unique_ptr<FunctionData> PacketsBind(ClientContext &context, TableFunctio
 	return result;
 }
 
-static LogicalType DnsQuestionType() {
+static LogicalType MakeDnsQuestionType() {
 	return LogicalType::STRUCT(
 	    {{"name", LogicalType::VARCHAR}, {"type", LogicalType::USMALLINT}, {"class", LogicalType::USMALLINT}});
 }
-static LogicalType DnsRecordType() {
+// Built once: rows ask for it per cell, and a STRUCT type allocates.
+static const LogicalType &DnsQuestionType() {
+	static const LogicalType type = MakeDnsQuestionType();
+	return type;
+}
+static LogicalType MakeDnsRecordType() {
 	return LogicalType::STRUCT({{"name", LogicalType::VARCHAR},
 	                            {"type", LogicalType::USMALLINT},
 	                            {"class", LogicalType::USMALLINT},
 	                            {"ttl", LogicalType::UINTEGER},
 	                            {"value", LogicalType::VARCHAR},
 	                            {"data", LogicalType::BLOB}});
+}
+// Built once: rows ask for it per cell, and a STRUCT type allocates.
+static const LogicalType &DnsRecordType() {
+	static const LogicalType type = MakeDnsRecordType();
+	return type;
 }
 static unique_ptr<FunctionData> DnsBind(ClientContext &context, TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types, vector<string> &names) {
@@ -1261,33 +1406,28 @@ static void BindStreamOptions(FunctionData &result, const TableFunctionBindInput
 	}
 }
 
-template <table_function_bind_t BIND>
-static unique_ptr<FunctionData> BindCapture(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &types, vector<string> &names) {
-	auto result = BIND(context, input, types, names);
-	auto &bind = result->Cast<PcapBindData>();
-	bind.base_column_count = types.size();
-	for (idx_t i = 0; i < bind.files.size(); ++i) {
-		bind.selected_indices.push_back(i);
-	}
-	MultiFileOptions options;
-	options.auto_detect_hive_partitioning = false;
-	options.hive_types_autocast = false;
+// Parses the capture options DuckDB passed, other than the ones the bind itself
+// owns, into bind and options. Returns whether any Hive type option was given.
+static bool BindCaptureOptions(ClientContext &context, TableFunctionBindInput &input, PcapBindData &bind,
+                               MultiFileOptions &options) {
 	auto reader = MultiFileReader::Create(input.table_function);
 	bool has_type_options = false;
 	for (auto &entry : input.named_parameters) {
 		if (StringUtil::CIEquals(entry.first, "catalog")) {
-			if (entry.second.IsNull())
+			if (entry.second.IsNull()) {
 				throw BinderException("catalog must not be NULL");
+			}
 			bind.catalog = BindInventoryCatalog(context, entry.second.GetValue<string>());
 			continue;
 		}
 		if (StringUtil::CIEquals(entry.first, "catalog_validation")) {
-			if (entry.second.IsNull())
+			if (entry.second.IsNull()) {
 				throw BinderException("catalog_validation must not be NULL");
+			}
 			auto mode = StringUtil::Lower(entry.second.GetValue<string>());
-			if (mode != "strict" && mode != "immutable")
+			if (mode != "strict" && mode != "immutable") {
 				throw BinderException("catalog_validation must be strict or immutable");
+			}
 			bind.catalog_immutable = mode == "immutable";
 			continue;
 		}
@@ -1304,16 +1444,14 @@ static unique_ptr<FunctionData> BindCapture(ClientContext &context, TableFunctio
 		}
 		has_type_options |= !StringUtil::CIEquals(entry.first, "hive_partitioning");
 	}
-	if (bind.catalog.empty() && input.named_parameters.count("catalog_validation"))
-		throw BinderException("catalog_validation requires catalog");
-	if (has_type_options && !options.hive_partitioning) {
-		throw BinderException("Capture partition type options require hive_partitioning=true");
-	}
-	bind.hive_partitioning = options.hive_partitioning;
-	if (!options.hive_partitioning || bind.files.empty()) {
-		return result;
-	}
+	return has_type_options;
+}
 
+// Adds a column per Hive partition key, typed and valued per file. Every path
+// must carry the same keys.
+static void BindHivePartitions(ClientContext &context, PcapBindData &bind, MultiFileOptions &options,
+                               vector<LogicalType> &types, vector<string> &names) {
+	PQ_ASSERT(!bind.files.empty());
 	const auto partitions = HivePartitioning::Parse(bind.files[0].path);
 	case_insensitive_set_t used_names;
 	for (auto &name : names) {
@@ -1335,11 +1473,15 @@ static unique_ptr<FunctionData> BindCapture(ClientContext &context, TableFunctio
 		}
 	}
 	// Validate all path metadata, including files that may later be pruned. No opens.
+	// Each path is parsed once; the typing pass below reuses the result.
+	vector<std::map<string, string>> parsed;
+	parsed.reserve(bind.files.size());
 	for (auto &file : bind.files) {
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
-		const auto values = HivePartitioning::Parse(file.path);
+		parsed.push_back(HivePartitioning::Parse(file.path));
+		const auto &values = parsed.back();
 		if (values.size() != partitions.size()) {
 			throw BinderException("Hive partition mismatch between capture files '%s' and '%s'", bind.files[0].path,
 			                      file.path);
@@ -1358,11 +1500,11 @@ static unique_ptr<FunctionData> BindCapture(ClientContext &context, TableFunctio
 		names.push_back(key);
 		types.push_back(options.GetHiveLogicalType(key));
 	}
-	for (auto &file : bind.files) {
+	PQ_ASSERT(parsed.size() == bind.files.size());
+	for (const auto &values : parsed) {
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
-		const auto values = HivePartitioning::Parse(file.path);
 		vector<Value> typed_values;
 		for (auto &key : bind.partition_keys) {
 			typed_values.push_back(options.GetHivePartitionValue(values.at(key), key, context));
@@ -1370,6 +1512,34 @@ static unique_ptr<FunctionData> BindCapture(ClientContext &context, TableFunctio
 		bind.partition_values.push_back(std::move(typed_values));
 	}
 	bind.types = types;
+}
+
+template <table_function_bind_t BIND>
+static unique_ptr<FunctionData> BindCapture(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &types, vector<string> &names) {
+	auto result = BIND(context, input, types, names);
+	// Every bind pairs its column names and types by position.
+	PQ_ASSERT(names.size() == types.size());
+	auto &bind = result->Cast<PcapBindData>();
+	bind.base_column_count = types.size();
+	for (idx_t i = 0; i < bind.files.size(); ++i) {
+		bind.selected_indices.push_back(i);
+	}
+	MultiFileOptions options;
+	options.auto_detect_hive_partitioning = false;
+	options.hive_types_autocast = false;
+	const bool has_type_options = BindCaptureOptions(context, input, bind, options);
+	if (bind.catalog.empty() && input.named_parameters.count("catalog_validation")) {
+		throw BinderException("catalog_validation requires catalog");
+	}
+	if (has_type_options && !options.hive_partitioning) {
+		throw BinderException("Capture partition type options require hive_partitioning=true");
+	}
+	bind.hive_partitioning = options.hive_partitioning;
+	if (!options.hive_partitioning || bind.files.empty()) {
+		return result;
+	}
+	BindHivePartitions(context, bind, options, types, names);
 	return result;
 }
 
@@ -1378,38 +1548,11 @@ static bool SupportsPacketFilter(const FunctionData &data, idx_t column) {
 	return column < bind.base_column_count && bind.types[column].id() != LogicalTypeId::LIST;
 }
 
-static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, TableFunctionInitInput &input) {
-	auto &bind = input.bind_data->Cast<PcapBindData>();
-	map<string, idx_t> reasons;
-	auto result = make_uniq<PcapGlobalState>(SelectCatalogFiles(context, bind, input, reasons));
-	result->catalog_reasons = std::move(reasons);
-	vector<OpenFileInfo> selected_files;
-	for (auto index : result->selected_indices)
-		selected_files.push_back(bind.files[index]);
-	result->progress.Initialize(context, selected_files);
-	// DuckDB can keep filter-only columns out of the scan output. Unsupported
-	// partition/list filters are restored above the scan with their own projection.
-	if (input.projection_ids.empty()) {
-		result->column_ids = input.column_ids;
-	} else {
-		for (auto index : input.projection_ids) {
-			result->column_ids.push_back(input.column_ids[index]);
-		}
-	}
-	auto &options = result->options;
-	// Every base column of a decoding scan must carry a stage. Without this a bind
-	// that appends columns and forgets their stages would silently under-decode them.
-	if (bind.column_stages.size() != bind.base_column_count) {
-		throw InternalException("capture scan has %llu columns but %llu column stages",
-		                        static_cast<uint64_t>(bind.base_column_count),
-		                        static_cast<uint64_t>(bind.column_stages.size()));
-	}
-	options.dns_scan = bind.dns_scan;
-	if (bind.dns_scan) {
-		options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
-	}
+// The decode depth and extra stages a scan needs, from the columns it reads,
+// including filter-only columns.
+static void PlanDecodeStages(const PcapBindData &bind, const vector<column_t> &column_ids, ScanOptions &options) {
 	// Filter-only packet columns still determine the required decode depth.
-	for (const auto column : input.column_ids) {
+	for (const auto column : column_ids) {
 		if (column >= bind.base_column_count) {
 			continue;
 		}
@@ -1433,6 +1576,12 @@ static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, Tab
 			options.decode_depth = depth;
 		}
 	}
+}
+
+// Pushes the packet-column filters a scan can evaluate itself, so packets that
+// fail them are skipped as early in decoding as possible.
+static void PushPacketFilters(const PcapBindData &bind, TableFunctionInitInput &input, PcapGlobalState &global) {
+	auto &options = global.options;
 	if (input.filters) {
 		for (const auto &entry : input.filters->filters) {
 			const auto &filter = *entry.second;
@@ -1449,10 +1598,45 @@ static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, Tab
 			if (!SupportsPacketFilter(bind, column)) {
 				continue;
 			}
-			result->filters.push_back({column, filter.Copy()});
+			global.filters.push_back({column, filter.Copy()});
 			options.filter_stages[bind.StageOf(column)] = true;
 		}
 	}
+}
+
+static unique_ptr<GlobalTableFunctionState> PcapInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<PcapBindData>();
+	map<string, idx_t> reasons;
+	auto result = make_uniq<PcapGlobalState>(SelectCatalogFiles(context, bind, input, reasons));
+	result->catalog_reasons = std::move(reasons);
+	vector<OpenFileInfo> selected_files;
+	for (auto index : result->selected_indices) {
+		selected_files.push_back(bind.files[index]);
+	}
+	result->progress.Initialize(context, selected_files);
+	// DuckDB can keep filter-only columns out of the scan output. Unsupported
+	// partition/list filters are restored above the scan with their own projection.
+	if (input.projection_ids.empty()) {
+		result->column_ids = input.column_ids;
+	} else {
+		for (auto index : input.projection_ids) {
+			result->column_ids.push_back(input.column_ids[index]);
+		}
+	}
+	auto &options = result->options;
+	// Every base column of a decoding scan must carry a stage. Without this a bind
+	// that appends columns and forgets their stages would silently under-decode them.
+	if (bind.column_stages.size() != bind.base_column_count) {
+		throw InternalException("capture scan has %llu columns but %llu column stages",
+		                        static_cast<uint64_t>(bind.base_column_count),
+		                        static_cast<uint64_t>(bind.column_stages.size()));
+	}
+	options.dns_scan = bind.dns_scan;
+	if (bind.dns_scan) {
+		options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
+	}
+	PlanDecodeStages(bind, input.column_ids, options);
+	PushPacketFilters(bind, input, *result);
 	return std::move(result);
 }
 
@@ -1467,139 +1651,241 @@ static unique_ptr<LocalTableFunctionState> PcapInitLocal(ExecutionContext &conte
 		                                                  bind.StageOf(definition.column),
 		                                                  bind.types[definition.column], *definition.filter));
 	}
-	auto *state = result.get();
-	result->options.matches = [state](const PacketRecord &record, unsigned stage) {
-		for (auto &filter : state->filters) {
-			if (filter->stage == stage && !filter->Matches(record)) {
-				return false;
-			}
-		}
-		return true;
-	};
+	result->options.filters = &result->filters;
 	return std::move(result);
+}
+
+// Cells are written straight into the flat output vectors. Building a Value per
+// cell boxed every scalar and heap-allocated every string, which profiled at about
+// a sixth of a read_packets scan.
+template <class T>
+static void SetDecodedScalar(Vector &vector, idx_t row, T value) {
+	// SetValue cast a mismatched Value silently; a direct write would not.
+	PQ_ASSERT(vector.GetType().InternalType() == GetTypeId<T>());
+	FlatVector::SetNull(vector, row, false);
+	FlatVector::GetData<T>(vector)[row] = value;
+}
+
+// A scalar cell that is NULL unless present.
+template <class T>
+static void SetOptionalScalar(Vector &vector, idx_t row, bool present, T value) {
+	if (present) {
+		SetDecodedScalar(vector, row, value);
+	} else {
+		FlatVector::SetNull(vector, row, true);
+	}
+}
+
+// Text or bytes; the vector owns its copy. Callers pass only valid UTF-8 for
+// VARCHAR columns: paths, fixed names and escaped peer text.
+static void SetStringCell(Vector &vector, idx_t row, const char *data, idx_t length) {
+	PQ_ASSERT(vector.GetType().InternalType() == PhysicalType::VARCHAR);
+	if (length == 0) {
+		data = ""; // an empty packet_data vector has no buffer
+	}
+	FlatVector::SetNull(vector, row, false);
+	FlatVector::GetData<string_t>(vector)[row] = StringVector::AddStringOrBlob(vector, data, length);
+}
+static void SetStringCell(Vector &vector, idx_t row, const string &text) {
+	SetStringCell(vector, row, text.data(), text.size());
+}
+// A text cell that is NULL when empty, as error columns are.
+static void SetOptionalText(Vector &vector, idx_t row, const string &text) {
+	if (text.empty()) {
+		FlatVector::SetNull(vector, row, true);
+	} else {
+		SetStringCell(vector, row, text);
+	}
+}
+
+static const char HEX_DIGITS[] = "0123456789abcdef";
+
+// Formats into buffer, which holds at least 18 bytes, and returns the length.
+// Written digit by digit: four snprintf calls per packet were a visible share of
+// a read_packets scan.
+static idx_t FormatMac(const std::array<uint8_t, 6> &address, char *buffer) {
+	idx_t length = 0;
+	for (idx_t i = 0; i < address.size(); ++i) {
+		if (i > 0) {
+			buffer[length++] = ':';
+		}
+		buffer[length++] = HEX_DIGITS[address[i] >> 4U];
+		buffer[length++] = HEX_DIGITS[address[i] & 0x0FU];
+	}
+	PQ_ASSERT(length == 17);
+	return length;
+}
+
+// Formats into buffer, which holds at least 40 bytes, and returns the length:
+// dotted IPv4, or IPv6 as eight four-digit groups, uncompressed.
+static idx_t FormatIp(const std::array<uint8_t, 16> &address, uint8_t version, char *buffer) {
+	idx_t length = 0;
+	if (version == 4) {
+		for (idx_t i = 0; i < 4; ++i) {
+			if (i > 0) {
+				buffer[length++] = '.';
+			}
+			const auto byte = address[i];
+			if (byte >= 100) {
+				buffer[length++] = static_cast<char>('0' + byte / 100);
+			}
+			if (byte >= 10) {
+				buffer[length++] = static_cast<char>('0' + byte / 10 % 10);
+			}
+			buffer[length++] = static_cast<char>('0' + byte % 10);
+		}
+		PQ_ASSERT(length >= 7 && length <= 15);
+		return length;
+	}
+	for (idx_t i = 0; i < 16; ++i) {
+		if (i > 0 && i % 2 == 0) {
+			buffer[length++] = ':';
+		}
+		buffer[length++] = HEX_DIGITS[address[i] >> 4U];
+		buffer[length++] = HEX_DIGITS[address[i] & 0x0FU];
+	}
+	PQ_ASSERT(length == 39);
+	return length;
+}
+
+static void SetMacCell(Vector &vector, idx_t row, const std::array<uint8_t, 6> &address) {
+	char buffer[18];
+	SetStringCell(vector, row, buffer, FormatMac(address, buffer));
+}
+
+static void SetIpCell(Vector &vector, idx_t row, const std::array<uint8_t, 16> &address, uint8_t version) {
+	char buffer[40];
+	SetStringCell(vector, row, buffer, FormatIp(address, version, buffer));
+}
+
+struct KeepAll {
+	template <class T>
+	bool operator()(const T &) const {
+		return true;
+	}
+};
+
+// A LIST cell of fixed-width values, appended to the list vector's child. Only
+// values keep accepts are written, which drops GREASE from the filtered lists.
+template <class T, class KEEP = KeepAll>
+static void SetScalarListCell(Vector &vector, idx_t row, const T *values, idx_t count, KEEP keep = KEEP()) {
+	PQ_ASSERT(vector.GetType().InternalType() == PhysicalType::LIST);
+	const auto offset = ListVector::GetListSize(vector);
+	ListVector::Reserve(vector, offset + count);
+	auto &child = ListVector::GetEntry(vector);
+	PQ_ASSERT(child.GetType().InternalType() == GetTypeId<T>());
+	auto *data = FlatVector::GetData<T>(child);
+	auto &validity = FlatVector::Validity(child);
+	idx_t kept = 0;
+	for (idx_t i = 0; i < count; ++i) {
+		if (keep(values[i])) {
+			validity.SetValid(offset + kept);
+			data[offset + kept++] = values[i];
+		}
+	}
+	PQ_ASSERT(kept <= count);
+	ListVector::SetListSize(vector, offset + kept);
+	FlatVector::SetNull(vector, row, false);
+	FlatVector::GetData<list_entry_t>(vector)[row] = list_entry_t(offset, kept);
+}
+
+// A LIST(VARCHAR) cell; render turns each kept item into its valid UTF-8 text.
+template <class ITEM, class KEEP, class RENDER>
+static void SetStringListCell(Vector &vector, idx_t row, const std::vector<ITEM> &items, KEEP keep, RENDER render) {
+	PQ_ASSERT(vector.GetType().InternalType() == PhysicalType::LIST);
+	const auto offset = ListVector::GetListSize(vector);
+	ListVector::Reserve(vector, offset + items.size());
+	auto &child = ListVector::GetEntry(vector);
+	PQ_ASSERT(child.GetType().InternalType() == PhysicalType::VARCHAR);
+	auto *data = FlatVector::GetData<string_t>(child);
+	auto &validity = FlatVector::Validity(child);
+	idx_t kept = 0;
+	for (const auto &item : items) {
+		if (keep(item)) {
+			const string text = render(item);
+			validity.SetValid(offset + kept);
+			data[offset + kept++] = StringVector::AddString(child, text);
+		}
+	}
+	ListVector::SetListSize(vector, offset + kept);
+	FlatVector::SetNull(vector, row, false);
+	FlatVector::GetData<list_entry_t>(vector)[row] = list_entry_t(offset, kept);
 }
 
 static void SetOutputValue(Vector &vector, idx_t row, column_t column_id, const PacketRecord &record) {
 	switch (column_id) {
 	case 0:
-		vector.SetValue(row, record.filename);
+		SetStringCell(vector, row, record.filename);
 		break;
 	case 1:
-		vector.SetValue(row, Value::UBIGINT(record.packet_number));
+		SetDecodedScalar(vector, row, record.packet_number);
 		break;
 	case 2:
 		if (record.has_timestamp) {
-			vector.SetValue(row, Value::TIMESTAMP(record.timestamp));
+			SetDecodedScalar(vector, row, record.timestamp);
 		} else {
 			FlatVector::SetNull(vector, row, true);
 		}
 		break;
 	case 3:
-		vector.SetValue(row, Value::UINTEGER(record.captured_length));
+		SetDecodedScalar(vector, row, record.captured_length);
 		break;
 	case 4:
-		vector.SetValue(row, Value::UINTEGER(record.original_length));
+		SetDecodedScalar(vector, row, record.original_length);
 		break;
 	case 5:
-		vector.SetValue(row, Value::UINTEGER(record.link_type));
+		SetDecodedScalar(vector, row, record.link_type);
 		break;
 	case 6:
-		vector.SetValue(row, Value::UINTEGER(record.interface_id));
+		SetDecodedScalar(vector, row, record.interface_id);
 		break;
 	case 7:
-		vector.SetValue(row, Value::UBIGINT(record.packet_offset));
+		SetDecodedScalar(vector, row, record.packet_offset);
 		break;
 	case 8:
-		vector.SetValue(row, record.format == CaptureFormat::PCAP ? "pcap" : "pcapng");
-		break;
-	case 9:
-		if (record.packet_data.empty()) {
-			vector.SetValue(row, Value::BLOB(""));
+		if (record.format == CaptureFormat::PCAP) {
+			SetStringCell(vector, row, "pcap", 4);
 		} else {
-			vector.SetValue(row, Value::BLOB(record.packet_data.data(), record.packet_data.size()));
+			SetStringCell(vector, row, "pcapng", 6);
 		}
 		break;
+	case 9:
+		SetStringCell(vector, row, reinterpret_cast<const char *>(record.packet_data.data()),
+		              record.packet_data.size());
+		break;
 	case 10:
-		vector.SetValue(row, Value::UINTEGER(record.section_number));
+		SetDecodedScalar(vector, row, record.section_number);
 		break;
 	default:
 		throw InternalException("Unexpected read_pcap column id %d", column_id);
 	}
 }
 
-template <class T>
-static void SetDecodedScalar(Vector &vector, idx_t row, T value) {
-	FlatVector::SetNull(vector, row, false);
-	FlatVector::GetData<T>(vector)[row] = value;
-}
-
-static string MacString(const std::array<uint8_t, 6> &address) {
-	char buffer[18];
-	std::snprintf(buffer, sizeof(buffer), "%02x:%02x:%02x:%02x:%02x:%02x", address[0], address[1], address[2],
-	              address[3], address[4], address[5]);
-	return buffer;
-}
-
-static string IpString(const std::array<uint8_t, 16> &address, uint8_t version) {
-	char buffer[40];
-	if (version == 4) {
-		std::snprintf(buffer, sizeof(buffer), "%u.%u.%u.%u", address[0], address[1], address[2], address[3]);
-	} else {
-		std::snprintf(buffer, sizeof(buffer), "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-		              address[0], address[1], address[2], address[3], address[4], address[5], address[6], address[7],
-		              address[8], address[9], address[10], address[11], address[12], address[13], address[14],
-		              address[15]);
-	}
-	return buffer;
-}
-
-static void SetDecodedValue(Vector &vector, idx_t row, column_t column, const packetquapture::DecodedPacket &packet) {
-	bool valid = column < 15 ? packet.ethernet : column < 23 ? packet.network : packet.transport;
-	if (column >= 32 && column <= 39) {
-		if (!packet.tcp) {
-			FlatVector::SetNull(vector, row, true);
-		} else {
-			SetDecodedScalar(vector, row, (packet.tcp_flags & (1U << (column - 32))) != 0);
-		}
-		return;
-	}
-	if (column == 22) {
-		valid = valid && packet.has_ip_id;
-	} else if (column >= 25 && column <= 28) {
-		valid = packet.tcp;
-	} else if (column == 29) {
-		valid = packet.udp;
-	}
-	if (!valid) {
-		FlatVector::SetNull(vector, row, true);
-		return;
-	}
+// Ethernet and IP header fields.
+static void SetLinkNetworkValue(Vector &vector, idx_t row, column_t column,
+                                const packetquapture::DecodedPacket &packet) {
+	PQ_ASSERT(column >= PACKET_COLUMN_COUNT && column < TRANSPORT_COLUMNS_BEGIN);
 	switch (column) {
 	case 11:
-		vector.SetValue(row, MacString(packet.src_mac));
+		SetMacCell(vector, row, packet.src_mac);
 		break;
 	case 12:
-		vector.SetValue(row, MacString(packet.dst_mac));
+		SetMacCell(vector, row, packet.dst_mac);
 		break;
 	case 13:
 		SetDecodedScalar(vector, row, packet.ether_type);
 		break;
-	case 14: {
-		duckdb::vector<Value> tags;
-		for (const auto tag : packet.vlan_ids) {
-			tags.push_back(Value::USMALLINT(tag));
-		}
-		vector.SetValue(row, Value::LIST(LogicalType::USMALLINT, tags));
+	case 14:
+		SetScalarListCell(vector, row, packet.vlan_ids.data(), packet.vlan_ids.size());
 		break;
-	}
 	case 15:
 		SetDecodedScalar(vector, row, packet.ip_version);
 		break;
 	case 16:
-		vector.SetValue(row, IpString(packet.src_ip, packet.ip_version));
+		SetIpCell(vector, row, packet.src_ip, packet.ip_version);
 		break;
 	case 17:
-		vector.SetValue(row, IpString(packet.dst_ip, packet.ip_version));
+		SetIpCell(vector, row, packet.dst_ip, packet.ip_version);
 		break;
 	case 18:
 		SetDecodedScalar(vector, row, packet.ip_protocol);
@@ -1616,6 +1902,15 @@ static void SetDecodedValue(Vector &vector, idx_t row, column_t column, const pa
 	case 22:
 		SetDecodedScalar(vector, row, packet.ip_id);
 		break;
+	default:
+		throw InternalException("Unexpected read_packets column id %d", column);
+	}
+}
+
+// TCP and UDP header fields and the payload's place in the packet.
+static void SetTransportValue(Vector &vector, idx_t row, column_t column, const packetquapture::DecodedPacket &packet) {
+	PQ_ASSERT(column >= TRANSPORT_COLUMNS_BEGIN && column < TCP_FLAG_COLUMNS_BEGIN);
+	switch (column) {
 	case 23:
 		SetDecodedScalar(vector, row, packet.src_port);
 		break;
@@ -1645,6 +1940,39 @@ static void SetDecodedValue(Vector &vector, idx_t row, column_t column, const pa
 		break;
 	default:
 		throw InternalException("Unexpected read_packets column id %d", column);
+	}
+}
+
+static void SetDecodedValue(Vector &vector, idx_t row, column_t column, const packetquapture::DecodedPacket &packet) {
+	// Each column needs the layer it comes from: link columns, including vlan_ids,
+	// exist only for Ethernet framing; network and transport ones only once that
+	// header decoded.
+	bool valid = column < NETWORK_COLUMNS_BEGIN     ? packet.ethernet
+	             : column < TRANSPORT_COLUMNS_BEGIN ? packet.network
+	                                                : packet.transport;
+	if (column >= TCP_FLAG_COLUMNS_BEGIN && column < TLS_COLUMN_BEGIN) {
+		if (!packet.tcp) {
+			FlatVector::SetNull(vector, row, true);
+		} else {
+			SetDecodedScalar(vector, row, (packet.tcp_flags & (1U << (column - TCP_FLAG_COLUMNS_BEGIN))) != 0);
+		}
+		return;
+	}
+	if (column == 22) {
+		valid = valid && packet.has_ip_id;
+	} else if (column >= 25 && column <= 28) {
+		valid = packet.tcp;
+	} else if (column == 29) {
+		valid = packet.udp;
+	}
+	if (!valid) {
+		FlatVector::SetNull(vector, row, true);
+		return;
+	}
+	if (column < TRANSPORT_COLUMNS_BEGIN) {
+		SetLinkNetworkValue(vector, row, column, packet);
+	} else {
+		SetTransportValue(vector, row, column, packet);
 	}
 }
 
@@ -1687,7 +2015,7 @@ static void SetTlsValue(Vector &vector, idx_t row, column_t slot, const packetqu
 		break;
 	case 4:
 		if (tls.has_server_name) {
-			vector.SetValue(row, tls.server_name);
+			SetStringCell(vector, row, tls.server_name);
 			return;
 		}
 		break;
@@ -1705,31 +2033,15 @@ static void SetTlsValue(Vector &vector, idx_t row, column_t slot, const packetqu
 	FlatVector::SetNull(vector, row, true);
 }
 
-static void SetRecordValue(Vector &vector, idx_t row, column_t column, const PacketRecord &record) {
-	if (column < PACKET_COLUMN_COUNT) {
-		SetOutputValue(vector, row, column, record);
-		return;
-	}
-	if (column < TLS_COLUMN_BEGIN) {
-		SetDecodedValue(vector, row, column, record.decoded);
-		return;
-	}
-	if (column < DNS_COLUMN_BEGIN) {
-		SetTlsValue(vector, row, column - TLS_COLUMN_BEGIN, record.tls);
-		return;
-	}
-	const auto dns_column = column - DNS_COLUMN_BEGIN;
-	const auto &dns = record.dns;
+// The dns_* columns, by position among them.
+static void SetDnsValue(Vector &vector, idx_t row, column_t dns_column, const packetquapture::DnsMessage &dns) {
+	PQ_ASSERT(dns_column < DNS_COLUMN_COUNT);
 	if (dns_column == 0) {
 		SetDecodedScalar(vector, row, dns.valid);
 		return;
 	}
 	if (dns_column == 13) {
-		if (dns.error.empty()) {
-			FlatVector::SetNull(vector, row, true);
-		} else {
-			vector.SetValue(row, dns.error);
-		}
+		SetOptionalText(vector, row, dns.error);
 		return;
 	}
 	if (!dns.valid || (dns_column >= 6 && dns_column <= 8 && dns.questions.empty())) {
@@ -1753,7 +2065,7 @@ static void SetRecordValue(Vector &vector, idx_t row, column_t column, const Pac
 		SetDecodedScalar(vector, row, dns.truncated);
 		break;
 	case 6:
-		vector.SetValue(row, dns.questions[0].name);
+		SetStringCell(vector, row, dns.questions[0].name);
 		break;
 	case 7:
 		SetDecodedScalar(vector, row, dns.questions[0].type);
@@ -1780,8 +2092,24 @@ static void SetRecordValue(Vector &vector, idx_t row, column_t column, const Pac
 		vector.SetValue(row, DnsRecordsValue(dns.additionals));
 		break;
 	default:
-		throw InternalException("Unexpected read_dns column id %d", column);
+		throw InternalException("Unexpected read_dns column id %d", dns_column);
 	}
+}
+
+static void SetRecordValue(Vector &vector, idx_t row, column_t column, const PacketRecord &record) {
+	if (column < PACKET_COLUMN_COUNT) {
+		SetOutputValue(vector, row, column, record);
+		return;
+	}
+	if (column < TLS_COLUMN_BEGIN) {
+		SetDecodedValue(vector, row, column, record.decoded);
+		return;
+	}
+	if (column < DNS_COLUMN_BEGIN) {
+		SetTlsValue(vector, row, column - TLS_COLUMN_BEGIN, record.tls);
+		return;
+	}
+	SetDnsValue(vector, row, column - DNS_COLUMN_BEGIN, record.dns);
 }
 
 static void NormalizeBooleanFilter(unique_ptr<Expression> &expression) {
@@ -1895,6 +2223,7 @@ static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChun
 	auto &bind_data = input.bind_data->Cast<PcapBindData>();
 	auto &global = input.global_state->Cast<PcapGlobalState>();
 	auto &state = input.local_state->Cast<PcapLocalState>();
+	PQ_ASSERT(global.column_ids.size() == output.ColumnCount());
 	idx_t output_count = 0;
 	while (output_count < STANDARD_VECTOR_SIZE) {
 		if (context.IsInterrupted()) {
@@ -1909,7 +2238,7 @@ static void PcapScan(ClientContext &context, TableFunctionInput &input, DataChun
 			state.reader = make_uniq<CaptureReader>(context, bind_data.files[state.file_index], state.options,
 			                                        &global.progress, file_index);
 		}
-		PacketRecord record;
+		auto &record = state.record;
 		if (!state.reader->Next(record)) {
 			state.reader.reset();
 			continue;
@@ -1934,15 +2263,17 @@ struct StreamGlobalState : public CaptureGlobalState {
 		budget = context.registered_state->GetOrCreate<StreamQueryBudget>("packetquapture_stream_budget", context);
 		if (bind.stream_plan) {
 			bind.stream_plan->sealed.store(true);
+			PQ_ASSERT(bind.stream_plan->scans.load() > 0); // bind registered this scan
 			max_workers = MaxValue<idx_t>(1, budget->Slots() / bind.stream_plan->scans.load());
 		}
 		max_workers = MinValue<idx_t>(max_workers, MaxValue<idx_t>(1, file_count));
 		if (file_count) {
 			initial = make_uniq<StreamReservation>(budget);
 			if (!initial->Acquired()) {
-				throw OutOfMemoryException("PacketQuapture cannot reserve 128 MiB for a stream worker. "
+				throw OutOfMemoryException("PacketQuapture cannot reserve %llu MiB for a stream worker. "
 				                           "Increase packetquapture_stream_memory_mb or memory_limit; "
-				                           "all stream scans in this query share the budget.");
+				                           "all stream scans in this query share the budget.",
+				                           STREAM_WORKER_BYTES / (1024 * 1024));
 			}
 		}
 	}
@@ -1955,11 +2286,17 @@ struct StreamGlobalState : public CaptureGlobalState {
 			return nullptr;
 		}
 		++admitted;
+		PQ_ASSERT(admitted <= max_workers);
 		if (initial) {
 			return std::move(initial);
 		}
 		auto result = make_uniq<StreamReservation>(budget);
-		return result->Acquired() ? std::move(result) : nullptr;
+		if (!result->Acquired()) {
+			// The slot goes back, so a later worker can still try the budget.
+			--admitted;
+			return nullptr;
+		}
+		return result;
 	}
 	void Drained() {
 		if (drained.fetch_add(1, std::memory_order_relaxed) + 1 == file_count) {
@@ -1975,12 +2312,18 @@ struct StreamGlobalState : public CaptureGlobalState {
 	idx_t max_workers = 1, admitted = 0;
 	vector<column_t> columns;
 	ScanOptions options;
-	bool decode_dns = false;
 };
 
-// read_tls columns that hold certificate structs.
+// read_tls column groups, in schema order; TlsBind checks them against the names.
+static const column_t TLS_HELLO_COLUMNS_BEGIN = 15;
+static const column_t TLS_LIST_COLUMNS_BEGIN = 25;
+static const column_t TLS_FINGERPRINT_COLUMNS_BEGIN = 42;
+static const column_t TLS_FINGERPRINT_COLUMNS_END = 50;
+// Columns that hold certificate structs, with the tunnel between them.
 static const column_t TLS_SERVER_CERTIFICATES = 50;
+static const column_t TLS_TUNNEL = 51;
 static const column_t TLS_CLIENT_CERTIFICATES = 52;
+static_assert(TLS_FINGERPRINT_COLUMNS_END == TLS_SERVER_CERTIFICATES, "fingerprints precede the certificates");
 
 // SHA-1 and SHA-256 of a certificate's DER, for the parser, which has no hash
 // of its own.
@@ -2006,6 +2349,12 @@ static packetquapture::TlsHandshakeAssembler NewTlsAssembler(bool digest) {
 	return packetquapture::TlsHandshakeAssembler(limits);
 }
 
+struct StreamEvent {
+	bool tcp = false;
+	packetquapture::TcpStream stream;
+	PacketRecord datagram;
+};
+
 struct StreamScanState : public LocalTableFunctionState {
 	// Destroy all worker buffers before releasing the reservation.
 	unique_ptr<StreamReservation> reservation;
@@ -2013,6 +2362,8 @@ struct StreamScanState : public LocalTableFunctionState {
 	bool file_finished = false, initialized = false;
 	string filename;
 	unique_ptr<CaptureReader> reader;
+	PacketRecord record; // reused for every packet
+	StreamEvent event;   // reused for every event, so its buffers are too
 	packetquapture::TcpReassembler reassembler;
 	std::vector<packetquapture::TcpStream> streams;
 	idx_t pending_index = 0;
@@ -2057,13 +2408,35 @@ static packetquapture::PacketStamp Stamp(const PacketRecord &record) {
 	stamp.timestamp = record.has_timestamp ? record.timestamp.value : 0;
 	return stamp;
 }
-struct StreamEvent {
-	bool tcp = false;
-	packetquapture::TcpStream stream;
-	PacketRecord datagram;
-};
+// Admits this thread as a stream worker on its first call, if the query's
+// memory budget has room. Returns whether it holds a reservation and may scan.
+static bool AdmitStreamWorker(StreamGlobalState &global, StreamScanState &state) {
+	if (!state.initialized) {
+		state.initialized = true;
+		if (global.file_count) {
+			state.reservation = global.Admit();
+		}
+	}
+	return state.reservation != nullptr;
+}
+
+// A worker with nothing left frees every buffer it holds, and only then its
+// reservation, so memory never outlives the budget that admitted it.
+static void ReleaseStreamWorker(const PcapBindData &bind, StreamScanState &state) {
+	std::vector<packetquapture::TcpStream>().swap(state.streams);
+	std::vector<packetquapture::TcpDnsMessage>().swap(state.pending);
+	std::vector<packetquapture::TlsHandshake>().swap(state.tls_pending);
+	state.tls_assembler = packetquapture::TlsHandshakeAssembler();
+	state.tls_configured = false; // a later call configures it again
+	state.reassembler = packetquapture::TcpReassembler(bind.stream_limits);
+	state.record = PacketRecord();
+	state.event = StreamEvent();
+	state.reservation.reset();
+}
 
 // Shared capture iteration and transport lifecycle for every stream-level consumer.
+// Each pass hands out a stream, reads one record, finishes one flow at end of
+// file, or claims the next file, so it is bounded by records plus flows plus files.
 static bool NextStreamEvent(ClientContext &context, const PcapBindData &bind, StreamGlobalState &global,
                             StreamScanState &state, StreamEvent &event) {
 	while (true) {
@@ -2098,7 +2471,7 @@ static bool NextStreamEvent(ClientContext &context, const PcapBindData &bind, St
 			state.reassembler = packetquapture::TcpReassembler(bind.stream_limits);
 			state.reader = make_uniq<CaptureReader>(context, file, global.options, &global.progress, work_index);
 		}
-		PacketRecord record;
+		auto &record = state.record;
 		if (!state.reader->Next(record)) {
 			state.file_finished = true;
 			continue;
@@ -2113,10 +2486,42 @@ static bool NextStreamEvent(ClientContext &context, const PcapBindData &bind, St
 			    record.transport_data.size(), packet.payload_declared_length, Stamp(record));
 		} else {
 			event.tcp = false;
-			event.datagram = std::move(record);
+			// A swap, not a move, so both records keep their buffers.
+			std::swap(event.datagram, record);
 			return true;
 		}
 	}
+}
+
+// read_dns_messages's own columns, one per line so each name sits beside its type.
+// The dns_* columns of read_dns follow them.
+static void DnsMessagesSchema(vector<LogicalType> &types, vector<string> &names) {
+	types.clear();
+	names.clear();
+	auto column = [&](const char *name, const LogicalType &type) {
+		names.emplace_back(name);
+		types.push_back(type);
+	};
+	column("filename", LogicalType::VARCHAR);
+	column("section_number", LogicalType::UINTEGER);
+	column("interface_id", LogicalType::UINTEGER);
+	column("ip_version", LogicalType::UTINYINT);
+	column("src_ip", LogicalType::VARCHAR);
+	column("dst_ip", LogicalType::VARCHAR);
+	column("src_port", LogicalType::USMALLINT);
+	column("dst_port", LogicalType::USMALLINT);
+	column("transport", LogicalType::VARCHAR);
+	column("stream_id", LogicalType::UBIGINT);
+	column("message_number", LogicalType::UBIGINT);
+	column("first_packet_number", LogicalType::UBIGINT);
+	column("last_packet_number", LogicalType::UBIGINT);
+	column("first_timestamp", LogicalType::TIMESTAMP);
+	column("last_timestamp", LogicalType::TIMESTAMP);
+	column("tcp_sequence", LogicalType::UINTEGER);
+	column("reassembly_status", LogicalType::VARCHAR);
+	column("reassembly_error", LogicalType::VARCHAR);
+	column("message_data", LogicalType::BLOB);
+	column("vlan_ids", LogicalType::LIST(LogicalType::USMALLINT));
 }
 
 static unique_ptr<FunctionData> DnsMessagesBind(ClientContext &context, TableFunctionBindInput &input,
@@ -2127,36 +2532,7 @@ static unique_ptr<FunctionData> DnsMessagesBind(ClientContext &context, TableFun
 	// row per reassembled message, not per packet.
 	vector<LogicalType> dns_types(types.begin() + DNS_COLUMN_BEGIN, types.end());
 	vector<string> dns_names(names.begin() + DNS_COLUMN_BEGIN, names.end());
-	names = {"filename",
-	         "section_number",
-	         "interface_id",
-	         "ip_version",
-	         "src_ip",
-	         "dst_ip",
-	         "src_port",
-	         "dst_port",
-	         "transport",
-	         "stream_id",
-	         "message_number",
-	         "first_packet_number",
-	         "last_packet_number",
-	         "first_timestamp",
-	         "last_timestamp",
-	         "tcp_sequence",
-	         "reassembly_status",
-	         "reassembly_error",
-	         "message_data",
-	         "vlan_ids"};
-	types = {LogicalType::VARCHAR,   LogicalType::UINTEGER,
-	         LogicalType::UINTEGER,  LogicalType::UTINYINT,
-	         LogicalType::VARCHAR,   LogicalType::VARCHAR,
-	         LogicalType::USMALLINT, LogicalType::USMALLINT,
-	         LogicalType::VARCHAR,   LogicalType::UBIGINT,
-	         LogicalType::UBIGINT,   LogicalType::UBIGINT,
-	         LogicalType::UBIGINT,   LogicalType::TIMESTAMP,
-	         LogicalType::TIMESTAMP, LogicalType::UINTEGER,
-	         LogicalType::VARCHAR,   LogicalType::VARCHAR,
-	         LogicalType::BLOB,      LogicalType::LIST(LogicalType::USMALLINT)};
+	DnsMessagesSchema(types, names);
 	names.insert(names.end(), dns_names.begin(), dns_names.end());
 	types.insert(types.end(), dns_types.begin(), dns_types.end());
 	result->Cast<PcapBindData>().types = types;
@@ -2173,22 +2549,21 @@ static unique_ptr<GlobalTableFunctionState> DnsMessagesInit(ClientContext &conte
 	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
 	for (const auto column : state->columns) {
 		if (column >= MESSAGE_DNS_COLUMN_BEGIN && column < MESSAGE_DNS_COLUMN_END) {
-			state->decode_dns = true;
+			state->options.decode_dns = true; // dns_* columns are projected, so messages are parsed
 		}
 	}
 	return std::move(state);
 }
 
-static void SetMessageValue(Vector &vector, idx_t row, column_t column, const string &filename,
-                            const packetquapture::TcpDnsMessage &message, const PacketRecord &dns_record) {
-	const auto &key = message.key;
-	if (column >= MESSAGE_DNS_COLUMN_BEGIN && column < MESSAGE_DNS_COLUMN_END) {
-		SetRecordValue(vector, row, column - MESSAGE_DNS_COLUMN_BEGIN + DNS_COLUMN_BEGIN, dns_record);
-		return;
-	}
+// The first columns of every stream-level reader: the file, then the connection
+// as the transport core keyed it.
+static const column_t CONNECTION_COLUMN_COUNT = 8;
+static void SetConnectionValue(Vector &vector, idx_t row, column_t column, const string &filename,
+                               const packetquapture::TcpFlowKey &key) {
+	PQ_ASSERT(column < CONNECTION_COLUMN_COUNT);
 	switch (column) {
 	case 0:
-		vector.SetValue(row, filename);
+		SetStringCell(vector, row, filename);
 		break;
 	case 1:
 		SetDecodedScalar(vector, row, key.section);
@@ -2200,33 +2575,44 @@ static void SetMessageValue(Vector &vector, idx_t row, column_t column, const st
 		SetDecodedScalar(vector, row, key.ip_version);
 		break;
 	case 4:
-		vector.SetValue(row, IpString(key.src_ip, key.ip_version));
+		SetIpCell(vector, row, key.src_ip, key.ip_version);
 		break;
 	case 5:
-		vector.SetValue(row, IpString(key.dst_ip, key.ip_version));
+		SetIpCell(vector, row, key.dst_ip, key.ip_version);
 		break;
 	case 6:
 		SetDecodedScalar(vector, row, key.src_port);
 		break;
-	case 7:
+	default:
 		SetDecodedScalar(vector, row, key.dst_port);
 		break;
+	}
+}
+
+static void SetMessageValue(Vector &vector, idx_t row, column_t column, const string &filename,
+                            const packetquapture::TcpDnsMessage &message, const PacketRecord &dns_record) {
+	const auto &key = message.key;
+	if (column >= MESSAGE_DNS_COLUMN_BEGIN && column < MESSAGE_DNS_COLUMN_END) {
+		SetRecordValue(vector, row, column - MESSAGE_DNS_COLUMN_BEGIN + DNS_COLUMN_BEGIN, dns_record);
+		return;
+	}
+	if (column < CONNECTION_COLUMN_COUNT) {
+		SetConnectionValue(vector, row, column, filename, key);
+		return;
+	}
+	switch (column) {
 	case 8:
-		vector.SetValue(row, message.tcp ? "tcp" : "udp");
+		if (message.tcp) {
+			SetStringCell(vector, row, "tcp", 3);
+		} else {
+			SetStringCell(vector, row, "udp", 3);
+		}
 		break;
 	case 9:
-		if (message.tcp) {
-			SetDecodedScalar(vector, row, message.stream_id);
-		} else {
-			FlatVector::SetNull(vector, row, true);
-		}
+		SetOptionalScalar(vector, row, message.tcp, message.stream_id);
 		break;
 	case 10:
-		if (message.message_number) {
-			SetDecodedScalar(vector, row, message.message_number);
-		} else {
-			FlatVector::SetNull(vector, row, true);
-		}
+		SetOptionalScalar(vector, row, message.message_number != 0, message.message_number);
 		break;
 	case 11:
 		SetDecodedScalar(vector, row, message.first.number);
@@ -2237,48 +2623,36 @@ static void SetMessageValue(Vector &vector, idx_t row, column_t column, const st
 	case 13:
 	case 14: {
 		const auto &stamp = column == 13 ? message.first : message.last;
-		if (stamp.has_timestamp) {
-			vector.SetValue(row, Value::TIMESTAMP(timestamp_t(stamp.timestamp)));
-		} else {
-			FlatVector::SetNull(vector, row, true);
-		}
+		SetOptionalScalar(vector, row, stamp.has_timestamp, timestamp_t(stamp.timestamp));
 		break;
 	}
 	case 15:
-		if (message.tcp &&
-		    (message.status == "complete" || message.status == "incomplete" || message.status == "invalid")) {
+		if (message.tcp && (message.status == packetquapture::DnsFrameStatus::COMPLETE ||
+		                    message.status == packetquapture::DnsFrameStatus::INCOMPLETE ||
+		                    message.status == packetquapture::DnsFrameStatus::INVALID)) {
 			SetDecodedScalar(vector, row, message.sequence);
 		} else {
 			FlatVector::SetNull(vector, row, true);
 		}
 		break;
 	case 16:
-		vector.SetValue(row, message.status);
+		SetStringCell(vector, row, packetquapture::DnsFrameStatusName(message.status));
 		break;
 	case 17:
-		if (message.error.empty()) {
-			FlatVector::SetNull(vector, row, true);
-		} else {
-			vector.SetValue(row, message.error);
-		}
+		SetOptionalText(vector, row, message.error);
 		break;
 	case 18:
-		if (message.status != "complete") {
+		if (message.status != packetquapture::DnsFrameStatus::COMPLETE) {
 			FlatVector::SetNull(vector, row, true);
 		} else if (message.data.empty()) {
-			vector.SetValue(row, Value::BLOB(""));
+			SetStringCell(vector, row, "", 0);
 		} else {
-			vector.SetValue(row, Value::BLOB(message.data.data(), message.data.size()));
+			SetStringCell(vector, row, reinterpret_cast<const char *>(message.data.data()), message.data.size());
 		}
 		break;
-	case 19: {
-		duckdb::vector<Value> tags;
-		for (const auto tag : key.vlans) {
-			tags.push_back(Value::USMALLINT(tag));
-		}
-		vector.SetValue(row, Value::LIST(LogicalType::USMALLINT, tags));
+	case 19:
+		SetScalarListCell(vector, row, key.vlans.data(), key.vlans.size());
 		break;
-	}
 	default:
 		throw InternalException("Unexpected read_dns_messages column id %d", column);
 	}
@@ -2288,13 +2662,7 @@ static void DnsMessagesScan(ClientContext &context, TableFunctionInput &input, D
 	auto &bind = input.bind_data->Cast<PcapBindData>();
 	auto &global = input.global_state->Cast<StreamGlobalState>();
 	auto &state = input.local_state->Cast<StreamScanState>();
-	if (!state.initialized) {
-		state.initialized = true;
-		if (global.file_count) {
-			state.reservation = global.Admit();
-		}
-	}
-	if (!state.reservation) {
+	if (!AdmitStreamWorker(global, state)) {
 		return;
 	}
 	idx_t count = 0, output_bytes = 0;
@@ -2305,8 +2673,8 @@ static void DnsMessagesScan(ClientContext &context, TableFunctionInput &input, D
 		if (state.pending_index < state.pending.size()) {
 			const auto &message = state.pending[state.pending_index++];
 			PacketRecord dns_record;
-			if (global.decode_dns) {
-				if (message.status == "complete") {
+			if (global.options.decode_dns) {
+				if (message.status == packetquapture::DnsFrameStatus::COMPLETE) {
 					dns_record.dns = packetquapture::DecodeDns(message.data.data(), message.data.size());
 				} else {
 					dns_record.dns.error = message.error;
@@ -2317,16 +2685,16 @@ static void DnsMessagesScan(ClientContext &context, TableFunctionInput &input, D
 					SetMessageValue(output.data[i], count, global.columns[i], state.filename, message, dns_record);
 				}
 			}
-			output_bytes += 1024 + state.filename.size() + message.data.size() * 4;
+			output_bytes += ROW_BASE_BYTES + state.filename.size() + message.data.size() * PAYLOAD_COPIES;
 			output_bytes += (dns_record.dns.questions.size() + dns_record.dns.answers.size() +
 			                 dns_record.dns.authorities.size() + dns_record.dns.additionals.size()) *
-			                4096;
+			                DNS_RECORD_BYTES;
 			++count;
 			continue;
 		}
 		state.pending.clear();
 		state.pending_index = 0;
-		StreamEvent event;
+		auto &event = state.event;
 		if (!NextStreamEvent(context, bind, global, state, event)) {
 			break;
 		}
@@ -2341,10 +2709,10 @@ static void DnsMessagesScan(ClientContext &context, TableFunctionInput &input, D
 			message.first = message.last = Stamp(record);
 			message.message_number = 1;
 			if (packet.payload_length == packet.payload_declared_length) {
-				message.status = "complete";
+				message.status = packetquapture::DnsFrameStatus::COMPLETE;
 				message.data.assign(record.transport_data.begin(), record.transport_data.end());
 			} else {
-				message.status = "incomplete";
+				message.status = packetquapture::DnsFrameStatus::INCOMPLETE;
 				message.error = "truncated UDP DNS payload";
 				message.message_number = 0;
 			}
@@ -2353,10 +2721,7 @@ static void DnsMessagesScan(ClientContext &context, TableFunctionInput &input, D
 	}
 	output.SetCardinality(count);
 	if (!count) {
-		std::vector<packetquapture::TcpStream>().swap(state.streams);
-		std::vector<packetquapture::TcpDnsMessage>().swap(state.pending);
-		state.reassembler = packetquapture::TcpReassembler(bind.stream_limits);
-		state.reservation.reset();
+		ReleaseStreamWorker(bind, state);
 	}
 }
 
@@ -2396,7 +2761,7 @@ static LogicalType TlsCertificateType() {
 }
 
 // The tunnel that carried a handshake, when TLS did not begin a stream.
-static LogicalType TlsTunnelType() {
+static LogicalType MakeTlsTunnelType() {
 	child_list_t<LogicalType> fields;
 	fields.emplace_back("protocol", LogicalType::VARCHAR);
 	fields.emplace_back("destination", LogicalType::VARCHAR);
@@ -2404,119 +2769,90 @@ static LogicalType TlsTunnelType() {
 	fields.emplace_back("server_prefix_bytes", LogicalType::UINTEGER);
 	return LogicalType::STRUCT(std::move(fields));
 }
+// Built once: rows ask for it per cell, and a STRUCT type allocates.
+static const LogicalType &TlsTunnelType() {
+	static const LogicalType type = MakeTlsTunnelType();
+	return type;
+}
+
+// read_tls's schema, one column per line so each name sits beside its type.
+static void TlsSchema(vector<LogicalType> &types, vector<string> &names) {
+	const auto codes = LogicalType::LIST(LogicalType::USMALLINT);
+	const auto text = LogicalType::LIST(LogicalType::VARCHAR);
+	types.clear();
+	names.clear();
+	auto column = [&](const char *name, const LogicalType &type) {
+		names.emplace_back(name);
+		types.push_back(type);
+	};
+	column("filename", LogicalType::VARCHAR);
+	column("section_number", LogicalType::UINTEGER);
+	column("interface_id", LogicalType::UINTEGER);
+	column("ip_version", LogicalType::UTINYINT);
+	column("client_ip", LogicalType::VARCHAR);
+	column("server_ip", LogicalType::VARCHAR);
+	column("client_port", LogicalType::USMALLINT);
+	column("server_port", LogicalType::USMALLINT);
+	column("client_stream_id", LogicalType::UBIGINT);
+	column("server_stream_id", LogicalType::UBIGINT);
+	column("handshake_number", LogicalType::UBIGINT);
+	column("first_packet_number", LogicalType::UBIGINT);
+	column("last_packet_number", LogicalType::UBIGINT);
+	column("first_timestamp", LogicalType::TIMESTAMP);
+	column("last_timestamp", LogicalType::TIMESTAMP);
+	column("client_hello", LogicalType::BOOLEAN);
+	column("server_hello", LogicalType::BOOLEAN);
+	column("tls_sni", LogicalType::VARCHAR);
+	column("client_version", LogicalType::USMALLINT);
+	column("negotiated_version", LogicalType::USMALLINT);
+	column("cipher_suite", LogicalType::USMALLINT);
+	column("session_resumed", LogicalType::BOOLEAN);
+	column("reassembly_status", LogicalType::VARCHAR);
+	column("reassembly_error", LogicalType::VARCHAR);
+	column("vlan_ids", codes);
+	column("client_cipher_suites", codes);
+	column("client_cipher_suites_no_grease", codes);
+	column("client_extensions", codes);
+	column("client_extensions_no_grease", codes);
+	column("client_supported_groups", codes);
+	column("client_supported_groups_no_grease", codes);
+	column("client_signature_algorithms", codes);
+	column("client_signature_algorithms_no_grease", codes);
+	column("client_supported_versions", codes);
+	column("client_supported_versions_no_grease", codes);
+	column("client_ec_point_formats", LogicalType::LIST(LogicalType::UTINYINT));
+	column("client_alpn", text);
+	column("client_alpn_no_grease", text);
+	column("server_extensions", codes);
+	column("server_extensions_no_grease", codes);
+	column("server_alpn", LogicalType::VARCHAR);
+	column("warnings", text);
+	column("ja3", LogicalType::VARCHAR);
+	column("ja3_full", LogicalType::VARCHAR);
+	column("ja3s", LogicalType::VARCHAR);
+	column("ja3s_full", LogicalType::VARCHAR);
+	column("ja4", LogicalType::VARCHAR);
+	column("ja4_r", LogicalType::VARCHAR);
+	column("ja4s", LogicalType::VARCHAR);
+	column("ja4s_r", LogicalType::VARCHAR);
+	column("server_certificates", LogicalType::LIST(TlsCertificateType()));
+	column("tunnel", TlsTunnelType());
+	column("client_certificates", LogicalType::LIST(TlsCertificateType()));
+}
 
 static unique_ptr<FunctionData> TlsBind(ClientContext &context, TableFunctionBindInput &input,
                                         vector<LogicalType> &types, vector<string> &names) {
 	auto result = PcapBind(context, input, types, names);
 	BindStreamOptions(*result, input);
-	names = {"filename",
-	         "section_number",
-	         "interface_id",
-	         "ip_version",
-	         "client_ip",
-	         "server_ip",
-	         "client_port",
-	         "server_port",
-	         "client_stream_id",
-	         "server_stream_id",
-	         "handshake_number",
-	         "first_packet_number",
-	         "last_packet_number",
-	         "first_timestamp",
-	         "last_timestamp",
-	         "client_hello",
-	         "server_hello",
-	         "tls_sni",
-	         "client_version",
-	         "negotiated_version",
-	         "cipher_suite",
-	         "session_resumed",
-	         "reassembly_status",
-	         "reassembly_error",
-	         "vlan_ids",
-	         "client_cipher_suites",
-	         "client_cipher_suites_no_grease",
-	         "client_extensions",
-	         "client_extensions_no_grease",
-	         "client_supported_groups",
-	         "client_supported_groups_no_grease",
-	         "client_signature_algorithms",
-	         "client_signature_algorithms_no_grease",
-	         "client_supported_versions",
-	         "client_supported_versions_no_grease",
-	         "client_ec_point_formats",
-	         "client_alpn",
-	         "client_alpn_no_grease",
-	         "server_extensions",
-	         "server_extensions_no_grease",
-	         "server_alpn",
-	         "warnings",
-	         "ja3",
-	         "ja3_full",
-	         "ja3s",
-	         "ja3s_full",
-	         "ja4",
-	         "ja4_r",
-	         "ja4s",
-	         "ja4s_r",
-	         "server_certificates",
-	         "tunnel",
-	         "client_certificates"};
-	const auto codes = LogicalType::LIST(LogicalType::USMALLINT);
-	const auto text = LogicalType::LIST(LogicalType::VARCHAR);
-	types = {LogicalType::VARCHAR,
-	         LogicalType::UINTEGER,
-	         LogicalType::UINTEGER,
-	         LogicalType::UTINYINT,
-	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,
-	         LogicalType::USMALLINT,
-	         LogicalType::USMALLINT,
-	         LogicalType::UBIGINT,
-	         LogicalType::UBIGINT,
-	         LogicalType::UBIGINT,
-	         LogicalType::UBIGINT,
-	         LogicalType::UBIGINT,
-	         LogicalType::TIMESTAMP,
-	         LogicalType::TIMESTAMP,
-	         LogicalType::BOOLEAN,
-	         LogicalType::BOOLEAN,
-	         LogicalType::VARCHAR,
-	         LogicalType::USMALLINT,
-	         LogicalType::USMALLINT,
-	         LogicalType::USMALLINT,
-	         LogicalType::BOOLEAN,
-	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,
-	         codes,
-	         codes,
-	         codes,
-	         codes,
-	         codes,
-	         codes,
-	         codes,
-	         codes,
-	         codes,
-	         codes,
-	         codes,
-	         LogicalType::LIST(LogicalType::UTINYINT),
-	         text,
-	         text,
-	         codes,
-	         codes,
-	         LogicalType::VARCHAR,
-	         text,
-	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,
-	         LogicalType::LIST(TlsCertificateType()),
-	         TlsTunnelType(),
-	         LogicalType::LIST(TlsCertificateType())};
+	TlsSchema(types, names);
+	// The cell writers find column groups by position.
+	PQ_ASSERT(names.size() == TLS_CLIENT_CERTIFICATES + 1);
+	PQ_ASSERT(names[TLS_HELLO_COLUMNS_BEGIN] == "client_hello");
+	PQ_ASSERT(names[TLS_LIST_COLUMNS_BEGIN] == "client_cipher_suites");
+	PQ_ASSERT(names[TLS_FINGERPRINT_COLUMNS_BEGIN] == "ja3");
+	PQ_ASSERT(names[TLS_SERVER_CERTIFICATES] == "server_certificates");
+	PQ_ASSERT(names[TLS_TUNNEL] == "tunnel");
+	PQ_ASSERT(names[TLS_CLIENT_CERTIFICATES] == "client_certificates");
 	auto &bind = result->Cast<PcapBindData>();
 	bind.types = types;
 	bind.stream_plan =
@@ -2554,13 +2890,8 @@ static void SetTlsCodes(Vector &vector, idx_t row, const packetquapture::TlsList
 		FlatVector::SetNull(vector, row, true);
 		return;
 	}
-	duckdb::vector<Value> values;
-	for (const auto code : list.values) {
-		if (!skip_grease || !packetquapture::IsTlsGrease(code)) {
-			values.push_back(Value::USMALLINT(code));
-		}
-	}
-	vector.SetValue(row, Value::LIST(LogicalType::USMALLINT, values));
+	SetScalarListCell(vector, row, list.values.data(), list.values.size(),
+	                  [skip_grease](uint16_t code) { return !skip_grease || !packetquapture::IsTlsGrease(code); });
 }
 
 // ALPN identifiers are peer-supplied bytes, escaped as server names are.
@@ -2569,13 +2900,12 @@ static void SetTlsAlpn(Vector &vector, idx_t row, const packetquapture::TlsList<
 		FlatVector::SetNull(vector, row, true);
 		return;
 	}
-	duckdb::vector<Value> values;
-	for (const auto &protocol : list.values) {
-		if (!skip_grease || !packetquapture::IsTlsGreaseAlpn(protocol)) {
-			values.push_back(Value(packetquapture::EscapeTlsText(protocol)));
-		}
-	}
-	vector.SetValue(row, Value::LIST(LogicalType::VARCHAR, values));
+	SetStringListCell(
+	    vector, row, list.values,
+	    [skip_grease](const std::string &protocol) {
+		    return !skip_grease || !packetquapture::IsTlsGreaseAlpn(protocol);
+	    },
+	    [](const std::string &protocol) { return packetquapture::EscapeTlsText(protocol); });
 }
 
 static Value TextList(const std::vector<std::string> &items) {
@@ -2592,30 +2922,31 @@ static Value TextList(const std::vector<std::string> &items) {
 // JA3/JA4 raw strings, and each ALPN name is written twice and may grow
 // fourfold when escaped.
 static idx_t TlsRowBytes(const string &filename, const packetquapture::TlsHandshake &handshake) {
-	const idx_t codes = handshake.client_cipher_suites.values.size() + handshake.client_extensions.values.size() +
-	                    handshake.client_supported_groups.values.size() +
-	                    handshake.client_signature_algorithms.values.size() +
-	                    handshake.client_supported_versions.values.size() +
-	                    handshake.client_ec_point_formats.values.size() + handshake.server_extensions.values.size();
-	idx_t alpn = 0;
+	const idx_t code_count =
+	    handshake.client_cipher_suites.values.size() + handshake.client_extensions.values.size() +
+	    handshake.client_supported_groups.values.size() + handshake.client_signature_algorithms.values.size() +
+	    handshake.client_supported_versions.values.size() + handshake.client_ec_point_formats.values.size() +
+	    handshake.server_extensions.values.size();
+	idx_t alpn_bytes = 0;
 	for (const auto &protocol : handshake.client_alpn.values) {
-		alpn += 32 + 8 * protocol.size();
+		alpn_bytes += LIST_ENTRY_BYTES + 8 * protocol.size(); // the escaped text, in two columns
 	}
 	for (const auto &protocol : handshake.server_alpn.values) {
-		alpn += 32 + 4 * protocol.size();
+		alpn_bytes += LIST_ENTRY_BYTES + 4 * protocol.size(); // the escaped text, in one column
 	}
-	idx_t certificates = 0;
+	idx_t certificate_bytes = 0;
 	for (const auto *chain : {&handshake.server_certificates, &handshake.client_certificates}) {
 		for (const auto &certificate : chain->values) {
 			const auto &fields = certificate.fields;
-			certificates += 512 + fields.TextBytes();
-			certificates += 32 * (fields.san_dns.size() + fields.san_ip.size() + fields.key_usage.size() +
-			                      fields.extended_key_usage.size() + fields.ocsp_urls.size() +
-			                      fields.ca_issuers_urls.size() + fields.crl_urls.size() + fields.policies.size());
+			certificate_bytes += CERTIFICATE_BASE_BYTES + fields.TextBytes();
+			certificate_bytes +=
+			    LIST_ENTRY_BYTES * (fields.san_dns.size() + fields.san_ip.size() + fields.key_usage.size() +
+			                        fields.extended_key_usage.size() + fields.ocsp_urls.size() +
+			                        fields.ca_issuers_urls.size() + fields.crl_urls.size() + fields.policies.size());
 		}
 	}
-	return 1024 + filename.size() + handshake.sni.size() + 32 * codes + alpn + certificates +
-	       handshake.tunnel_destination.size();
+	return ROW_BASE_BYTES + filename.size() + handshake.sni.size() + LIST_ENTRY_BYTES * code_count + alpn_bytes +
+	       certificate_bytes + handshake.tunnel_destination.size();
 }
 
 static Value OptionalText(const std::string &text) {
@@ -2672,48 +3003,63 @@ static void SetTlsCertificates(Vector &vector, idx_t row,
 	vector.SetValue(row, Value::LIST(type, values));
 }
 
-static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const string &filename,
-                              const packetquapture::TlsHandshake &handshake) {
+// One row's fingerprint inputs, built on first use: the hash and raw columns of
+// JA3, JA3S, JA4 and JA4S share them, so projecting both builds each once.
+class TlsFingerprintInputs {
+public:
+	explicit TlsFingerprintInputs(const packetquapture::TlsHandshake &handshake_p) : handshake(handshake_p) {
+	}
+	// JA3 for the client side, JA3S for the server's; null when not computable.
+	const std::string *Ja3(bool client) {
+		auto &slot = ja3[client ? 0 : 1];
+		if (!slot.built) {
+			slot.built = true;
+			slot.valid = client ? packetquapture::Ja3String(handshake, slot.text)
+			                    : packetquapture::Ja3sString(handshake, slot.text);
+		}
+		return slot.valid ? &slot.text : nullptr;
+	}
+	// JA4 for the client side, JA4S for the server's; null when not computable.
+	const packetquapture::Ja4Parts *Ja4(bool client) {
+		auto &slot = ja4[client ? 0 : 1];
+		if (!slot.built) {
+			slot.built = true;
+			slot.valid = client ? packetquapture::Ja4Strings(handshake, slot.parts)
+			                    : packetquapture::Ja4sStrings(handshake, slot.parts);
+		}
+		return slot.valid ? &slot.parts : nullptr;
+	}
+
+private:
+	struct Ja3Slot {
+		bool built = false, valid = false;
+		std::string text;
+	};
+	struct Ja4Slot {
+		bool built = false, valid = false;
+		packetquapture::Ja4Parts parts;
+	};
+	const packetquapture::TlsHandshake &handshake;
+	Ja3Slot ja3[2];
+	Ja4Slot ja4[2];
+};
+
+// The connection and provenance columns.
+static void SetHandshakeKeyValue(Vector &vector, idx_t row, column_t column, const string &filename,
+                                 const packetquapture::TlsHandshake &handshake) {
+	PQ_ASSERT(column < TLS_HELLO_COLUMNS_BEGIN);
 	const auto &key = handshake.key;
+	if (column < CONNECTION_COLUMN_COUNT) {
+		SetConnectionValue(vector, row, column, filename, key);
+		return;
+	}
 	switch (column) {
-	case 0:
-		vector.SetValue(row, filename);
-		break;
-	case 1:
-		SetDecodedScalar(vector, row, key.section);
-		break;
-	case 2:
-		SetDecodedScalar(vector, row, key.interface_id);
-		break;
-	case 3:
-		SetDecodedScalar(vector, row, key.ip_version);
-		break;
-	case 4:
-		vector.SetValue(row, IpString(key.src_ip, key.ip_version));
-		break;
-	case 5:
-		vector.SetValue(row, IpString(key.dst_ip, key.ip_version));
-		break;
-	case 6:
-		SetDecodedScalar(vector, row, key.src_port);
-		break;
-	case 7:
-		SetDecodedScalar(vector, row, key.dst_port);
-		break;
 	// A stream id is NULL when that direction of the connection was not captured.
 	case 8:
-		if (handshake.has_client_stream) {
-			SetDecodedScalar(vector, row, handshake.client_stream_id);
-		} else {
-			FlatVector::SetNull(vector, row, true);
-		}
+		SetOptionalScalar(vector, row, handshake.has_client_stream, handshake.client_stream_id);
 		break;
 	case 9:
-		if (handshake.has_server_stream) {
-			SetDecodedScalar(vector, row, handshake.server_stream_id);
-		} else {
-			FlatVector::SetNull(vector, row, true);
-		}
+		SetOptionalScalar(vector, row, handshake.has_server_stream, handshake.server_stream_id);
 		break;
 	case 10:
 		SetDecodedScalar(vector, row, handshake.handshake_number);
@@ -2724,16 +3070,19 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 	case 12:
 		SetDecodedScalar(vector, row, handshake.last.number);
 		break;
-	case 13:
-	case 14: {
+	default: {
 		const auto &stamp = column == 13 ? handshake.first : handshake.last;
-		if (stamp.has_timestamp) {
-			vector.SetValue(row, Value::TIMESTAMP(timestamp_t(stamp.timestamp)));
-		} else {
-			FlatVector::SetNull(vector, row, true);
-		}
+		SetOptionalScalar(vector, row, stamp.has_timestamp, timestamp_t(stamp.timestamp));
 		break;
 	}
+	}
+}
+
+// What the hellos said, and the row's status.
+static void SetHandshakeHelloValue(Vector &vector, idx_t row, column_t column,
+                                   const packetquapture::TlsHandshake &handshake) {
+	PQ_ASSERT(column >= TLS_HELLO_COLUMNS_BEGIN && column < TLS_LIST_COLUMNS_BEGIN);
+	switch (column) {
 	case 15:
 		SetDecodedScalar(vector, row, handshake.has_client_hello);
 		break;
@@ -2742,58 +3091,41 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 		break;
 	case 17:
 		if (handshake.has_sni) {
-			vector.SetValue(row, handshake.sni);
+			SetStringCell(vector, row, handshake.sni);
 		} else {
 			FlatVector::SetNull(vector, row, true);
 		}
 		break;
 	case 18:
-		if (handshake.has_client_version) {
-			SetDecodedScalar(vector, row, handshake.client_version);
-		} else {
-			FlatVector::SetNull(vector, row, true);
-		}
+		SetOptionalScalar(vector, row, handshake.has_client_version, handshake.client_version);
 		break;
 	case 19:
-		if (handshake.has_negotiated_version) {
-			SetDecodedScalar(vector, row, handshake.negotiated_version);
-		} else {
-			FlatVector::SetNull(vector, row, true);
-		}
+		SetOptionalScalar(vector, row, handshake.has_negotiated_version, handshake.negotiated_version);
 		break;
 	case 20:
-		if (handshake.has_cipher_suite) {
-			SetDecodedScalar(vector, row, handshake.cipher_suite);
-		} else {
-			FlatVector::SetNull(vector, row, true);
-		}
+		SetOptionalScalar(vector, row, handshake.has_cipher_suite, handshake.cipher_suite);
 		break;
 	case 21:
 		// Undecidable without both directions, and meaningless in TLS 1.3.
-		if (handshake.has_resumed) {
-			SetDecodedScalar(vector, row, handshake.resumed);
-		} else {
-			FlatVector::SetNull(vector, row, true);
-		}
+		SetOptionalScalar(vector, row, handshake.has_resumed, handshake.resumed);
 		break;
 	case 22:
-		vector.SetValue(row, handshake.status);
+		SetStringCell(vector, row, packetquapture::TlsStatusName(handshake.status));
 		break;
 	case 23:
-		if (handshake.error.empty()) {
-			FlatVector::SetNull(vector, row, true);
-		} else {
-			vector.SetValue(row, handshake.error);
-		}
+		SetOptionalText(vector, row, handshake.error);
 		break;
-	case 24: {
-		duckdb::vector<Value> values;
-		for (const auto vlan : key.vlans) {
-			values.push_back(Value::USMALLINT(vlan));
-		}
-		vector.SetValue(row, Value::LIST(LogicalType::USMALLINT, values));
+	default:
+		SetScalarListCell(vector, row, handshake.key.vlans.data(), handshake.key.vlans.size());
 		break;
 	}
+}
+
+// The hello lists, each with its GREASE-free twin, and the warnings.
+static void SetHandshakeListValue(Vector &vector, idx_t row, column_t column,
+                                  const packetquapture::TlsHandshake &handshake) {
+	PQ_ASSERT(column >= TLS_LIST_COLUMNS_BEGIN && column < TLS_FINGERPRINT_COLUMNS_BEGIN);
+	switch (column) {
 	case 25:
 	case 26:
 		SetTlsCodes(vector, row, handshake.client_cipher_suites, column == 26);
@@ -2821,11 +3153,7 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 			FlatVector::SetNull(vector, row, true);
 			break;
 		}
-		duckdb::vector<Value> values;
-		for (const auto format : list.values) {
-			values.push_back(Value::UTINYINT(format));
-		}
-		vector.SetValue(row, Value::LIST(LogicalType::UTINYINT, values));
+		SetScalarListCell(vector, row, list.values.data(), list.values.size());
 		break;
 	}
 	case 36:
@@ -2838,123 +3166,137 @@ static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const 
 		break;
 	case 40:
 		if (handshake.server_alpn.present && !handshake.server_alpn.values.empty()) {
-			vector.SetValue(row, packetquapture::EscapeTlsText(handshake.server_alpn.values.front()));
+			SetStringCell(vector, row, packetquapture::EscapeTlsText(handshake.server_alpn.values.front()));
 		} else {
 			FlatVector::SetNull(vector, row, true);
 		}
 		break;
-	case 41: {
-		duckdb::vector<Value> values;
-		for (const auto &warning : handshake.warnings) {
-			values.push_back(Value(warning));
-		}
-		vector.SetValue(row, Value::LIST(LogicalType::VARCHAR, values));
+	default:
+		SetStringListCell(
+		    vector, row, handshake.warnings, [](const std::string &) { return true; },
+		    [](const std::string &warning) { return warning; });
 		break;
 	}
-	// Fingerprints are built only when projected, like every other column, so
-	// queries that do not ask for them pay nothing. NULL rather than a hash of
-	// partial input; see tls_fingerprint.hpp.
-	case 42:
-	case 43:
-	case 44:
-	case 45: {
-		std::string text;
-		const bool client = column == 42 || column == 43;
-		if (!(client ? packetquapture::Ja3String(handshake, text) : packetquapture::Ja3sString(handshake, text))) {
+}
+
+// JA3 and JA3S, then JA4 and JA4S, each hashed and raw. Fingerprints are built
+// only when projected, like every other column, so queries that do not ask for
+// them pay nothing. NULL rather than a hash of partial input; see
+// tls_fingerprint.hpp. JA4S is FoxIO License 1.1; see NOTICE.
+static void SetHandshakeFingerprintValue(Vector &vector, idx_t row, column_t column,
+                                         TlsFingerprintInputs &fingerprints) {
+	PQ_ASSERT(column >= TLS_FINGERPRINT_COLUMNS_BEGIN && column < TLS_FINGERPRINT_COLUMNS_END);
+	if (column < 46) {
+		const auto *text = fingerprints.Ja3(column == 42 || column == 43);
+		if (text == nullptr) {
 			FlatVector::SetNull(vector, row, true);
 		} else if (column == 43 || column == 45) {
-			vector.SetValue(row, Value(text));
+			SetStringCell(vector, row, *text);
 		} else {
 			MD5Context md5;
-			md5.Add(text);
-			vector.SetValue(row, Value(md5.FinishHex()));
+			md5.Add(*text);
+			SetStringCell(vector, row, md5.FinishHex());
 		}
-		break;
+		return;
 	}
-	// JA4 and JA4S, and their raw forms. JA4S is FoxIO License 1.1; see NOTICE.
-	case 46:
-	case 47:
-	case 48:
-	case 49: {
-		packetquapture::Ja4Parts parts;
-		const bool client = column == 46 || column == 47;
-		if (!(client ? packetquapture::Ja4Strings(handshake, parts) : packetquapture::Ja4sStrings(handshake, parts))) {
-			FlatVector::SetNull(vector, row, true);
-		} else if (column == 47 || column == 49) {
-			vector.SetValue(row, Value(parts.prefix + "_" + parts.first + "_" + parts.second));
-		} else {
-			// JA4S carries its one cipher suite as is; JA4 hashes its cipher list.
-			const auto first = client ? Ja4Hash12(parts.first) : parts.first;
-			vector.SetValue(row, Value(parts.prefix + "_" + first + "_" + Ja4Hash12(parts.second)));
-		}
-		break;
+	const bool client = column == 46 || column == 47;
+	const auto *parts = fingerprints.Ja4(client);
+	if (parts == nullptr) {
+		FlatVector::SetNull(vector, row, true);
+	} else if (column == 47 || column == 49) {
+		SetStringCell(vector, row, parts->prefix + "_" + parts->first + "_" + parts->second);
+	} else {
+		// JA4S carries its one cipher suite as is; JA4 hashes its cipher list.
+		const auto first = client ? Ja4Hash12(parts->first) : parts->first;
+		SetStringCell(vector, row, parts->prefix + "_" + first + "_" + Ja4Hash12(parts->second));
 	}
-	// The chain from each side's Certificate message, leaf first. An entry that
-	// did not parse is a NULL element, so positions still match the chain.
-	case TLS_SERVER_CERTIFICATES:
+}
+
+// NULL unless a prefix came before TLS in a captured direction. The protocol
+// is the client's reading of its own prefix when it has one, since only the
+// client's request names the destination; otherwise the server's.
+static void SetHandshakeTunnel(Vector &vector, idx_t row, const packetquapture::TlsHandshake &handshake) {
+	if (handshake.client_prefix_bytes == 0 && handshake.server_prefix_bytes == 0) {
+		FlatVector::SetNull(vector, row, true);
+		return;
+	}
+	const auto &protocol = !handshake.client_tunnel.empty() ? handshake.client_tunnel : handshake.server_tunnel;
+	vector.SetValue(
+	    row, Value::STRUCT(TlsTunnelType(), {protocol.empty() ? Value(LogicalType::VARCHAR) : Value(protocol),
+	                                         handshake.tunnel_destination.empty() ? Value(LogicalType::VARCHAR)
+	                                                                              : Value(handshake.tunnel_destination),
+	                                         handshake.has_client_hello ? Value::UINTEGER(handshake.client_prefix_bytes)
+	                                                                    : Value(LogicalType::UINTEGER),
+	                                         handshake.has_server_hello ? Value::UINTEGER(handshake.server_prefix_bytes)
+	                                                                    : Value(LogicalType::UINTEGER)}));
+}
+
+static void SetHandshakeValue(Vector &vector, idx_t row, column_t column, const string &filename,
+                              const packetquapture::TlsHandshake &handshake, TlsFingerprintInputs &fingerprints) {
+	if (column < TLS_HELLO_COLUMNS_BEGIN) {
+		SetHandshakeKeyValue(vector, row, column, filename, handshake);
+	} else if (column < TLS_LIST_COLUMNS_BEGIN) {
+		SetHandshakeHelloValue(vector, row, column, handshake);
+	} else if (column < TLS_FINGERPRINT_COLUMNS_BEGIN) {
+		SetHandshakeListValue(vector, row, column, handshake);
+	} else if (column < TLS_FINGERPRINT_COLUMNS_END) {
+		SetHandshakeFingerprintValue(vector, row, column, fingerprints);
+	} else if (column == TLS_SERVER_CERTIFICATES) {
+		// The chain from each side's Certificate message, leaf first. An entry that
+		// did not parse is a NULL element, so positions still match the chain.
 		SetTlsCertificates(vector, row, handshake.server_certificates);
-		break;
-	case TLS_CLIENT_CERTIFICATES:
+	} else if (column == TLS_CLIENT_CERTIFICATES) {
 		SetTlsCertificates(vector, row, handshake.client_certificates);
-		break;
-	// NULL unless a prefix came before TLS in a captured direction. The protocol
-	// is the client's reading of its own prefix when it has one, since only the
-	// client's request names the destination; otherwise the server's.
-	case 51: {
-		if (handshake.client_prefix_bytes == 0 && handshake.server_prefix_bytes == 0) {
-			FlatVector::SetNull(vector, row, true);
-			break;
-		}
-		const auto &protocol = !handshake.client_tunnel.empty() ? handshake.client_tunnel : handshake.server_tunnel;
-		vector.SetValue(row, Value::STRUCT(TlsTunnelType(),
-		                                   {protocol.empty() ? Value(LogicalType::VARCHAR) : Value(protocol),
-		                                    handshake.tunnel_destination.empty() ? Value(LogicalType::VARCHAR)
-		                                                                         : Value(handshake.tunnel_destination),
-		                                    handshake.has_client_hello ? Value::UINTEGER(handshake.client_prefix_bytes)
-		                                                               : Value(LogicalType::UINTEGER),
-		                                    handshake.has_server_hello ? Value::UINTEGER(handshake.server_prefix_bytes)
-		                                                               : Value(LogicalType::UINTEGER)}));
-		break;
-	}
-	default:
+	} else if (column == TLS_TUNNEL) {
+		SetHandshakeTunnel(vector, row, handshake);
+	} else {
 		throw InternalException("Unexpected read_tls column id %d", column);
 	}
+}
+
+// Hashing certificates costs per certificate, so the assembler does it only when
+// a certificate column is projected. Decided on the worker's first call.
+static void ConfigureTlsWorker(const StreamGlobalState &global, StreamScanState &state) {
+	if (state.tls_configured) {
+		return;
+	}
+	for (const auto column : global.columns) {
+		state.tls_digest = state.tls_digest || column == TLS_SERVER_CERTIFICATES || column == TLS_CLIENT_CERTIFICATES;
+	}
+	state.tls_assembler = NewTlsAssembler(state.tls_digest);
+	state.tls_configured = true;
+}
+
+// Writes the next held handshake as output row `row`; returns its estimated bytes.
+static idx_t EmitTlsRow(const PcapBindData &bind, const StreamGlobalState &global, StreamScanState &state,
+                        DataChunk &output, idx_t row) {
+	PQ_ASSERT(state.tls_pending_index < state.tls_pending.size());
+	const auto &handshake = state.tls_pending[state.tls_pending_index++];
+	TlsFingerprintInputs fingerprints(handshake);
+	for (idx_t i = 0; i < global.columns.size(); ++i) {
+		if (!bind.SetPartition(output.data[i], row, global.columns[i], state.tls_pending_file_index)) {
+			SetHandshakeValue(output.data[i], row, global.columns[i], state.tls_pending_filename, handshake,
+			                  fingerprints);
+		}
+	}
+	return TlsRowBytes(state.tls_pending_filename, handshake);
 }
 
 static void TlsScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind = input.bind_data->Cast<PcapBindData>();
 	auto &global = input.global_state->Cast<StreamGlobalState>();
 	auto &state = input.local_state->Cast<StreamScanState>();
-	if (!state.initialized) {
-		state.initialized = true;
-		if (global.file_count) {
-			state.reservation = global.Admit();
-		}
-	}
-	if (!state.reservation) {
+	if (!AdmitStreamWorker(global, state)) {
 		return;
 	}
 	idx_t count = 0, output_bytes = 0;
-	if (!state.tls_configured) {
-		for (const auto column : global.columns) {
-			state.tls_digest =
-			    state.tls_digest || column == TLS_SERVER_CERTIFICATES || column == TLS_CLIENT_CERTIFICATES;
-		}
-		state.tls_assembler = NewTlsAssembler(state.tls_digest);
-		state.tls_configured = true;
-	}
+	ConfigureTlsWorker(global, state);
 	while (count < STANDARD_VECTOR_SIZE && output_bytes < STREAM_OUTPUT_BATCH_BYTES) {
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
 		if (state.tls_pending_index < state.tls_pending.size()) {
-			const auto &handshake = state.tls_pending[state.tls_pending_index++];
-			for (idx_t i = 0; i < global.columns.size(); ++i) {
-				if (!bind.SetPartition(output.data[i], count, global.columns[i], state.tls_pending_file_index)) {
-					SetHandshakeValue(output.data[i], count, global.columns[i], state.tls_pending_filename, handshake);
-				}
-			}
-			output_bytes += TlsRowBytes(state.tls_pending_filename, handshake);
+			output_bytes += EmitTlsRow(bind, global, state, output, count);
 			++count;
 			continue;
 		}
@@ -2963,7 +3305,7 @@ static void TlsScan(ClientContext &context, TableFunctionInput &input, DataChunk
 		if (state.tls_drained) {
 			break;
 		}
-		StreamEvent event;
+		auto &event = state.event;
 		if (!NextStreamEvent(context, bind, global, state, event)) {
 			// Directions still waiting for a peer are reported on their own.
 			state.tls_drained = true;
@@ -2972,10 +3314,9 @@ static void TlsScan(ClientContext &context, TableFunctionInput &input, DataChunk
 			state.tls_pending_file_index = state.tls_open_file_index;
 			continue;
 		}
-		// TLS runs over TCP. DTLS frames differently and is not parsed.
-		if (!event.tcp) {
-			continue;
-		}
+		// TLS runs over TCP, and a TLS scan reassembles TCP only (the reader drops
+		// every other packet), so a non-TCP event would mean that filter broke.
+		PQ_ASSERT(event.tcp);
 		if (state.tls_open_filename != state.filename || state.tls_open_file_index != state.file_index) {
 			// A connection cannot span files, so anything still held belongs to
 			// the file just finished and is reported before moving on.
@@ -2987,96 +3328,83 @@ static void TlsScan(ClientContext &context, TableFunctionInput &input, DataChunk
 		}
 		auto handshakes = state.tls_assembler.Add(event.stream);
 		if (!handshakes.empty()) {
-			// Nothing pairs on the first stream of a file, so these two never
-			// collide; append rather than assume it.
-			if (state.tls_pending.empty()) {
-				state.tls_pending_filename = state.filename;
-				state.tls_pending_file_index = state.file_index;
-				state.tls_pending = std::move(handshakes);
-			} else {
-				state.tls_pending.insert(state.tls_pending.end(), std::make_move_iterator(handshakes.begin()),
-				                         std::make_move_iterator(handshakes.end()));
-			}
+			// Nothing pairs on the first stream of a file, so rows held from the
+			// previous file are never pending here; were they, these rows would be
+			// filed under that file's name.
+			PQ_ASSERT(state.tls_pending.empty());
+			state.tls_pending_filename = state.filename;
+			state.tls_pending_file_index = state.file_index;
+			state.tls_pending = std::move(handshakes);
 		}
 	}
 	output.SetCardinality(count);
 	if (!count) {
-		std::vector<packetquapture::TcpStream>().swap(state.streams);
-		std::vector<packetquapture::TlsHandshake>().swap(state.tls_pending);
-		state.tls_assembler = NewTlsAssembler(state.tls_digest);
-		state.reassembler = packetquapture::TcpReassembler(bind.stream_limits);
-		state.reservation.reset();
+		ReleaseStreamWorker(bind, state);
 	}
 }
 
-static LogicalType TcpChunkType() {
+static LogicalType MakeTcpChunkType() {
 	return LogicalType::STRUCT({{"offset", LogicalType::UINTEGER},
 	                            {"tcp_sequence", LogicalType::UINTEGER},
 	                            {"data", LogicalType::BLOB},
 	                            {"first_packet_number", LogicalType::UBIGINT},
 	                            {"last_packet_number", LogicalType::UBIGINT}});
 }
-static LogicalType TcpGapType() {
+// Built once: rows ask for it per cell, and a STRUCT type allocates.
+static const LogicalType &TcpChunkType() {
+	static const LogicalType type = MakeTcpChunkType();
+	return type;
+}
+static LogicalType MakeTcpGapType() {
 	return LogicalType::STRUCT({{"offset", LogicalType::UINTEGER}, {"length", LogicalType::UINTEGER}});
 }
+// Built once: rows ask for it per cell, and a STRUCT type allocates.
+static const LogicalType &TcpGapType() {
+	static const LogicalType type = MakeTcpGapType();
+	return type;
+}
+// read_tcp_streams's schema, one column per line so each name sits beside its type.
+static void TcpStreamsSchema(vector<LogicalType> &types, vector<string> &names) {
+	types.clear();
+	names.clear();
+	auto column = [&](const char *name, const LogicalType &type) {
+		names.emplace_back(name);
+		types.push_back(type);
+	};
+	column("filename", LogicalType::VARCHAR);
+	column("section_number", LogicalType::UINTEGER);
+	column("interface_id", LogicalType::UINTEGER);
+	column("ip_version", LogicalType::UTINYINT);
+	column("src_ip", LogicalType::VARCHAR);
+	column("dst_ip", LogicalType::VARCHAR);
+	column("src_port", LogicalType::USMALLINT);
+	column("dst_port", LogicalType::USMALLINT);
+	column("stream_id", LogicalType::UBIGINT);
+	column("tcp_sequence", LogicalType::UINTEGER);
+	column("syn_seen", LogicalType::BOOLEAN);
+	column("fin_seen", LogicalType::BOOLEAN);
+	column("reset_seen", LogicalType::BOOLEAN);
+	column("finalized_by", LogicalType::VARCHAR);
+	column("reassembly_status", LogicalType::VARCHAR);
+	column("reassembly_error", LogicalType::VARCHAR);
+	column("first_packet_number", LogicalType::UBIGINT);
+	column("last_packet_number", LogicalType::UBIGINT);
+	column("first_timestamp", LogicalType::TIMESTAMP);
+	column("last_timestamp", LogicalType::TIMESTAMP);
+	column("expected_bytes", LogicalType::UINTEGER);
+	column("captured_bytes", LogicalType::UINTEGER);
+	column("has_gaps", LogicalType::BOOLEAN);
+	column("stream_data", LogicalType::BLOB);
+	column("chunks", LogicalType::LIST(TcpChunkType()));
+	column("gaps", LogicalType::LIST(TcpGapType()));
+	column("vlan_ids", LogicalType::LIST(LogicalType::USMALLINT));
+}
+
 static unique_ptr<FunctionData> TcpStreamsBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &types, vector<string> &names) {
 	auto result = PcapBind(context, input, types, names);
 	BindStreamOptions(*result, input);
-	names = {"filename",
-	         "section_number",
-	         "interface_id",
-	         "ip_version",
-	         "src_ip",
-	         "dst_ip",
-	         "src_port",
-	         "dst_port",
-	         "stream_id",
-	         "tcp_sequence",
-	         "syn_seen",
-	         "fin_seen",
-	         "reset_seen",
-	         "finalized_by",
-	         "reassembly_status",
-	         "reassembly_error",
-	         "first_packet_number",
-	         "last_packet_number",
-	         "first_timestamp",
-	         "last_timestamp",
-	         "expected_bytes",
-	         "captured_bytes",
-	         "has_gaps",
-	         "stream_data",
-	         "chunks",
-	         "gaps",
-	         "vlan_ids"};
-	types = {LogicalType::VARCHAR,
-	         LogicalType::UINTEGER,
-	         LogicalType::UINTEGER,
-	         LogicalType::UTINYINT,
-	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,
-	         LogicalType::USMALLINT,
-	         LogicalType::USMALLINT,
-	         LogicalType::UBIGINT,
-	         LogicalType::UINTEGER,
-	         LogicalType::BOOLEAN,
-	         LogicalType::BOOLEAN,
-	         LogicalType::BOOLEAN,
-	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,
-	         LogicalType::UBIGINT,
-	         LogicalType::UBIGINT,
-	         LogicalType::TIMESTAMP,
-	         LogicalType::TIMESTAMP,
-	         LogicalType::UINTEGER,
-	         LogicalType::UINTEGER,
-	         LogicalType::BOOLEAN,
-	         LogicalType::BLOB,
-	         LogicalType::LIST(TcpChunkType()),
-	         LogicalType::LIST(TcpGapType()),
-	         LogicalType::LIST(LogicalType::USMALLINT)};
+	TcpStreamsSchema(types, names);
 	result->Cast<PcapBindData>().types = types;
 	result->Cast<PcapBindData>().stream_plan =
 	    context.registered_state->GetOrCreate<StreamPlanRegistry>("packetquapture_stream_plans")->Register();
@@ -3090,67 +3418,30 @@ static unique_ptr<GlobalTableFunctionState> TcpStreamsInit(ClientContext &contex
 	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
 	return std::move(state);
 }
-static void SetStreamValue(Vector &vector, idx_t row, column_t column, const string &filename,
-                           const packetquapture::TcpStream &stream) {
-	const auto &key = stream.key;
-	const bool failed = stream.status == "conflict" || stream.status == "limit";
-	if (failed && (column == 9 || (column >= 20 && column <= 25))) {
-		FlatVector::SetNull(vector, row, true);
-		return;
+// The captured runs of a stream, each with the packets that carried it.
+static void SetTcpChunks(Vector &vector, idx_t row, const packetquapture::TcpStream &stream) {
+	duckdb::vector<Value> values;
+	for (const auto &chunk : stream.chunks) {
+		const auto stamps = chunk.Provenance(0, chunk.data.size());
+		values.push_back(
+		    Value::STRUCT(TcpChunkType(), {Value::UINTEGER(chunk.offset), Value::UINTEGER(chunk.sequence),
+		                                   Value::BLOB(chunk.data.data(), chunk.data.size()),
+		                                   Value::UBIGINT(stamps.first.number), Value::UBIGINT(stamps.second.number)}));
 	}
+	vector.SetValue(row, Value::LIST(TcpChunkType(), values));
+}
+
+static void SetTcpGaps(Vector &vector, idx_t row, const packetquapture::TcpStream &stream) {
+	duckdb::vector<Value> values;
+	for (const auto &gap : stream.gaps) {
+		values.push_back(Value::STRUCT(TcpGapType(), {Value::UINTEGER(gap.offset), Value::UINTEGER(gap.length)}));
+	}
+	vector.SetValue(row, Value::LIST(TcpGapType(), values));
+}
+
+// What was captured of a stream: its packets, bytes, gaps and VLANs.
+static void SetStreamCaptureValue(Vector &vector, idx_t row, column_t column, const packetquapture::TcpStream &stream) {
 	switch (column) {
-	case 0:
-		vector.SetValue(row, filename);
-		break;
-	case 1:
-		SetDecodedScalar(vector, row, key.section);
-		break;
-	case 2:
-		SetDecodedScalar(vector, row, key.interface_id);
-		break;
-	case 3:
-		SetDecodedScalar(vector, row, key.ip_version);
-		break;
-	case 4:
-		vector.SetValue(row, IpString(key.src_ip, key.ip_version));
-		break;
-	case 5:
-		vector.SetValue(row, IpString(key.dst_ip, key.ip_version));
-		break;
-	case 6:
-		SetDecodedScalar(vector, row, key.src_port);
-		break;
-	case 7:
-		SetDecodedScalar(vector, row, key.dst_port);
-		break;
-	case 8:
-		SetDecodedScalar(vector, row, stream.stream_id);
-		break;
-	case 9:
-		SetDecodedScalar(vector, row, stream.sequence);
-		break;
-	case 10:
-		SetDecodedScalar(vector, row, stream.syn_seen);
-		break;
-	case 11:
-		SetDecodedScalar(vector, row, stream.fin_seen);
-		break;
-	case 12:
-		SetDecodedScalar(vector, row, stream.finalized_by == "reset");
-		break;
-	case 13:
-		vector.SetValue(row, stream.finalized_by);
-		break;
-	case 14:
-		vector.SetValue(row, stream.status);
-		break;
-	case 15:
-		if (stream.error.empty()) {
-			FlatVector::SetNull(vector, row, true);
-		} else {
-			vector.SetValue(row, stream.error);
-		}
-		break;
 	case 16:
 		SetDecodedScalar(vector, row, stream.first.number);
 		break;
@@ -3160,11 +3451,7 @@ static void SetStreamValue(Vector &vector, idx_t row, column_t column, const str
 	case 18:
 	case 19: {
 		const auto &stamp = column == 18 ? stream.first : stream.last;
-		if (stamp.has_timestamp) {
-			vector.SetValue(row, Value::TIMESTAMP(timestamp_t(stamp.timestamp)));
-		} else {
-			FlatVector::SetNull(vector, row, true);
-		}
+		SetOptionalScalar(vector, row, stamp.has_timestamp, timestamp_t(stamp.timestamp));
 		break;
 	}
 	case 20:
@@ -3181,52 +3468,71 @@ static void SetStreamValue(Vector &vector, idx_t row, column_t column, const str
 			FlatVector::SetNull(vector, row, true);
 		} else {
 			const auto &bytes = stream.chunks[0].data;
-			vector.SetValue(row, Value::BLOB(bytes.data(), bytes.size()));
+			SetStringCell(vector, row, reinterpret_cast<const char *>(bytes.data()), bytes.size());
 		}
 		break;
-	case 24: {
-		duckdb::vector<Value> values;
-		for (const auto &chunk : stream.chunks) {
-			const auto stamps = chunk.Provenance(0, chunk.data.size());
-			values.push_back(Value::STRUCT(
-			    TcpChunkType(), {Value::UINTEGER(chunk.offset), Value::UINTEGER(chunk.sequence),
-			                     Value::BLOB(chunk.data.data(), chunk.data.size()), Value::UBIGINT(stamps.first.number),
-			                     Value::UBIGINT(stamps.second.number)}));
-		}
-		vector.SetValue(row, Value::LIST(TcpChunkType(), values));
+	case 24:
+		SetTcpChunks(vector, row, stream);
 		break;
-	}
-	case 25: {
-		duckdb::vector<Value> values;
-		for (const auto &gap : stream.gaps) {
-			values.push_back(Value::STRUCT(TcpGapType(), {Value::UINTEGER(gap.offset), Value::UINTEGER(gap.length)}));
-		}
-		vector.SetValue(row, Value::LIST(TcpGapType(), values));
+	case 25:
+		SetTcpGaps(vector, row, stream);
 		break;
-	}
-	case 26: {
-		duckdb::vector<Value> values;
-		for (const auto tag : key.vlans) {
-			values.push_back(Value::USMALLINT(tag));
-		}
-		vector.SetValue(row, Value::LIST(LogicalType::USMALLINT, values));
+	case 26:
+		SetScalarListCell(vector, row, stream.key.vlans.data(), stream.key.vlans.size());
 		break;
-	}
 	default:
 		throw InternalException("Unexpected read_tcp_streams column id %d", column);
+	}
+}
+
+static void SetStreamValue(Vector &vector, idx_t row, column_t column, const string &filename,
+                           const packetquapture::TcpStream &stream) {
+	const auto &key = stream.key;
+	const bool failed = stream.status == packetquapture::TcpStreamStatus::CONFLICT ||
+	                    stream.status == packetquapture::TcpStreamStatus::LIMIT;
+	if (failed && (column == 9 || (column >= 20 && column <= 25))) {
+		FlatVector::SetNull(vector, row, true);
+		return;
+	}
+	if (column < CONNECTION_COLUMN_COUNT) {
+		SetConnectionValue(vector, row, column, filename, key);
+		return;
+	}
+	switch (column) {
+	case 8:
+		SetDecodedScalar(vector, row, stream.stream_id);
+		break;
+	case 9:
+		SetDecodedScalar(vector, row, stream.sequence);
+		break;
+	case 10:
+		SetDecodedScalar(vector, row, stream.syn_seen);
+		break;
+	case 11:
+		SetDecodedScalar(vector, row, stream.fin_seen);
+		break;
+	case 12:
+		SetDecodedScalar(vector, row, stream.finalized_by == "reset");
+		break;
+	case 13:
+		SetStringCell(vector, row, stream.finalized_by);
+		break;
+	case 14:
+		SetStringCell(vector, row, packetquapture::TcpStreamStatusName(stream.status));
+		break;
+	case 15:
+		SetOptionalText(vector, row, stream.error);
+		break;
+	default:
+		SetStreamCaptureValue(vector, row, column, stream);
+		break;
 	}
 }
 static void TcpStreamsScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind = input.bind_data->Cast<PcapBindData>();
 	auto &global = input.global_state->Cast<StreamGlobalState>();
 	auto &state = input.local_state->Cast<StreamScanState>();
-	if (!state.initialized) {
-		state.initialized = true;
-		if (global.file_count) {
-			state.reservation = global.Admit();
-		}
-	}
-	if (!state.reservation) {
+	if (!AdmitStreamWorker(global, state)) {
 		return;
 	}
 	idx_t count = 0, output_bytes = 0;
@@ -3234,7 +3540,7 @@ static void TcpStreamsScan(ClientContext &context, TableFunctionInput &input, Da
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
-		StreamEvent event;
+		auto &event = state.event;
 		if (!NextStreamEvent(context, bind, global, state, event)) {
 			break;
 		}
@@ -3243,16 +3549,13 @@ static void TcpStreamsScan(ClientContext &context, TableFunctionInput &input, Da
 				SetStreamValue(output.data[i], count, global.columns[i], state.filename, event.stream);
 			}
 		}
-		output_bytes += 1024 + state.filename.size() + event.stream.captured_bytes * 4ULL +
-		                (event.stream.chunks.size() + event.stream.gaps.size()) * 1024ULL;
+		output_bytes += ROW_BASE_BYTES + state.filename.size() + event.stream.captured_bytes * PAYLOAD_COPIES +
+		                (event.stream.chunks.size() + event.stream.gaps.size()) * ROW_BASE_BYTES;
 		++count;
 	}
 	output.SetCardinality(count);
 	if (!count) {
-		std::vector<packetquapture::TcpStream>().swap(state.streams);
-		std::vector<packetquapture::TcpDnsMessage>().swap(state.pending);
-		state.reassembler = packetquapture::TcpReassembler(bind.stream_limits);
-		state.reservation.reset();
+		ReleaseStreamWorker(bind, state);
 	}
 }
 
@@ -3262,15 +3565,17 @@ struct FlowGlobalState : public CaptureGlobalState {
 		budget = context.registered_state->GetOrCreate<FlowQueryBudget>("packetquapture_flow_budget", context);
 		if (bind.flow_plan) {
 			bind.flow_plan->sealed.store(true);
+			PQ_ASSERT(bind.flow_plan->scans.load() > 0); // bind registered this scan
 			max_workers = MaxValue<idx_t>(1, budget->Slots() / bind.flow_plan->scans.load());
 		}
 		max_workers = MinValue<idx_t>(max_workers, MaxValue<idx_t>(1, file_count));
 		if (file_count) {
 			initial = make_uniq<FlowReservation>(budget);
 			if (!initial->Acquired()) {
-				throw OutOfMemoryException("PacketQuapture cannot reserve 48 MiB for a flow worker. "
+				throw OutOfMemoryException("PacketQuapture cannot reserve %llu MiB for a flow worker. "
 				                           "Increase packetquapture_flow_memory_mb or memory_limit; "
-				                           "all flow scans in this query share the budget.");
+				                           "all flow scans in this query share the budget.",
+				                           FLOW_WORKER_BYTES / (1024 * 1024));
 			}
 		}
 	}
@@ -3283,11 +3588,17 @@ struct FlowGlobalState : public CaptureGlobalState {
 			return nullptr;
 		}
 		++admitted;
+		PQ_ASSERT(admitted <= max_workers);
 		if (initial) {
 			return std::move(initial);
 		}
 		auto result = make_uniq<FlowReservation>(budget);
-		return result->Acquired() ? std::move(result) : nullptr;
+		if (!result->Acquired()) {
+			// The slot goes back, so a later worker can still try the budget.
+			--admitted;
+			return nullptr;
+		}
+		return result;
 	}
 	void Drained() {
 		if (drained.fetch_add(1, std::memory_order_relaxed) + 1 == file_count) {
@@ -3303,7 +3614,6 @@ struct FlowGlobalState : public CaptureGlobalState {
 	idx_t max_workers = 1, admitted = 0;
 	vector<column_t> columns;
 	ScanOptions options;
-	bool decode_dns = false;
 };
 
 struct FlowScanState : public LocalTableFunctionState {
@@ -3312,11 +3622,65 @@ struct FlowScanState : public LocalTableFunctionState {
 	bool initialized = false, finished = false;
 	unique_ptr<CaptureReader> reader;
 	unique_ptr<packetquapture::FlowAggregator> aggregator;
+	PacketRecord record; // reused for every packet
 };
 static unique_ptr<LocalTableFunctionState> FlowsInitLocal(ExecutionContext &, TableFunctionInitInput &,
                                                           GlobalTableFunctionState *) {
 	return make_uniq<FlowScanState>();
 }
+// read_flows column groups, in schema order; FlowsBind checks them against the names.
+static const column_t FLOW_COUNTER_COLUMNS_BEGIN = 15;
+static const column_t FLOW_STATE_COLUMNS_BEGIN = 28;
+
+// read_flows's schema, one column per line so each name sits beside its type.
+static void FlowsSchema(vector<LogicalType> &types, vector<string> &names) {
+	types.clear();
+	names.clear();
+	auto column = [&](const char *name, const LogicalType &type) {
+		names.emplace_back(name);
+		types.push_back(type);
+	};
+	column("filename", LogicalType::VARCHAR);
+	column("input_index", LogicalType::UBIGINT);
+	column("flow_id", LogicalType::UBIGINT);
+	column("section_number", LogicalType::UINTEGER);
+	column("interface_id", LogicalType::UINTEGER);
+	column("vlan_ids", LogicalType::LIST(LogicalType::USMALLINT));
+	column("first_packet_number", LogicalType::UBIGINT);
+	column("last_packet_number", LogicalType::UBIGINT);
+	column("transport", LogicalType::VARCHAR);
+	column("ip_version", LogicalType::UTINYINT);
+	column("orig_ip", LogicalType::VARCHAR);
+	column("orig_port", LogicalType::USMALLINT);
+	column("resp_ip", LogicalType::VARCHAR);
+	column("resp_port", LogicalType::USMALLINT);
+	column("originator_basis", LogicalType::VARCHAR);
+	column("orig_packets", LogicalType::UBIGINT);
+	column("resp_packets", LogicalType::UBIGINT);
+	column("orig_captured_bytes", LogicalType::UBIGINT);
+	column("resp_captured_bytes", LogicalType::UBIGINT);
+	column("orig_reported_bytes", LogicalType::UBIGINT);
+	column("resp_reported_bytes", LogicalType::UBIGINT);
+	column("orig_payload_bytes", LogicalType::UBIGINT);
+	column("resp_payload_bytes", LogicalType::UBIGINT);
+	column("first_timestamp", LogicalType::TIMESTAMP);
+	column("last_timestamp", LogicalType::TIMESTAMP);
+	column("duration", LogicalType::INTERVAL);
+	column("missing_timestamp_packets", LogicalType::UBIGINT);
+	column("late_packets", LogicalType::UBIGINT);
+	column("orig_tcp_flags", LogicalType::USMALLINT);
+	column("resp_tcp_flags", LogicalType::USMALLINT);
+	column("handshake_complete", LogicalType::BOOLEAN);
+	column("syn_seen", LogicalType::BOOLEAN);
+	column("fin_seen", LogicalType::BOOLEAN);
+	column("reset_seen", LogicalType::BOOLEAN);
+	column("simultaneous_open", LogicalType::BOOLEAN);
+	column("equal_endpoints", LogicalType::BOOLEAN);
+	column("partial_session", LogicalType::BOOLEAN);
+	column("ambiguous", LogicalType::BOOLEAN);
+	column("finalized_by", LogicalType::VARCHAR);
+}
+
 static unique_ptr<FunctionData> FlowsBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &types, vector<string> &names) {
 	auto result = PcapBind(context, input, types, names);
@@ -3342,58 +3706,11 @@ static unique_ptr<FunctionData> FlowsBind(ClientContext &context, TableFunctionB
 			}
 		}
 	}
-	names = {"filename",
-	         "input_index",
-	         "flow_id",
-	         "section_number",
-	         "interface_id",
-	         "vlan_ids",
-	         "first_packet_number",
-	         "last_packet_number",
-	         "transport",
-	         "ip_version",
-	         "orig_ip",
-	         "orig_port",
-	         "resp_ip",
-	         "resp_port",
-	         "originator_basis",
-	         "orig_packets",
-	         "resp_packets",
-	         "orig_captured_bytes",
-	         "resp_captured_bytes",
-	         "orig_reported_bytes",
-	         "resp_reported_bytes",
-	         "orig_payload_bytes",
-	         "resp_payload_bytes",
-	         "first_timestamp",
-	         "last_timestamp",
-	         "duration",
-	         "missing_timestamp_packets",
-	         "late_packets",
-	         "orig_tcp_flags",
-	         "resp_tcp_flags",
-	         "handshake_complete",
-	         "syn_seen",
-	         "fin_seen",
-	         "reset_seen",
-	         "simultaneous_open",
-	         "equal_endpoints",
-	         "partial_session",
-	         "ambiguous",
-	         "finalized_by"};
-	types = {LogicalType::VARCHAR,   LogicalType::UBIGINT,   LogicalType::UBIGINT,
-	         LogicalType::UINTEGER,  LogicalType::UINTEGER,  LogicalType::LIST(LogicalType::USMALLINT),
-	         LogicalType::UBIGINT,   LogicalType::UBIGINT,   LogicalType::VARCHAR,
-	         LogicalType::UTINYINT,  LogicalType::VARCHAR,   LogicalType::USMALLINT,
-	         LogicalType::VARCHAR,   LogicalType::USMALLINT, LogicalType::VARCHAR,
-	         LogicalType::UBIGINT,   LogicalType::UBIGINT,   LogicalType::UBIGINT,
-	         LogicalType::UBIGINT,   LogicalType::UBIGINT,   LogicalType::UBIGINT,
-	         LogicalType::UBIGINT,   LogicalType::UBIGINT,   LogicalType::TIMESTAMP,
-	         LogicalType::TIMESTAMP, LogicalType::INTERVAL,  LogicalType::UBIGINT,
-	         LogicalType::UBIGINT,   LogicalType::USMALLINT, LogicalType::USMALLINT,
-	         LogicalType::BOOLEAN,   LogicalType::BOOLEAN,   LogicalType::BOOLEAN,
-	         LogicalType::BOOLEAN,   LogicalType::BOOLEAN,   LogicalType::BOOLEAN,
-	         LogicalType::BOOLEAN,   LogicalType::BOOLEAN,   LogicalType::VARCHAR};
+	FlowsSchema(types, names);
+	// The cell writers find column groups by position.
+	PQ_ASSERT(names.size() == 39);
+	PQ_ASSERT(names[FLOW_COUNTER_COLUMNS_BEGIN] == "orig_packets");
+	PQ_ASSERT(names[FLOW_STATE_COLUMNS_BEGIN] == "orig_tcp_flags");
 	bind.types = types;
 	bind.flow_plan = context.registered_state->GetOrCreate<FlowPlanRegistry>("packetquapture_flow_plans")->Register();
 	return result;
@@ -3406,169 +3723,223 @@ static unique_ptr<GlobalTableFunctionState> FlowsInit(ClientContext &context, Ta
 	state->options.decode_depth = packetquapture::DecodeDepth::TRANSPORT;
 	return std::move(state);
 }
-static void SetFlowValue(Vector &v, idx_t row, column_t col, const PcapBindData &bind, idx_t file,
-                         const packetquapture::FlowSummary &flow) {
+// The session's identity: file, ids, endpoints and how its originator was chosen.
+static void SetFlowKeyValue(Vector &v, idx_t row, column_t col, const PcapBindData &bind, idx_t file,
+                            const packetquapture::FlowSummary &flow) {
+	PQ_ASSERT(col < FLOW_COUNTER_COLUMNS_BEGIN);
 	const auto &orig = flow.orig_is_low ? flow.key.low : flow.key.high;
 	const auto &resp = flow.orig_is_low ? flow.key.high : flow.key.low;
+	const bool tcp = flow.key.protocol == 6;
+	switch (col) {
+	case 0:
+		SetStringCell(v, row, bind.files[file].path);
+		break;
+	case 1:
+		SetDecodedScalar<uint64_t>(v, row, file + 1);
+		break;
+	case 2:
+		SetDecodedScalar<uint64_t>(v, row, FlowScanId(flow.first_packet, file, bind.files.size()));
+		break;
+	case 3:
+		SetDecodedScalar<uint32_t>(v, row, flow.section);
+		break;
+	case 4:
+		SetDecodedScalar<uint32_t>(v, row, flow.key.interface_id);
+		break;
+	case 5:
+		PQ_ASSERT(flow.key.vlan_count <= flow.key.vlans.size());
+		SetScalarListCell(v, row, flow.key.vlans.data(), flow.key.vlan_count);
+		break;
+	case 6:
+		SetDecodedScalar<uint64_t>(v, row, flow.first_packet);
+		break;
+	case 7:
+		SetDecodedScalar<uint64_t>(v, row, flow.last_packet);
+		break;
+	case 8:
+		if (tcp) {
+			SetStringCell(v, row, "tcp", 3);
+		} else {
+			SetStringCell(v, row, "udp", 3);
+		}
+		break;
+	case 9:
+		SetDecodedScalar<uint8_t>(v, row, flow.key.ip_version);
+		break;
+	case 10:
+		SetIpCell(v, row, orig.ip, flow.key.ip_version);
+		break;
+	case 11:
+		SetDecodedScalar<uint16_t>(v, row, orig.port);
+		break;
+	case 12:
+		SetIpCell(v, row, resp.ip, flow.key.ip_version);
+		break;
+	case 13:
+		SetDecodedScalar<uint16_t>(v, row, resp.port);
+		break;
+	case 14:
+		SetStringCell(v, row, flow.originator_basis);
+		break;
+	default:
+		throw InternalException("Unexpected read_flows key column id %d", col);
+	}
+}
+
+// Per-direction counters and the session's timing.
+static void SetFlowCounterValue(Vector &v, idx_t row, column_t col, const packetquapture::FlowSummary &flow) {
+	PQ_ASSERT(col >= FLOW_COUNTER_COLUMNS_BEGIN && col < FLOW_STATE_COLUMNS_BEGIN);
+	switch (col) {
+	case 15:
+		SetDecodedScalar<uint64_t>(v, row, flow.orig.packets);
+		break;
+	case 16:
+		SetDecodedScalar<uint64_t>(v, row, flow.resp.packets);
+		break;
+	case 17:
+		SetDecodedScalar<uint64_t>(v, row, flow.orig.captured_bytes);
+		break;
+	case 18:
+		SetDecodedScalar<uint64_t>(v, row, flow.resp.captured_bytes);
+		break;
+	case 19:
+		SetDecodedScalar<uint64_t>(v, row, flow.orig.reported_bytes);
+		break;
+	case 20:
+		SetDecodedScalar<uint64_t>(v, row, flow.resp.reported_bytes);
+		break;
+	case 21:
+		SetDecodedScalar<uint64_t>(v, row, flow.orig.payload_bytes);
+		break;
+	case 22:
+		SetDecodedScalar<uint64_t>(v, row, flow.resp.payload_bytes);
+		break;
+	case 23:
+		SetDecodedScalar<timestamp_t>(v, row, timestamp_t(flow.first_timestamp));
+		break;
+	case 24:
+		SetDecodedScalar<timestamp_t>(v, row, timestamp_t(flow.last_timestamp));
+		break;
+	case 25: {
+		// The aggregator keeps first and last as the minimum and maximum seen, so
+		// the duration is never negative and only the overflow needs a check.
+		PQ_ASSERT(flow.last_timestamp >= flow.first_timestamp);
+		if (flow.first_timestamp < 0 &&
+		    flow.last_timestamp > NumericLimits<int64_t>::Maximum() + flow.first_timestamp) {
+			throw OutOfRangeException("Flow duration exceeds INTERVAL microsecond capacity");
+		}
+		interval_t duration {0, 0, flow.last_timestamp - flow.first_timestamp};
+		SetDecodedScalar<interval_t>(v, row, duration);
+		break;
+	}
+	case 26:
+		SetDecodedScalar<uint64_t>(v, row, flow.missing_timestamps);
+		break;
+	case 27:
+		SetDecodedScalar<uint64_t>(v, row, flow.late_packets);
+		break;
+	default:
+		throw InternalException("Unexpected read_flows counter column id %d", col);
+	}
+}
+
+// TCP flags and the session-state flags derived from them.
+static void SetFlowStateValue(Vector &v, idx_t row, column_t col, const packetquapture::FlowSummary &flow) {
+	PQ_ASSERT(col >= FLOW_STATE_COLUMNS_BEGIN);
+	const bool tcp = flow.key.protocol == 6;
+	switch (col) {
+	case 28:
+		SetDecodedScalar<uint16_t>(v, row, flow.orig.flags);
+		break;
+	case 29:
+		SetDecodedScalar<uint16_t>(v, row, flow.resp.flags);
+		break;
+	case 30:
+		SetDecodedScalar<bool>(v, row, flow.handshake_complete);
+		break;
+	case 31:
+		SetDecodedScalar<bool>(v, row, flow.syn_seen);
+		break;
+	case 32:
+		SetDecodedScalar<bool>(v, row, flow.fin_seen);
+		break;
+	case 33:
+		SetDecodedScalar<bool>(v, row, flow.reset_seen);
+		break;
+	case 34:
+		SetDecodedScalar<bool>(v, row, flow.simultaneous_open);
+		break;
+	case 35:
+		SetDecodedScalar<bool>(v, row, flow.equal_endpoints);
+		break;
+	case 36:
+		SetDecodedScalar<bool>(v, row,
+		                       !tcp || !flow.handshake_complete ||
+		                           (!flow.reset_seen && !((flow.orig.flags & packetquapture::TCP_FIN) &&
+		                                                  (flow.resp.flags & packetquapture::TCP_FIN))));
+		break;
+	case 37:
+		SetDecodedScalar<bool>(v, row,
+		                       flow.equal_endpoints || flow.simultaneous_open || flow.late_packets ||
+		                           flow.missing_timestamps || flow.originator_basis == "first_packet");
+		break;
+	case 38:
+		SetStringCell(v, row, flow.finalized_by);
+		break;
+	default:
+		throw InternalException("Unexpected read_flows column id %d", col);
+	}
+}
+
+static void SetFlowValue(Vector &v, idx_t row, column_t col, const PcapBindData &bind, idx_t file,
+                         const packetquapture::FlowSummary &flow) {
 	const bool tcp = flow.key.protocol == 6;
 	if ((!tcp && col >= 28 && col <= 34) || ((col == 23 || col == 24) && !flow.has_timestamp) ||
 	    (col == 25 && (!flow.has_timestamp || flow.missing_timestamps))) {
 		FlatVector::SetNull(v, row, true);
 		return;
 	}
-	switch (col) {
-	case 0:
-		v.SetValue(row, bind.files[file].path);
-		break;
-	case 1:
-		v.SetValue(row, Value::UBIGINT(file + 1));
-		break;
-	case 2:
-		v.SetValue(row, Value::UBIGINT(FlowScanId(flow.first_packet, file, bind.files.size())));
-		break;
-	case 3:
-		v.SetValue(row, Value::UINTEGER(flow.section));
-		break;
-	case 4:
-		v.SetValue(row, Value::UINTEGER(flow.key.interface_id));
-		break;
-	case 5: {
-		vector<Value> tags;
-		for (idx_t i = 0; i < flow.key.vlan_count; ++i)
-			tags.push_back(Value::USMALLINT(flow.key.vlans[i]));
-		v.SetValue(row, Value::LIST(LogicalType::USMALLINT, tags));
-		break;
-	}
-	case 6:
-		v.SetValue(row, Value::UBIGINT(flow.first_packet));
-		break;
-	case 7:
-		v.SetValue(row, Value::UBIGINT(flow.last_packet));
-		break;
-	case 8:
-		v.SetValue(row, tcp ? "tcp" : "udp");
-		break;
-	case 9:
-		v.SetValue(row, Value::UTINYINT(flow.key.ip_version));
-		break;
-	case 10:
-		v.SetValue(row, IpString(orig.ip, flow.key.ip_version));
-		break;
-	case 11:
-		v.SetValue(row, Value::USMALLINT(orig.port));
-		break;
-	case 12:
-		v.SetValue(row, IpString(resp.ip, flow.key.ip_version));
-		break;
-	case 13:
-		v.SetValue(row, Value::USMALLINT(resp.port));
-		break;
-	case 14:
-		v.SetValue(row, flow.originator_basis);
-		break;
-	case 15:
-		v.SetValue(row, Value::UBIGINT(flow.orig.packets));
-		break;
-	case 16:
-		v.SetValue(row, Value::UBIGINT(flow.resp.packets));
-		break;
-	case 17:
-		v.SetValue(row, Value::UBIGINT(flow.orig.captured_bytes));
-		break;
-	case 18:
-		v.SetValue(row, Value::UBIGINT(flow.resp.captured_bytes));
-		break;
-	case 19:
-		v.SetValue(row, Value::UBIGINT(flow.orig.reported_bytes));
-		break;
-	case 20:
-		v.SetValue(row, Value::UBIGINT(flow.resp.reported_bytes));
-		break;
-	case 21:
-		v.SetValue(row, Value::UBIGINT(flow.orig.payload_bytes));
-		break;
-	case 22:
-		v.SetValue(row, Value::UBIGINT(flow.resp.payload_bytes));
-		break;
-	case 23:
-		v.SetValue(row, Value::TIMESTAMP(timestamp_t(flow.first_timestamp)));
-		break;
-	case 24:
-		v.SetValue(row, Value::TIMESTAMP(timestamp_t(flow.last_timestamp)));
-		break;
-	case 25: {
-		if (flow.first_timestamp < 0 &&
-		    flow.last_timestamp > NumericLimits<int64_t>::Maximum() + flow.first_timestamp) {
-			throw OutOfRangeException("Flow duration exceeds INTERVAL microsecond capacity");
-		}
-		interval_t duration {0, 0, flow.last_timestamp - flow.first_timestamp};
-		v.SetValue(row, Value::INTERVAL(duration));
-		break;
-	}
-	case 26:
-		v.SetValue(row, Value::UBIGINT(flow.missing_timestamps));
-		break;
-	case 27:
-		v.SetValue(row, Value::UBIGINT(flow.late_packets));
-		break;
-	case 28:
-		v.SetValue(row, Value::USMALLINT(flow.orig.flags));
-		break;
-	case 29:
-		v.SetValue(row, Value::USMALLINT(flow.resp.flags));
-		break;
-	case 30:
-		v.SetValue(row, Value(flow.handshake_complete));
-		break;
-	case 31:
-		v.SetValue(row, Value(flow.syn_seen));
-		break;
-	case 32:
-		v.SetValue(row, Value(flow.fin_seen));
-		break;
-	case 33:
-		v.SetValue(row, Value(flow.reset_seen));
-		break;
-	case 34:
-		v.SetValue(row, Value(flow.simultaneous_open));
-		break;
-	case 35:
-		v.SetValue(row, Value(flow.equal_endpoints));
-		break;
-	case 36:
-		v.SetValue(row, Value(!tcp || !flow.handshake_complete ||
-		                      (!flow.reset_seen && !((flow.orig.flags & 1) && (flow.resp.flags & 1)))));
-		break;
-	case 37:
-		v.SetValue(row, Value(flow.equal_endpoints || flow.simultaneous_open || flow.late_packets ||
-		                      flow.missing_timestamps || flow.originator_basis == "first_packet"));
-		break;
-	case 38:
-		v.SetValue(row, flow.finalized_by);
-		break;
-	default:
-		throw InternalException("Unexpected read_flows column id %d", col);
+	if (col < FLOW_COUNTER_COLUMNS_BEGIN) {
+		SetFlowKeyValue(v, row, col, bind, file, flow);
+	} else if (col < FLOW_STATE_COLUMNS_BEGIN) {
+		SetFlowCounterValue(v, row, col, flow);
+	} else {
+		SetFlowStateValue(v, row, col, flow);
 	}
 }
+// What the aggregator needs of a packet; its decoded headers are moved out.
+static packetquapture::FlowInput FlowInputOf(PacketRecord &record) {
+	packetquapture::FlowInput packet;
+	packet.section = record.section_number;
+	packet.interface_id = record.interface_id;
+	packet.captured_length = record.captured_length;
+	packet.original_length = record.original_length;
+	packet.stamp = Stamp(record);
+	packet.packet = std::move(record.decoded);
+	return packet;
+}
+
 static void FlowsScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind = input.bind_data->Cast<PcapBindData>();
 	auto &global = input.global_state->Cast<FlowGlobalState>();
 	auto &state = input.local_state->Cast<FlowScanState>();
 	if (!state.initialized) {
 		state.initialized = true;
-		if (global.file_count)
-			state.reservation = global.Admit();
+		state.reservation = global.file_count ? global.Admit() : nullptr;
 	}
-	if (!state.reservation)
+	if (!state.reservation) {
 		return;
+	}
 	idx_t count = 0, bytes = 0;
 	while (count < STANDARD_VECTOR_SIZE && bytes < FLOW_OUTPUT_BATCH_BYTES) {
-		if (context.IsInterrupted())
+		if (context.IsInterrupted()) {
 			throw InterruptException();
+		}
 		if (!state.reader) {
 			idx_t work;
-			if (!global.scheduler.Claim(work))
+			if (!global.scheduler.Claim(work)) {
 				break;
+			}
 			state.file_index = bind.selected_indices[work];
 			state.aggregator = make_uniq<packetquapture::FlowAggregator>(bind.flow_limits);
 			state.reader =
@@ -3579,6 +3950,8 @@ static void FlowsScan(ClientContext &context, TableFunctionInput &input, DataChu
 		bool have_flow = false;
 		try {
 			have_flow = state.aggregator->Next(flow);
+		} catch (const packetquapture::AssertionFailure &) {
+			throw;
 		} catch (const std::exception &exception) {
 			ErrorData error(exception);
 			error.Throw(StringUtil::Format("Flow scan '%s': ", bind.files[state.file_index].path));
@@ -3589,7 +3962,7 @@ static void FlowsScan(ClientContext &context, TableFunctionInput &input, DataChu
 					SetFlowValue(output.data[i], count, global.columns[i], bind, state.file_index, flow);
 				}
 			}
-			bytes += 1024 + bind.files[state.file_index].path.size();
+			bytes += ROW_BASE_BYTES + bind.files[state.file_index].path.size();
 			++count;
 			continue;
 		}
@@ -3599,25 +3972,19 @@ static void FlowsScan(ClientContext &context, TableFunctionInput &input, DataChu
 			global.Drained();
 			continue;
 		}
-		PacketRecord record;
+		auto &record = state.record;
 		if (!state.reader->Next(record)) {
 			state.aggregator->Finish(state.reader->SectionNumber());
 			state.finished = true;
 			continue;
 		}
-		packetquapture::FlowInput packet;
-		packet.section = record.section_number;
-		packet.interface_id = record.interface_id;
-		packet.captured_length = record.captured_length;
-		packet.original_length = record.original_length;
-		packet.stamp = Stamp(record);
-		packet.packet = std::move(record.decoded);
-		state.aggregator->Push(std::move(packet));
+		state.aggregator->Push(FlowInputOf(record));
 	}
 	output.SetCardinality(count);
 	if (!count) {
 		state.aggregator.reset();
 		state.reader.reset();
+		state.record = PacketRecord();
 		state.reservation.reset();
 	}
 }
@@ -3662,52 +4029,48 @@ enum InventoryColumn : idx_t {
 	IC_COUNT
 };
 static void InventorySchema(vector<LogicalType> &types, vector<string> &names) {
-	names = {"filename",
-	         "input_index",
-	         "identity_type",
-	         "identity_value",
-	         "identity_strength",
-	         "file_size",
-	         "modification_time",
-	         "capture_format",
-	         "link_types",
-	         "packet_count",
-	         "min_timestamp",
-	         "max_timestamp",
-	         "timestamp_null_count",
-	         "captured_bytes",
-	         "reported_bytes",
-	         "detail",
-	         "ipv4_packets",
-	         "ipv6_packets",
-	         "tcp_packets",
-	         "udp_packets",
-	         "other_protocol_packets",
-	         "malformed_packets",
-	         "unsupported_packets",
-	         "fragment_packets",
-	         "scan_status",
-	         "scan_error",
-	         "inventory_time",
-	         "source_scan_time",
-	         "schema_version",
-	         "semantic_version",
-	         "metadata_unchanged",
-	         "reused",
-	         "catalog_validation",
-	         "reuse_reason"};
-	types = {LogicalType::VARCHAR,   LogicalType::UBIGINT,   LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,   LogicalType::VARCHAR,   LogicalType::UBIGINT,
-	         LogicalType::TIMESTAMP, LogicalType::VARCHAR,   LogicalType::LIST(LogicalType::UINTEGER),
-	         LogicalType::UBIGINT,   LogicalType::TIMESTAMP, LogicalType::TIMESTAMP,
-	         LogicalType::UBIGINT,   LogicalType::UBIGINT,   LogicalType::UBIGINT,
-	         LogicalType::VARCHAR,   LogicalType::UBIGINT,   LogicalType::UBIGINT,
-	         LogicalType::UBIGINT,   LogicalType::UBIGINT,   LogicalType::UBIGINT,
-	         LogicalType::UBIGINT,   LogicalType::UBIGINT,   LogicalType::UBIGINT,
-	         LogicalType::VARCHAR,   LogicalType::VARCHAR,   LogicalType::TIMESTAMP,
-	         LogicalType::TIMESTAMP, LogicalType::UINTEGER,  LogicalType::UINTEGER,
-	         LogicalType::BOOLEAN,   LogicalType::BOOLEAN,   LogicalType::VARCHAR,
-	         LogicalType::VARCHAR};
+	types.clear();
+	names.clear();
+	auto column = [&](const char *name, const LogicalType &type) {
+		names.emplace_back(name);
+		types.push_back(type);
+	};
+	column("filename", LogicalType::VARCHAR);
+	column("input_index", LogicalType::UBIGINT);
+	column("identity_type", LogicalType::VARCHAR);
+	column("identity_value", LogicalType::VARCHAR);
+	column("identity_strength", LogicalType::VARCHAR);
+	column("file_size", LogicalType::UBIGINT);
+	column("modification_time", LogicalType::TIMESTAMP);
+	column("capture_format", LogicalType::VARCHAR);
+	column("link_types", LogicalType::LIST(LogicalType::UINTEGER));
+	column("packet_count", LogicalType::UBIGINT);
+	column("min_timestamp", LogicalType::TIMESTAMP);
+	column("max_timestamp", LogicalType::TIMESTAMP);
+	column("timestamp_null_count", LogicalType::UBIGINT);
+	column("captured_bytes", LogicalType::UBIGINT);
+	column("reported_bytes", LogicalType::UBIGINT);
+	column("detail", LogicalType::VARCHAR);
+	column("ipv4_packets", LogicalType::UBIGINT);
+	column("ipv6_packets", LogicalType::UBIGINT);
+	column("tcp_packets", LogicalType::UBIGINT);
+	column("udp_packets", LogicalType::UBIGINT);
+	column("other_protocol_packets", LogicalType::UBIGINT);
+	column("malformed_packets", LogicalType::UBIGINT);
+	column("unsupported_packets", LogicalType::UBIGINT);
+	column("fragment_packets", LogicalType::UBIGINT);
+	column("scan_status", LogicalType::VARCHAR);
+	column("scan_error", LogicalType::VARCHAR);
+	column("inventory_time", LogicalType::TIMESTAMP);
+	column("source_scan_time", LogicalType::TIMESTAMP);
+	column("schema_version", LogicalType::UINTEGER);
+	column("semantic_version", LogicalType::UINTEGER);
+	column("metadata_unchanged", LogicalType::BOOLEAN);
+	column("reused", LogicalType::BOOLEAN);
+	column("catalog_validation", LogicalType::VARCHAR);
+	column("reuse_reason", LogicalType::VARCHAR);
+	PQ_ASSERT(names.size() == types.size());
+	PQ_ASSERT(names.size() == IC_COUNT);
 }
 struct InventoryBindData : public TableFunctionData {
 	vector<string> paths;
@@ -3722,8 +4085,9 @@ struct InventoryBindData : public TableFunctionData {
 		result->immutable = immutable;
 		result->previous = previous;
 		result->plan = plan;
-		if (plan)
+		if (plan) {
 			plan->scans.fetch_add(1);
+		}
 		return std::move(result);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -3736,8 +4100,9 @@ static TableCatalogEntry &InventoryCatalog(ClientContext &context, const string 
 	auto qualified = QualifiedName::Parse(name);
 	Binder::BindSchemaOrCatalog(context, qualified.catalog, qualified.schema);
 	auto &table = Catalog::GetEntry<TableCatalogEntry>(context, qualified.catalog, qualified.schema, qualified.name);
-	if (!table.IsDuckTable())
+	if (!table.IsDuckTable()) {
 		throw BinderException("previous_catalog must name a native DuckDB table");
+	}
 	vector<LogicalType> types;
 	vector<string> names;
 	InventorySchema(types, names);
@@ -3761,14 +4126,22 @@ static string BindInventoryCatalog(ClientContext &context, const string &name) {
 	resolved.name = table.name;
 	return resolved.ToString();
 }
-static void ValidateInventoryLocator(const string &path) {
-	if (!FileSystem::IsRemoteFile(path))
-		return;
+// A remote locator names the same object on every read only without a query
+// string or fragment (signed or versioned URLs) and without user information in
+// its authority. One rule serves inventory and catalog pruning, so a locator
+// either may be summarised and later trusted, or neither.
+static bool StableRemoteLocator(const string &path) {
+	PQ_ASSERT(FileSystem::IsRemoteFile(path));
+	if (path.find('?') != string::npos || path.find('#') != string::npos) {
+		return false;
+	}
 	auto authority = path.find("://");
 	auto end = authority == string::npos ? 0 : path.find('/', authority + 3);
 	auto at = path.find('@', authority == string::npos ? 0 : authority + 3);
-	if (path.find('?') != string::npos || path.find('#') != string::npos ||
-	    (at != string::npos && (end == string::npos || at < end))) {
+	return at == string::npos || (end != string::npos && at > end);
+}
+static void ValidateInventoryLocator(const string &path) {
+	if (FileSystem::IsRemoteFile(path) && !StableRemoteLocator(path)) {
 		throw InvalidInputException("Inventory requires stable remote locators without query strings, fragments, or "
 		                            "user information; use DuckDB credentials");
 	}
@@ -3777,34 +4150,36 @@ static unique_ptr<FunctionData> InventoryBind(ClientContext &context, TableFunct
                                               vector<LogicalType> &types, vector<string> &names) {
 	auto result = make_uniq<InventoryBindData>();
 	result->paths = MultiFileReader::Create(input.table_function)->ParsePaths(input.inputs[0]);
-	for (const auto &path : result->paths)
+	for (const auto &path : result->paths) {
 		ValidateInventoryLocator(path);
+	}
 	for (auto &entry : input.named_parameters) {
-		if (entry.second.IsNull())
+		if (entry.second.IsNull()) {
 			throw BinderException("Inventory option '%s' must not be NULL", entry.first);
+		}
 		auto value = entry.second.GetValue<string>();
 		if (StringUtil::CIEquals(entry.first, "previous_catalog")) {
-			vector<StorageIndex> columns;
-			auto &table = InventoryCatalog(context, value, columns);
-			QualifiedName resolved;
-			resolved.catalog = table.catalog.GetName();
-			resolved.schema = table.schema.name;
-			resolved.name = table.name;
-			result->previous = resolved.ToString();
+			result->previous = BindInventoryCatalog(context, value);
 		} else {
 			value = StringUtil::Lower(value);
 			if (StringUtil::CIEquals(entry.first, "detail")) {
-				if (value != "framing" && value != "protocols")
+				if (value != "framing" && value != "protocols") {
 					throw BinderException("detail must be framing or protocols");
+				}
 				result->protocols = value == "protocols";
 			} else if (StringUtil::CIEquals(entry.first, "on_error")) {
-				if (value != "error" && value != "report")
+				if (value != "error" && value != "report") {
 					throw BinderException("on_error must be error or report");
+				}
 				result->report = value == "report";
 			} else if (StringUtil::CIEquals(entry.first, "catalog_validation")) {
-				if (value != "strict" && value != "immutable")
+				if (value != "strict" && value != "immutable") {
 					throw BinderException("catalog_validation must be strict or immutable");
+				}
 				result->immutable = value == "immutable";
+			} else {
+				// DuckDB rejects options the function did not register.
+				throw InternalException("Unhandled capture_inventory option '%s'", entry.first);
 			}
 		}
 	}
@@ -3817,21 +4192,24 @@ static vector<OpenFileInfo> InventoryFiles(ClientContext &context, const Invento
 	vector<OpenFileInfo> files;
 	auto reader = MultiFileReader::CreateDefault("capture_inventory");
 	for (const auto &path : bind.paths) {
-		if (context.IsInterrupted())
+		if (context.IsInterrupted()) {
 			throw InterruptException();
+		}
 		if (FileSystem::HasGlob(path)) {
 			auto expanded = reader->CreateFileList(context, vector<string> {path})->GetAllFiles();
 			for (auto &file : expanded) {
 				ValidateInventoryLocator(file.path);
 				files.push_back(std::move(file));
 			}
-		} else
+		} else {
 			files.emplace_back(path);
+		}
 	}
 	auto &fs = FileSystem::GetFileSystem(context);
 	for (auto &file : files) {
-		if (!FileSystem::IsRemoteFile(file.path))
+		if (!FileSystem::IsRemoteFile(file.path)) {
 			file.path = fs.CanonicalizePath(file.path);
+		}
 	}
 	return files;
 }
@@ -3840,18 +4218,23 @@ struct InventoryPrevious {
 	bool conflict = false;
 };
 // Native Values retained outside DuckDB vectors are conservatively charged, with
-// an explicit 64 MiB snapshot cap. This is metadata, not a second capture cache.
+// an explicit snapshot cap. This is metadata, not a second capture cache.
+constexpr idx_t INVENTORY_SNAPSHOT_BYTES = 64ULL * 1024 * 1024;
 class InventorySnapshotMemory {
 public:
 	explicit InventorySnapshotMemory(ClientContext &context) : manager(BufferManager::GetBufferManager(context)) {
 	}
 	~InventorySnapshotMemory() {
-		if (used)
+		if (used) {
 			manager.FreeReservedMemory(used);
+		}
 	}
 	void Add(idx_t bytes) {
-		if (bytes > 64ULL * 1024 * 1024 - used)
-			throw OutOfMemoryException("Inventory previous_catalog snapshot exceeds 64 MiB");
+		PQ_ASSERT(used <= INVENTORY_SNAPSHOT_BYTES);
+		if (bytes > INVENTORY_SNAPSHOT_BYTES - used) {
+			throw OutOfMemoryException("Inventory previous_catalog snapshot exceeds %llu MiB",
+			                           INVENTORY_SNAPSHOT_BYTES / (1024 * 1024));
+		}
 		manager.ReserveMemory(bytes);
 		used += bytes;
 	}
@@ -3862,62 +4245,99 @@ private:
 };
 static bool InventoryAgreement(const vector<Value> &a, const vector<Value> &b) {
 	for (idx_t i = IC_ID_TYPE; i <= IC_STABLE; ++i) {
-		if (i == IC_TIME || i == IC_SCAN_TIME)
+		if (i == IC_TIME || i == IC_SCAN_TIME) {
 			continue;
-		if (!Value::NotDistinctFrom(a[i], b[i]))
+		}
+		if (!Value::NotDistinctFrom(a[i], b[i])) {
 			return false;
+		}
 	}
 	return true;
 }
-static void LoadInventorySnapshot(ClientContext &context, const string &catalog, const vector<OpenFileInfo> &files,
-                                  InventorySnapshotMemory &snapshot_memory,
-                                  unordered_map<string, InventoryPrevious> &previous) {
-	unordered_set<string> wanted;
-	for (const auto &file : files) {
-		if (wanted.insert(file.path).second)
-			snapshot_memory.Add(128 + file.path.size() * 2);
+// Reads the catalog rows for the wanted files. The range of wanted filenames goes
+// to the storage scan as a filter, so row groups outside it are skipped by their
+// zone maps and the rest are filtered vectorised, not a Value per row; the
+// wanted check below stays as the exact test. (Raw storage scans support
+// constant comparisons, not IN.) The loop ends when the transaction's snapshot
+// runs out.
+// Copies catalog row n into values; returns the memory the copy holds, charged
+// conservatively as Values are larger than their payload.
+static idx_t SnapshotRow(DataChunk &chunk, idx_t n, const string &file, vector<Value> &values) {
+	idx_t bytes = 512 + file.size() * 2;
+	for (idx_t c = 0; c < IC_COUNT; ++c) {
+		auto value = chunk.GetValue(c, n);
+		bytes += sizeof(Value) * 2;
+		if (!value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR) {
+			bytes += StringValue::Get(value).size() * 2;
+		}
+		if (!value.IsNull() && c == IC_LINKS) {
+			bytes += ListValue::GetChildren(value).size() * sizeof(Value) * 2;
+		}
+		values.push_back(std::move(value));
 	}
-	vector<StorageIndex> ids;
-	auto &table = InventoryCatalog(context, catalog, ids);
+	return bytes;
+}
+
+static void LoadInventorySnapshot(ClientContext &context, TableCatalogEntry &table, const vector<StorageIndex> &ids,
+                                  const vector<OpenFileInfo> &files, InventorySnapshotMemory &snapshot_memory,
+                                  unordered_map<string, InventoryPrevious> &previous) {
+	PQ_ASSERT(ids.size() == IC_COUNT);
+	PQ_ASSERT(!files.empty());
+	unordered_set<string> wanted;
+	string lowest = files[0].path, highest = files[0].path;
+	for (const auto &file : files) {
+		if (wanted.insert(file.path).second) {
+			snapshot_memory.Add(128 + file.path.size() * 2);
+			lowest = MinValue(lowest, file.path);
+			highest = MaxValue(highest, file.path);
+		}
+	}
 	auto &transaction = DuckTransaction::Get(context, table.catalog);
 	auto &storage = table.GetStorage();
+	TableFilterSet filters;
+	auto range = make_uniq<ConjunctionAndFilter>();
+	range->child_filters.push_back(
+	    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value(lowest)));
+	range->child_filters.push_back(
+	    make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO, Value(highest)));
+	filters.PushFilter(ColumnIndex(IC_FILE), std::move(range));
 	TableScanState scan;
-	storage.InitializeScan(context, transaction, scan, ids);
+	storage.InitializeScan(context, transaction, scan, ids, &filters);
 	vector<LogicalType> types;
 	vector<string> names;
 	InventorySchema(types, names);
 	DataChunk chunk;
 	chunk.Initialize(context, types);
 	while (true) {
-		if (context.IsInterrupted())
+		if (context.IsInterrupted()) {
 			throw InterruptException();
+		}
 		chunk.Reset();
 		storage.Scan(transaction, chunk, scan);
-		if (!chunk.size())
+		if (!chunk.size()) {
 			break;
+		}
 		for (idx_t n = 0; n < chunk.size(); ++n) {
-			auto file = chunk.GetValue(IC_FILE, n);
-			if (file.IsNull() || !wanted.count(file.GetValue<string>()))
+			auto file_value = chunk.GetValue(IC_FILE, n);
+			if (file_value.IsNull()) {
 				continue;
-			vector<Value> values;
-			idx_t bytes = 512 + file.GetValue<string>().size() * 2;
-			for (idx_t c = 0; c < IC_COUNT; ++c) {
-				auto value = chunk.GetValue(c, n);
-				bytes += sizeof(Value) * 2;
-				if (!value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR)
-					bytes += StringValue::Get(value).size() * 2;
-				if (!value.IsNull() && c == IC_LINKS)
-					bytes += ListValue::GetChildren(value).size() * sizeof(Value) * 2;
-				values.push_back(std::move(value));
 			}
-			auto found = previous.find(file.GetValue<string>());
+			// Read once: the name is looked up, charged and stored for each row.
+			const auto file = file_value.GetValue<string>();
+			if (!wanted.count(file)) {
+				continue;
+			}
+			vector<Value> values;
+			const idx_t bytes = SnapshotRow(chunk, n, file, values);
+			auto found = previous.find(file);
 			if (found == previous.end()) {
 				snapshot_memory.Add(bytes);
 				InventoryPrevious entry;
 				entry.row = std::move(values);
-				previous.emplace(file.GetValue<string>(), std::move(entry));
-			} else if (!InventoryAgreement(found->second.row, values))
+				previous.emplace(file, std::move(entry));
+			} else if (!InventoryAgreement(found->second.row, values)) {
 				found->second.conflict = true;
+			}
 		}
 	}
 }
@@ -3930,16 +4350,22 @@ struct InventoryGlobalState : public CaptureGlobalState {
 		budget =
 		    context.registered_state->GetOrCreate<InventoryQueryBudget>("packetquapture_inventory_budget", context);
 		bind.plan->sealed.store(true);
+		PQ_ASSERT(bind.plan->scans.load() > 0); // bind registered this scan
 		max_workers = MinValue<idx_t>(MaxValue<idx_t>(1, files.size()),
 		                              MaxValue<idx_t>(1, budget->Slots() / bind.plan->scans.load()));
 		if (!files.empty()) {
 			initial = make_uniq<InventoryReservation>(budget);
-			if (!initial->Acquired())
-				throw OutOfMemoryException("PacketQuapture cannot reserve 32 MiB for an inventory worker; increase "
-				                           "packetquapture_inventory_memory_mb or memory_limit");
+			if (!initial->Acquired()) {
+				throw OutOfMemoryException("PacketQuapture cannot reserve %llu MiB for an inventory worker; increase "
+				                           "packetquapture_inventory_memory_mb or memory_limit",
+				                           INVENTORY_WORKER_BYTES / (1024 * 1024));
+			}
 		}
-		if (!bind.previous.empty() && !files.empty())
-			LoadInventorySnapshot(context, bind.previous, files, snapshot_memory, previous);
+		if (!bind.previous.empty() && !files.empty()) {
+			vector<StorageIndex> ids;
+			auto &table = InventoryCatalog(context, bind.previous, ids);
+			LoadInventorySnapshot(context, table, ids, files, snapshot_memory, previous);
+		}
 		progress.Initialize(context, files, true);
 	}
 	idx_t MaxThreads() const override {
@@ -3947,17 +4373,26 @@ struct InventoryGlobalState : public CaptureGlobalState {
 	}
 	unique_ptr<InventoryReservation> Admit() {
 		lock_guard<mutex> guard(lock);
-		if (admitted >= max_workers)
+		if (admitted >= max_workers) {
 			return nullptr;
+		}
 		++admitted;
-		if (initial)
+		PQ_ASSERT(admitted <= max_workers);
+		if (initial) {
 			return std::move(initial);
+		}
 		auto result = make_uniq<InventoryReservation>(budget);
-		return result->Acquired() ? std::move(result) : nullptr;
+		if (!result->Acquired()) {
+			// The slot goes back, so a later worker can still try the budget.
+			--admitted;
+			return nullptr;
+		}
+		return result;
 	}
 	void Drained() {
-		if (drained.fetch_add(1) + 1 == files.size())
+		if (drained.fetch_add(1) + 1 == files.size()) {
 			progress.Finish();
+		}
 	}
 	vector<OpenFileInfo> files;
 	FileScheduler scheduler;
@@ -3998,56 +4433,89 @@ static void InventoryIdentityValues(vector<Value> &row, const CaptureIdentity &i
 	row[IC_MTIME] =
 	    Timestamp::IsFinite(identity.modified) ? Value::TIMESTAMP(identity.modified) : Value(LogicalType::TIMESTAMP);
 }
+// Whether a file's identity now matches a catalog row's. The one rule for reuse
+// in capture_inventory and for pruning in read_pcap(catalog=...), so a summary
+// trusted by one is trusted by the other.
+static bool InventoryIdentityMatches(const CaptureIdentity &identity, const vector<Value> &current,
+                                     const vector<Value> &old) {
+	PQ_ASSERT(current.size() == IC_COUNT);
+	PQ_ASSERT(old.size() == IC_COUNT);
+	if (!identity.Known()) {
+		return false;
+	}
+	for (idx_t col = IC_ID_TYPE; col <= IC_MTIME; ++col) {
+		if (!Value::NotDistinctFrom(current[col], old[col])) {
+			return false;
+		}
+	}
+	return true;
+}
 static bool InventoryValidPrevious(const vector<Value> &row, bool protocols) {
 	auto equal = [&](idx_t col, Value value) {
 		return Value::NotDistinctFrom(row[col], value);
 	};
 	if (!equal(IC_SCHEMA, Value::UINTEGER(1)) || !equal(IC_SEMANTICS, Value::UINTEGER(1)) ||
-	    !equal(IC_STATUS, Value("complete")) || !equal(IC_STABLE, Value(true)) || !row[IC_ERROR].IsNull())
+	    !equal(IC_STATUS, Value("complete")) || !equal(IC_STABLE, Value(true)) || !row[IC_ERROR].IsNull()) {
 		return false;
-	if (!equal(IC_DETAIL, Value("protocols")) && (protocols || !equal(IC_DETAIL, Value("framing"))))
+	}
+	if (!equal(IC_DETAIL, Value("protocols")) && (protocols || !equal(IC_DETAIL, Value("framing")))) {
 		return false;
-	if (!equal(IC_FORMAT, Value("pcap")) && !equal(IC_FORMAT, Value("pcapng")))
+	}
+	if (!equal(IC_FORMAT, Value("pcap")) && !equal(IC_FORMAT, Value("pcapng"))) {
 		return false;
-	for (idx_t col : {IC_PACKETS, IC_NULLS, IC_CAPTURED, IC_REPORTED, IC_LINKS})
-		if (row[col].IsNull())
+	}
+	for (idx_t col : {IC_PACKETS, IC_NULLS, IC_CAPTURED, IC_REPORTED, IC_LINKS}) {
+		if (row[col].IsNull()) {
 			return false;
+		}
+	}
 	auto packets = row[IC_PACKETS].GetValue<uint64_t>(), nulls = row[IC_NULLS].GetValue<uint64_t>();
-	if (nulls > packets || row[IC_MIN].IsNull() != row[IC_MAX].IsNull() || row[IC_MIN].IsNull() != (nulls == packets))
+	if (nulls > packets || row[IC_MIN].IsNull() != row[IC_MAX].IsNull() || row[IC_MIN].IsNull() != (nulls == packets)) {
 		return false;
-	if (row[IC_SCAN_TIME].IsNull() || !Timestamp::IsFinite(row[IC_SCAN_TIME].GetValue<timestamp_t>()))
+	}
+	if (row[IC_SCAN_TIME].IsNull() || !Timestamp::IsFinite(row[IC_SCAN_TIME].GetValue<timestamp_t>())) {
 		return false;
+	}
 	if (!row[IC_MIN].IsNull() && (!Timestamp::IsFinite(row[IC_MIN].GetValue<timestamp_t>()) ||
 	                              !Timestamp::IsFinite(row[IC_MAX].GetValue<timestamp_t>()) ||
-	                              row[IC_MIN].GetValue<timestamp_t>() > row[IC_MAX].GetValue<timestamp_t>()))
+	                              row[IC_MIN].GetValue<timestamp_t>() > row[IC_MAX].GetValue<timestamp_t>())) {
 		return false;
+	}
 	const auto &links = ListValue::GetChildren(row[IC_LINKS]);
-	if ((packets && links.empty()) || links.size() > 65536)
+	// Link types are 16 bits, so a summary can list at most 65536 of them.
+	if ((packets && links.empty()) || links.size() > 65536) {
 		return false;
+	}
 	uint32_t last = 0;
 	bool first = true;
 	for (const auto &link : links) {
-		if (link.IsNull())
+		if (link.IsNull()) {
 			return false;
+		}
 		auto value = link.GetValue<uint32_t>();
-		if (!first && value <= last)
+		if (!first && value <= last) {
 			return false;
+		}
 		first = false;
 		last = value;
 	}
 	if (equal(IC_DETAIL, Value("protocols"))) {
-		for (idx_t col = IC_IPV4; col <= IC_FRAGMENTS; ++col)
-			if (row[col].IsNull() || row[col].GetValue<uint64_t>() > packets)
+		for (idx_t col = IC_IPV4; col <= IC_FRAGMENTS; ++col) {
+			if (row[col].IsNull() || row[col].GetValue<uint64_t>() > packets) {
 				return false;
+			}
+		}
 		auto remaining = packets;
 		for (idx_t col : {IC_TCP, IC_UDP, IC_MALFORMED, IC_UNSUPPORTED, IC_FRAGMENTS}) {
 			auto count = row[col].GetValue<uint64_t>();
-			if (count > remaining)
+			if (count > remaining) {
 				return false;
+			}
 			remaining -= count;
 		}
-		if (remaining || row[IC_OTHER].GetValue<uint64_t>() > row[IC_UNSUPPORTED].GetValue<uint64_t>())
+		if (remaining || row[IC_OTHER].GetValue<uint64_t>() > row[IC_UNSUPPORTED].GetValue<uint64_t>()) {
 			return false;
+		}
 	}
 	return true;
 }
@@ -4065,29 +4533,117 @@ static bool CatalogTimestampFilter(const TableFilter &filter) {
 	case TableFilterType::CONJUNCTION_AND:
 	case TableFilterType::CONJUNCTION_OR: {
 		auto &conjunction = static_cast<const ConjunctionFilter &>(filter);
-		if (conjunction.child_filters.empty())
+		if (conjunction.child_filters.empty()) {
 			return false;
-		for (auto &child : conjunction.child_filters)
-			if (!CatalogTimestampFilter(*child))
+		}
+		for (auto &child : conjunction.child_filters) {
+			if (!CatalogTimestampFilter(*child)) {
 				return false;
+			}
+		}
 		return true;
 	}
 	default:
 		return false;
 	}
 }
+// Why a catalog summary cannot be trusted for this file's backend, or null when
+// it can. Only local and HTTP(S) have measured freshness behavior for this
+// milestone. S3/other backends fall back until provider tests pass.
+static const char *CatalogBackendRefusal(ClientContext &context, const string &path) {
+	if (!FileSystem::IsRemoteFile(path)) {
+		return nullptr;
+	}
+	const char *refusal = nullptr;
+	if (!StringUtil::StartsWith(path, "http://") && !StringUtil::StartsWith(path, "https://")) {
+		return "unverified remote backend";
+	}
+	Value cached;
+	if (context.TryGetCurrentSetting("enable_http_metadata_cache", cached) &&
+	    (cached.IsNull() || cached.GetValue<bool>())) {
+		refusal = "metadata cache enabled";
+	}
+	if (!StableRemoteLocator(path)) {
+		refusal = "unstable remote locator";
+	}
+	return refusal;
+}
+
+// Whether a summary proves the file has no rows the time filter could keep.
+static bool CatalogTimeExcludes(const vector<Value> &summary, const TableFilter &time_filter) {
+	auto stats = NumericStats::CreateUnknown(LogicalType::TIMESTAMP);
+	auto packets = summary[IC_PACKETS].GetValue<uint64_t>();
+	auto nulls = summary[IC_NULLS].GetValue<uint64_t>();
+	PQ_ASSERT(nulls <= packets); // InventoryValidPrevious checked it
+	stats.Set(nulls ? StatsInfo::CAN_HAVE_NULL_VALUES : StatsInfo::CANNOT_HAVE_NULL_VALUES);
+	stats.Set(packets > nulls ? StatsInfo::CAN_HAVE_VALID_VALUES : StatsInfo::CANNOT_HAVE_VALID_VALUES);
+	if (packets > nulls) {
+		NumericStats::SetMin(stats, summary[IC_MIN]);
+		NumericStats::SetMax(stats, summary[IC_MAX]);
+	}
+	return packets == 0 || time_filter.CheckStatistics(stats) == FilterPropagateResult::FILTER_ALWAYS_FALSE;
+}
+
+// Decides one file of a pruned scan: exclude is set when its summary proves the
+// time filter keeps none of its rows. Returns the reason, for EXPLAIN.
+static string CatalogDecision(ClientContext &context, const OpenFileInfo &file,
+                              const unordered_map<string, InventoryPrevious> &previous, const TableFilter &time_filter,
+                              bool &exclude) {
+	exclude = false;
+	auto found = previous.find(file.path);
+	if (found == previous.end()) {
+		return "no matching summary";
+	}
+	const auto &old = found->second;
+	if (old.conflict) {
+		return "conflicting summaries";
+	}
+	if (!InventoryValidPrevious(old.row, false)) {
+		return "incompatible summary";
+	}
+	const char *refusal = CatalogBackendRefusal(context, file.path);
+	if (refusal != nullptr) {
+		return refusal;
+	}
+	auto &fs = FileSystem::GetFileSystem(context);
+	if (fs.IsPipe(file.path)) {
+		throw InvalidInputException("Catalog validation requires seekable capture files");
+	}
+	auto handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+	if (!handle->CanSeek() || handle->IsPipe()) {
+		throw InvalidInputException("Catalog validation requires seekable capture files");
+	}
+	auto identity = ReadCaptureIdentity(fs, *handle);
+	vector<LogicalType> types;
+	vector<string> names;
+	InventorySchema(types, names);
+	vector<Value> current;
+	for (auto &type : types) {
+		current.emplace_back(type);
+	}
+	InventoryIdentityValues(current, identity);
+	if (!InventoryIdentityMatches(identity, current, old.row)) {
+		return "identity mismatch or unavailable";
+	}
+	exclude = CatalogTimeExcludes(old.row, time_filter);
+	return exclude ? "time excluded" : "time may match";
+}
+
 static vector<idx_t> SelectCatalogFiles(ClientContext &context, const PcapBindData &bind, TableFunctionInitInput &input,
                                         map<string, idx_t> &reasons) {
-	if (bind.catalog.empty() || bind.selected_indices.empty())
+	if (bind.catalog.empty() || bind.selected_indices.empty()) {
 		return bind.selected_indices;
+	}
 	// Re-resolve the table in the execution's transaction, even in strict mode.
 	vector<StorageIndex> ids;
-	InventoryCatalog(context, bind.catalog, ids);
+	auto &table = InventoryCatalog(context, bind.catalog, ids);
 	const TableFilter *time_filter = nullptr;
 	if (input.filters) {
-		for (auto &entry : input.filters->filters)
-			if (input.column_ids[entry.first] == 2 && CatalogTimestampFilter(*entry.second))
+		for (auto &entry : input.filters->filters) {
+			if (input.column_ids[entry.first] == PCAP_TIMESTAMP_COLUMN && CatalogTimestampFilter(*entry.second)) {
 				time_filter = entry.second.get();
+			}
+		}
 	}
 	if (!bind.catalog_immutable || !time_filter) {
 		reasons[!bind.catalog_immutable ? "strict requires scan" : "no supported time filter"] =
@@ -4098,93 +4654,39 @@ static vector<idx_t> SelectCatalogFiles(ClientContext &context, const PcapBindDa
 	vector<OpenFileInfo> candidates;
 	for (auto index : bind.selected_indices) {
 		auto file = bind.files[index];
-		if (!FileSystem::IsRemoteFile(file.path))
+		if (!FileSystem::IsRemoteFile(file.path)) {
 			file.path = fs.CanonicalizePath(file.path);
+		}
 		candidates.push_back(std::move(file));
 	}
 	InventorySnapshotMemory memory(context);
 	unordered_map<string, InventoryPrevious> previous;
-	LoadInventorySnapshot(context, bind.catalog, candidates, memory, previous);
+	LoadInventorySnapshot(context, table, ids, candidates, memory, previous);
 	vector<idx_t> selected;
-	vector<LogicalType> types;
-	vector<string> names;
-	InventorySchema(types, names);
 	for (idx_t n = 0; n < candidates.size(); ++n) {
-		if (context.IsInterrupted())
+		if (context.IsInterrupted()) {
 			throw InterruptException();
-		auto &file = candidates[n];
-		string reason = "no matching summary";
-		bool exclude = false;
-		auto found = previous.find(file.path);
-		if (found != previous.end()) {
-			auto &old = found->second;
-			reason = old.conflict ? "conflicting summaries" : "incompatible summary";
-			if (!old.conflict && InventoryValidPrevious(old.row, false)) {
-				reason = "unverified remote backend";
-				// Only local and HTTP(S) have measured freshness behavior for this
-				// milestone. S3/other backends fall back until provider tests pass.
-				bool supported = !FileSystem::IsRemoteFile(file.path) || StringUtil::StartsWith(file.path, "http://") ||
-				                 StringUtil::StartsWith(file.path, "https://");
-				if (supported && FileSystem::IsRemoteFile(file.path)) {
-					Value cached;
-					if (context.TryGetCurrentSetting("enable_http_metadata_cache", cached) &&
-					    (cached.IsNull() || cached.GetValue<bool>())) {
-						supported = false;
-						reason = "metadata cache enabled";
-					}
-					if (file.path.find('?') != string::npos || file.path.find('#') != string::npos ||
-					    file.path.find('@') != string::npos) {
-						supported = false;
-						reason = "unstable remote locator";
-					}
-				}
-				if (supported) {
-					if (fs.IsPipe(file.path))
-						throw InvalidInputException("Catalog validation requires seekable capture files");
-					auto handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
-					if (!handle->CanSeek() || handle->IsPipe())
-						throw InvalidInputException("Catalog validation requires seekable capture files");
-					auto identity = ReadCaptureIdentity(fs, *handle);
-					vector<Value> current;
-					for (auto &type : types)
-						current.emplace_back(type);
-					InventoryIdentityValues(current, identity);
-					bool match = identity.Known();
-					for (idx_t col = IC_ID_TYPE; col <= IC_MTIME; ++col)
-						match &= Value::NotDistinctFrom(current[col], old.row[col]);
-					reason = "identity mismatch or unavailable";
-					if (match) {
-						auto stats = NumericStats::CreateUnknown(LogicalType::TIMESTAMP);
-						auto packets = old.row[IC_PACKETS].GetValue<uint64_t>();
-						auto nulls = old.row[IC_NULLS].GetValue<uint64_t>();
-						stats.Set(nulls ? StatsInfo::CAN_HAVE_NULL_VALUES : StatsInfo::CANNOT_HAVE_NULL_VALUES);
-						stats.Set(packets > nulls ? StatsInfo::CAN_HAVE_VALID_VALUES
-						                          : StatsInfo::CANNOT_HAVE_VALID_VALUES);
-						if (packets > nulls) {
-							NumericStats::SetMin(stats, old.row[IC_MIN]);
-							NumericStats::SetMax(stats, old.row[IC_MAX]);
-						}
-						exclude = packets == 0 ||
-						          time_filter->CheckStatistics(stats) == FilterPropagateResult::FILTER_ALWAYS_FALSE;
-						reason = exclude ? "time excluded" : "time may match";
-					}
-				}
-			}
 		}
+		auto &file = candidates[n];
+		bool exclude = false;
+		const auto reason = CatalogDecision(context, file, previous, *time_filter, exclude);
 		++reasons[reason];
-		if (!exclude)
+		if (!exclude) {
 			selected.push_back(bind.selected_indices[n]);
+		}
 	}
 	return selected;
 }
 static InsertionOrderPreservingMap<string> CatalogDynamicToString(TableFunctionDynamicToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
-	if (!input.global_state || input.bind_data->Cast<PcapBindData>().catalog.empty())
+	if (!input.global_state || input.bind_data->Cast<PcapBindData>().catalog.empty()) {
 		return result;
+	}
 	auto &global = input.global_state->Cast<PcapGlobalState>();
 	result["Runtime Selected Files"] = StringUtil::Format("%llu", global.selected_indices.size());
-	for (auto &reason : global.catalog_reasons)
+	for (auto &reason : global.catalog_reasons) {
 		result["Catalog: " + reason.first] = StringUtil::Format("%llu", reason.second);
+	}
 	return result;
 }
 static void AddCatalogOptions(TableFunction &function) {
@@ -4193,15 +4695,13 @@ static void AddCatalogOptions(TableFunction &function) {
 	function.dynamic_to_string = CatalogDynamicToString;
 }
 
-static vector<Value> InventoryOne(ClientContext &context, const InventoryBindData &bind, InventoryGlobalState &global,
-                                  idx_t index) {
-	vector<LogicalType> types;
-	vector<string> names;
-	InventorySchema(types, names);
+// The row's columns that do not depend on reading the file.
+static vector<Value> InventoryRow(const InventoryBindData &bind, const OpenFileInfo &file, idx_t index,
+                                  const vector<LogicalType> &types) {
 	vector<Value> row;
-	for (const auto &type : types)
+	for (const auto &type : types) {
 		row.emplace_back(type);
-	const auto &file = global.files[index];
+	}
 	row[IC_FILE] = Value(file.path);
 	row[IC_INPUT] = Value::UBIGINT(index + 1);
 	row[IC_DETAIL] = Value(bind.protocols ? "protocols" : "framing");
@@ -4212,6 +4712,137 @@ static vector<Value> InventoryOne(ClientContext &context, const InventoryBindDat
 	row[IC_REUSED] = Value(false);
 	row[IC_VALIDATION] = Value(bind.immutable ? "immutable" : "strict");
 	row[IC_REASON] = Value(bind.previous.empty() ? "no_previous_catalog" : "no_matching_summary");
+	return row;
+}
+
+// Fills the row from the previous catalog's summary when catalog_validation is
+// immutable and the file's identity still matches it; otherwise records why not.
+static bool ReuseInventorySummary(const InventoryBindData &bind, InventoryGlobalState &global, idx_t index,
+                                  const CaptureIdentity &identity, vector<Value> &row) {
+	auto found = global.previous.find(global.files[index].path);
+	if (found == global.previous.end()) {
+		return false;
+	}
+	const auto &old = found->second;
+	row[IC_REASON] = Value(!bind.immutable ? "strict_requires_scan"
+	                       : old.conflict  ? "conflicting_summaries"
+	                                       : "incompatible_summary");
+	if (!bind.immutable || old.conflict || !InventoryValidPrevious(old.row, bind.protocols)) {
+		return false;
+	}
+	if (!InventoryIdentityMatches(identity, row, old.row)) {
+		row[IC_REASON] = Value("identity_changed_or_unavailable");
+		return false;
+	}
+	for (idx_t col = IC_FORMAT; col <= IC_FRAGMENTS; ++col) {
+		row[col] = old.row[col];
+	}
+	row[IC_DETAIL] = Value(bind.protocols ? "protocols" : "framing");
+	if (!bind.protocols) {
+		for (idx_t col = IC_IPV4; col <= IC_FRAGMENTS; ++col) {
+			row[col] = Value(LogicalType::UBIGINT);
+		}
+	}
+	row[IC_STATUS] = Value("complete");
+	row[IC_STABLE] = Value(true);
+	row[IC_REUSED] = Value(true);
+	row[IC_SCAN_TIME] = old.row[IC_SCAN_TIME];
+	row[IC_REASON] = Value("immutable_metadata_match");
+	// As the reader does: progress counts files only while it is enabled, so a
+	// reused file is counted on the same terms.
+	if (global.progress.Enabled()) {
+		global.progress.CheckSize(index, true, identity.size < 0 ? 0 : identity.size);
+		if (identity.size >= 0) {
+			global.progress.Advance(identity.size);
+		}
+		global.progress.CompleteFile();
+	}
+	return true;
+}
+
+// The totals a full read of the file produced.
+static void SetInventoryTotals(const InventoryBindData &bind, CaptureReader &reader, const InventoryTotals &totals,
+                               vector<Value> &row) {
+	row[IC_FORMAT] = Value(reader.InventoryFormat());
+	vector<Value> links;
+	for (auto link : reader.InventoryLinks()) {
+		links.push_back(Value::UINTEGER(link));
+	}
+	row[IC_LINKS] = Value::LIST(LogicalType::UINTEGER, links);
+	row[IC_PACKETS] = Value::UBIGINT(totals.packets);
+	row[IC_NULLS] = Value::UBIGINT(totals.null_timestamps);
+	row[IC_CAPTURED] = Value::UBIGINT(totals.captured);
+	row[IC_REPORTED] = Value::UBIGINT(totals.reported);
+	if (totals.timed) {
+		row[IC_MIN] = Value::TIMESTAMP(totals.minimum);
+		row[IC_MAX] = Value::TIMESTAMP(totals.maximum);
+	}
+	if (bind.protocols) {
+		const uint64_t counts[] = {totals.ipv4,  totals.ipv6,      totals.tcp,         totals.udp,
+		                           totals.other, totals.malformed, totals.unsupported, totals.fragments};
+		static_assert(IC_FRAGMENTS - IC_IPV4 + 1 == 8, "counts[] lists one value per protocol column");
+		for (idx_t i = 0; i < 8; ++i) {
+			row[IC_IPV4 + i] = Value::UBIGINT(counts[i]);
+		}
+	}
+	row[IC_STATUS] = Value(reader.SawTruncatedTail() ? "truncated" : "complete");
+}
+
+// Reads the whole file, then checks its identity did not change while it was
+// read; changed is set when it did.
+static void ScanInventory(ClientContext &context, const InventoryBindData &bind, InventoryGlobalState &global,
+                          idx_t index, const CaptureIdentity &identity, vector<Value> &row, bool &changed) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	const auto &file = global.files[index];
+	CaptureReader reader(context, file, global.options, &global.progress, index);
+	auto before = reader.InventoryBefore();
+	InventoryIdentityValues(row, before);
+	InventoryTotals totals;
+	PacketRecord record;
+	while (reader.Next(record)) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		totals.Observe(record.has_timestamp, record.timestamp, record.captured_length, record.original_length,
+		               record.decoded, bind.protocols);
+	}
+	auto after = reader.InventoryAfter();
+	auto verify = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+	auto current = ReadCaptureIdentity(fs, *verify);
+	changed = !identity.Same(before) || !before.Same(after) || !after.Same(current);
+	if (changed) {
+		throw InvalidInputException("Capture identity changed during inventory");
+	}
+	SetInventoryTotals(bind, reader, totals, row);
+	row[IC_STABLE] = before.Known() ? Value(true) : Value(LogicalType::BOOLEAN);
+}
+
+// With on_error=report, a capture's own failure becomes its row. An interrupt,
+// exhausted memory or a broken invariant fails the query instead: report is for
+// bad files, not for bugs in this code or the engine.
+static void ReportInventoryError(const InventoryBindData &bind, const OpenFileInfo &file,
+                                 const vector<LogicalType> &types, const ErrorData &error, bool changed,
+                                 vector<Value> &row) {
+	for (idx_t col = IC_FORMAT; col <= IC_FRAGMENTS; ++col) {
+		if (col != IC_DETAIL) {
+			row[col] = Value(types[col]);
+		}
+	}
+	row[IC_STATUS] = Value(changed ? "changed" : "error");
+	row[IC_ERROR] = Value(FileSystem::IsRemoteFile(file.path)
+	                          ? "Remote inventory scan failed; rerun with on_error=error for provider details"
+	                          : error.Message());
+	row[IC_SCAN_TIME] = Value(LogicalType::TIMESTAMP);
+	row[IC_STABLE] = Value(false);
+}
+
+static vector<Value> InventoryOne(ClientContext &context, const InventoryBindData &bind, InventoryGlobalState &global,
+                                  idx_t index) {
+	vector<LogicalType> types;
+	vector<string> names;
+	InventorySchema(types, names);
+	const auto &file = global.files[index];
+	auto row = InventoryRow(bind, file, index, types);
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (FileSystem::IsRemoteFile(file.path)) {
 		Value metadata_cache;
@@ -4223,96 +4854,30 @@ static vector<Value> InventoryOne(ClientContext &context, const InventoryBindDat
 	}
 	bool changed = false;
 	try {
-		if (fs.IsPipe(file.path))
+		if (fs.IsPipe(file.path)) {
 			throw InvalidInputException("Inventory does not support named pipes");
+		}
 		auto probe = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
-		if (!probe->CanSeek() || probe->IsPipe())
+		if (!probe->CanSeek() || probe->IsPipe()) {
 			throw InvalidInputException("Inventory requires seekable capture files");
+		}
 		auto identity = ReadCaptureIdentity(fs, *probe);
 		InventoryIdentityValues(row, identity);
-		auto found = global.previous.find(file.path);
-		if (found != global.previous.end()) {
-			const auto &old = found->second;
-			row[IC_REASON] = Value(!bind.immutable ? "strict_requires_scan"
-			                       : old.conflict  ? "conflicting_summaries"
-			                                       : "incompatible_summary");
-			if (bind.immutable && !old.conflict && InventoryValidPrevious(old.row, bind.protocols)) {
-				bool match = identity.Known();
-				for (idx_t col = IC_ID_TYPE; col <= IC_MTIME; ++col)
-					match &= Value::NotDistinctFrom(row[col], old.row[col]);
-				if (match) {
-					for (idx_t col = IC_FORMAT; col <= IC_FRAGMENTS; ++col)
-						row[col] = old.row[col];
-					row[IC_DETAIL] = Value(bind.protocols ? "protocols" : "framing");
-					if (!bind.protocols)
-						for (idx_t col = IC_IPV4; col <= IC_FRAGMENTS; ++col)
-							row[col] = Value(LogicalType::UBIGINT);
-					row[IC_STATUS] = Value("complete");
-					row[IC_STABLE] = Value(true);
-					row[IC_REUSED] = Value(true);
-					row[IC_SCAN_TIME] = old.row[IC_SCAN_TIME];
-					row[IC_REASON] = Value("immutable_metadata_match");
-					global.progress.CheckSize(index, true, identity.size < 0 ? 0 : identity.size);
-					if (identity.size >= 0)
-						global.progress.Advance(identity.size);
-					global.progress.CompleteFile();
-					return row;
-				}
-				row[IC_REASON] = Value("identity_changed_or_unavailable");
-			}
+		if (ReuseInventorySummary(bind, global, index, identity, row)) {
+			return row;
 		}
 		probe.reset();
-		CaptureReader reader(context, file, global.options, &global.progress, index);
-		auto before = reader.InventoryBefore();
-		InventoryIdentityValues(row, before);
-		InventoryTotals totals;
-		PacketRecord record;
-		while (reader.Next(record)) {
-			if (context.IsInterrupted())
-				throw InterruptException();
-			totals.Observe(record.has_timestamp, record.timestamp, record.captured_length, record.original_length,
-			               record.decoded, bind.protocols);
-		}
-		auto after = reader.InventoryAfter();
-		auto verify = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
-		auto current = ReadCaptureIdentity(fs, *verify);
-		changed = !identity.Same(before) || !before.Same(after) || !after.Same(current);
-		if (changed)
-			throw InvalidInputException("Capture identity changed during inventory");
-		row[IC_FORMAT] = Value(reader.InventoryFormat());
-		vector<Value> links;
-		for (auto link : reader.InventoryLinks())
-			links.push_back(Value::UINTEGER(link));
-		row[IC_LINKS] = Value::LIST(LogicalType::UINTEGER, links);
-		row[IC_PACKETS] = Value::UBIGINT(totals.packets);
-		row[IC_NULLS] = Value::UBIGINT(totals.null_timestamps);
-		row[IC_CAPTURED] = Value::UBIGINT(totals.captured);
-		row[IC_REPORTED] = Value::UBIGINT(totals.reported);
-		if (totals.timed) {
-			row[IC_MIN] = Value::TIMESTAMP(totals.minimum);
-			row[IC_MAX] = Value::TIMESTAMP(totals.maximum);
-		}
-		if (bind.protocols) {
-			const uint64_t counts[] = {totals.ipv4,  totals.ipv6,      totals.tcp,         totals.udp,
-			                           totals.other, totals.malformed, totals.unsupported, totals.fragments};
-			for (idx_t i = 0; i < 8; ++i)
-				row[IC_IPV4 + i] = Value::UBIGINT(counts[i]);
-		}
-		row[IC_STATUS] = Value(reader.SawTruncatedTail() ? "truncated" : "complete");
-		row[IC_STABLE] = before.Known() ? Value(true) : Value(LogicalType::BOOLEAN);
+		ScanInventory(context, bind, global, index, identity, row, changed);
+	} catch (const packetquapture::AssertionFailure &) {
+		throw;
 	} catch (const std::exception &exception) {
 		ErrorData error(exception);
-		if (!bind.report || error.Type() == ExceptionType::INTERRUPT || error.Type() == ExceptionType::OUT_OF_MEMORY)
+		const auto type = error.Type();
+		if (!bind.report || type == ExceptionType::INTERRUPT || type == ExceptionType::OUT_OF_MEMORY ||
+		    type == ExceptionType::INTERNAL || type == ExceptionType::FATAL) {
 			throw;
-		for (idx_t col = IC_FORMAT; col <= IC_FRAGMENTS; ++col)
-			if (col != IC_DETAIL)
-				row[col] = Value(types[col]);
-		row[IC_STATUS] = Value(changed ? "changed" : "error");
-		row[IC_ERROR] = Value(FileSystem::IsRemoteFile(file.path)
-		                          ? "Remote inventory scan failed; rerun with on_error=error for provider details"
-		                          : error.Message());
-		row[IC_SCAN_TIME] = Value(LogicalType::TIMESTAMP);
-		row[IC_STABLE] = Value(false);
+		}
+		ReportInventoryError(bind, file, types, error, changed, row);
 	}
 	return row;
 }
@@ -4322,21 +4887,28 @@ static void InventoryScan(ClientContext &context, TableFunctionInput &input, Dat
 	auto &local = input.local_state->Cast<InventoryLocalState>();
 	if (!local.initialized) {
 		local.initialized = true;
-		if (!global.files.empty())
+		if (!global.files.empty()) {
 			local.reservation = global.Admit();
+		}
 	}
-	if (!local.reservation)
+	if (!local.reservation) {
 		return;
+	}
 	idx_t index;
 	if (!global.scheduler.Claim(index)) {
 		local.reservation.reset();
 		return;
 	}
-	if (context.IsInterrupted())
+	if (context.IsInterrupted()) {
 		throw InterruptException();
+	}
 	auto row = InventoryOne(context, bind, global, index);
-	for (idx_t c = 0; c < global.columns.size(); ++c)
+	PQ_ASSERT(row.size() == IC_COUNT);
+	PQ_ASSERT(global.columns.size() == output.ColumnCount());
+	for (idx_t c = 0; c < global.columns.size(); ++c) {
+		PQ_ASSERT(global.columns[c] < IC_COUNT);
 		output.data[c].SetValue(0, row[global.columns[c]]);
+	}
 	output.SetCardinality(1);
 	global.Drained();
 }
@@ -4355,9 +4927,8 @@ static TableFunction ReadPcapFunction() {
 	return function;
 }
 
-static void LoadInternal(ExtensionLoader &loader) {
-	RegisterPcapCopy(loader);
-	loader.SetDescription("Query PCAP and PCAPNG packet captures directly from DuckDB");
+// The worker memory settings, read_flows and capture_inventory.
+static void RegisterBudgetedScans(ExtensionLoader &loader) {
 	DBConfig::GetConfig(loader.GetDatabaseInstance())
 	    .AddExtensionOption("packetquapture_stream_memory_mb",
 	                        "Query-wide stream-worker admission budget in MiB, capped at half memory_limit",
@@ -4384,9 +4955,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                        InventoryInitLocal);
 	inventory.projection_pushdown = true;
 	inventory.table_scan_progress = CaptureScanProgress;
-	for (const auto *option : {"detail", "on_error", "previous_catalog", "catalog_validation"})
+	for (const auto *option : {"detail", "on_error", "previous_catalog", "catalog_validation"}) {
 		inventory.named_parameters[option] = LogicalType::VARCHAR;
+	}
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(inventory));
+}
+
+// The per-packet readers: read_pcap, read_packets and read_dns.
+static void RegisterPacketReaders(ExtensionLoader &loader) {
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(ReadPcapFunction()));
 	TableFunction packets("read_packets", {LogicalType::VARCHAR}, PcapScan, BindCapture<PacketsBind>, PcapInit,
 	                      PcapInitLocal);
@@ -4409,6 +4985,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	AddCaptureOptions(dns);
 	AddCatalogOptions(dns);
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(dns));
+}
+
+// The readers built on TCP reassembly: read_dns_messages, read_tls and
+// read_tcp_streams.
+static void RegisterStreamReaders(ExtensionLoader &loader) {
 	TableFunction messages("read_dns_messages", {LogicalType::VARCHAR}, DnsMessagesScan, BindCapture<DnsMessagesBind>,
 	                       DnsMessagesInit, StreamInitLocal);
 	messages.projection_pushdown = true;
@@ -4435,6 +5016,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	AddCaptureOptions(streams);
 	streams.named_parameters["tcp_idle_timeout"] = LogicalType::INTERVAL;
 	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(streams));
+}
+
+static void LoadInternal(ExtensionLoader &loader) {
+	RegisterPcapCopy(loader);
+	loader.SetDescription("Query PCAP and PCAPNG packet captures directly from DuckDB");
+	RegisterBudgetedScans(loader);
+	RegisterPacketReaders(loader);
+	RegisterStreamReaders(loader);
 	RegisterTrafficAnalytics(loader);
 	RegisterDnsAnalytics(loader);
 }

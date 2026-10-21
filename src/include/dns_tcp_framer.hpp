@@ -4,13 +4,40 @@
 
 namespace packetquapture {
 
+// The outcome of framing one DNS message. UNSET is a message nothing has judged.
+// CONFLICT and LIMIT also carry a failed TCP stream's status through unchanged.
+enum class DnsFrameStatus : uint8_t { UNSET, COMPLETE, INCOMPLETE, INVALID, UNANCHORED, CONFLICT, LIMIT };
+
+// The reassembly_status text SQL reports for a status.
+inline const char *DnsFrameStatusName(DnsFrameStatus status) {
+	switch (status) {
+	case DnsFrameStatus::UNSET:
+		return "";
+	case DnsFrameStatus::COMPLETE:
+		return "complete";
+	case DnsFrameStatus::INCOMPLETE:
+		return "incomplete";
+	case DnsFrameStatus::INVALID:
+		return "invalid";
+	case DnsFrameStatus::UNANCHORED:
+		return "unanchored";
+	case DnsFrameStatus::CONFLICT:
+		return "conflict";
+	case DnsFrameStatus::LIMIT:
+		return "limit";
+	}
+	PQ_ASSERT(false);
+	return "";
+}
+
 struct TcpDnsMessage {
 	TcpFlowKey key;
 	bool tcp = true;
 	uint64_t stream_id = 0, message_number = 0;
 	uint32_t sequence = 0;
 	PacketStamp first, last;
-	std::string status, error;
+	DnsFrameStatus status = DnsFrameStatus::UNSET;
+	std::string error;
 	std::vector<uint8_t> data;
 };
 

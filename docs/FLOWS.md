@@ -71,8 +71,12 @@ imperfect observations, not a reconstruction of real-world connection boundaries
 Timeout defaults are five minutes for TCP and one minute for UDP. Zero disables idle
 expiry. NULL, calendar months, negative total durations, and fixed-duration conversion
 overflow are errors. `max_active_flows` defaults to 16,384; callers may lower it to
-1..16,384 to impose a stricter per-worker bound. Exhaustion fails the query; no sessions
-are evicted or silently split to meet a resource limit.
+1..16,384 to impose a stricter per-worker bound. A full table does not fail the query:
+the session nearest its idle deadline on the new packet's interface (else on any
+interface, else the first in key order when none can expire) is emitted early with
+`finalized_by='limit'`, and the new packet opens its own session. A port scan inside
+the idle timeout is the usual cause. A later packet of an evicted tuple starts a new
+row, so `limit` marks a session that may continue in another row.
 
 `handshake_complete` requires observed initiating SYN, opposite SYN-ACK acknowledging
 SYN+1, then initiating-side non-SYN ACK with matching sequence and acknowledgement

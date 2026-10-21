@@ -66,7 +66,9 @@ private:
 		bool syn[2] = {false, false}, syn_ack[2] = {false, false};
 		uint32_t sequence[2] = {0, 0};
 		bool scheduled = false, handshake_closed = false;
-		int64_t deadline = 0;
+		// deadline is the real one; queued is where its expiry entry sits, which
+		// may be earlier, since entries move only when they reach the front.
+		int64_t deadline = 0, queued = 0;
 	};
 	struct Scope {
 		bool has_watermark = false;
@@ -76,8 +78,13 @@ private:
 	using States = std::map<SessionKey, State>;
 	void Unschedule(State &state);
 	void Schedule(State &state);
+	void Refresh(Scope &scope);
+	States::iterator Evictable(uint32_t interface_id);
 	bool Emit(States::iterator it, const char *reason, FlowSummary &output);
 	void Account(State &state, bool from_low);
+	void Prepare();
+	bool Reused(const State &state, bool from_low) const;
+	States::iterator Open(const SessionKey &key, bool from_low);
 	FlowLimits limits;
 	States states;
 	std::map<uint32_t, Scope> scopes;

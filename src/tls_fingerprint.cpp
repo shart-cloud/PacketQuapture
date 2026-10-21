@@ -1,17 +1,22 @@
 #include "tls_fingerprint.hpp"
 
+#include "pq_assert.hpp"
+#include "tls_reader.hpp"
+
 #include <algorithm>
 
 namespace packetquapture {
 
 namespace {
 
-void AppendNumber(std::string &out, unsigned value) {
-	char digits[8];
+// Every JA3 field is a 16-bit wire value, so five digits always suffice.
+void AppendNumber(std::string &out, uint16_t value) {
+	char digits[5];
 	size_t length = 0;
 	do {
+		PQ_ASSERT(length < sizeof(digits));
 		digits[length++] = static_cast<char>('0' + value % 10);
-		value /= 10;
+		value = static_cast<uint16_t>(value / 10);
 	} while (value != 0);
 	while (length != 0) {
 		out.push_back(digits[--length]);
@@ -22,8 +27,8 @@ template <class T>
 void AppendList(std::string &out, const TlsList<T> &list, bool skip_grease) {
 	bool first = true;
 	for (size_t i = 0; i < list.values.size(); ++i) {
-		const unsigned value = list.values[i];
-		if (skip_grease && IsTlsGrease(static_cast<uint16_t>(value))) {
+		const uint16_t value = list.values[i];
+		if (skip_grease && IsTlsGrease(value)) {
 			continue;
 		}
 		if (!first) {
@@ -74,13 +79,11 @@ bool Ja3sString(const TlsHandshake &handshake, std::string &out) {
 
 namespace {
 
-const uint16_t EXTENSION_SERVER_NAME = 0;
 const uint16_t EXTENSION_ALPN = 16;
-const uint16_t TLS_1_3 = 0x0304;
 
 std::string Ja4Version(uint16_t version) {
 	switch (version) {
-	case TLS_1_3:
+	case TLS_VERSION_1_3:
 		return "13";
 	case 0x0303:
 		return "12";
@@ -113,6 +116,7 @@ void AppendCount(std::string &out, size_t count) {
 
 std::string JoinHex(const std::vector<uint16_t> &values) {
 	std::string out;
+	out.reserve(values.size() * 5); // four digits and a comma each
 	for (size_t i = 0; i < values.size(); ++i) {
 		if (i != 0) {
 			out.push_back(',');
@@ -171,7 +175,7 @@ bool Ja4Strings(const TlsHandshake &handshake, Ja4Parts &out) {
 	}
 	auto ciphers = WithoutGrease(handshake.client_cipher_suites.values);
 	const auto extensions = WithoutGrease(handshake.client_extensions.values);
-	const bool sni = std::find(extensions.begin(), extensions.end(), EXTENSION_SERVER_NAME) != extensions.end();
+	const bool sni = std::find(extensions.begin(), extensions.end(), TLS_EXTENSION_SERVER_NAME) != extensions.end();
 
 	out.prefix = "t" + Ja4Version(version) + (sni ? "d" : "i");
 	AppendCount(out.prefix, ciphers.size());
@@ -186,7 +190,7 @@ bool Ja4Strings(const TlsHandshake &handshake, Ja4Parts &out) {
 	out.first = JoinHex(ciphers);
 	std::vector<uint16_t> hashed;
 	for (size_t i = 0; i < extensions.size(); ++i) {
-		if (extensions[i] != EXTENSION_SERVER_NAME && extensions[i] != EXTENSION_ALPN) {
+		if (extensions[i] != TLS_EXTENSION_SERVER_NAME && extensions[i] != EXTENSION_ALPN) {
 			hashed.push_back(extensions[i]);
 		}
 	}

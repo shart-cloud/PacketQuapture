@@ -1,4 +1,5 @@
 #include "dns_analytics.hpp"
+#include "pq_assert.hpp"
 #include "dns_analytics_resources.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -114,6 +115,22 @@ static string JoinLabels(const vector<string> &labels, idx_t begin, const char *
 	return result;
 }
 
+// Derives the public suffix, registrable domain and left payload once the
+// number of public labels is known; leaves them empty when that count is unusable.
+static void FillPslNames(const vector<string> &labels, idx_t public_label_count, PslResult &result) {
+	if (public_label_count == 0 || public_label_count > labels.size()) {
+		return;
+	}
+	result.public_suffix = JoinLabels(labels, labels.size() - public_label_count);
+	if (labels.size() > public_label_count) {
+		const auto registrable_begin = labels.size() - public_label_count - 1;
+		result.registrable_domain = JoinLabels(labels, registrable_begin);
+		for (idx_t i = 0; i < registrable_begin; ++i) {
+			result.left_payload += labels[i];
+		}
+	}
+}
+
 static PslResult ResolvePsl(const string &input) {
 	vector<string> labels;
 	PslResult result;
@@ -121,10 +138,26 @@ static PslResult ResolvePsl(const string &input) {
 		return result;
 	}
 	const auto &data = GetPslData();
+	// Labels are non-empty, so the name from label i on is a suffix of the whole
+	// joined name. One buffer is refilled per candidate instead of joining a new
+	// string each time, which cost labels^2 allocations per row.
+	const string joined = JoinLabels(labels, 0);
+	vector<idx_t> starts;
+	starts.reserve(labels.size());
+	for (idx_t i = 0, offset = 0; i < labels.size(); offset += labels[i].size() + 1, ++i) {
+		starts.push_back(offset);
+	}
+	PQ_ASSERT(starts.back() + labels.back().size() == joined.size());
+	string candidate;
+	candidate.reserve(joined.size());
+	auto suffix = [&](idx_t i) -> const string & {
+		candidate.assign(joined, starts[i], string::npos);
+		return candidate;
+	};
 	idx_t public_label_count = 1;
 	bool exception_match = false;
 	for (idx_t i = 0; i < labels.size(); ++i) {
-		const auto candidate = JoinLabels(labels, i);
+		suffix(i);
 		for (const auto section : {&data.icann, &data.private_domains}) {
 			if (section->exception.find(candidate) != section->exception.end()) {
 				public_label_count = labels.size() - i - 1;
@@ -140,7 +173,7 @@ static PslResult ResolvePsl(const string &input) {
 	}
 	if (!exception_match) {
 		for (idx_t i = 0; i < labels.size(); ++i) {
-			const auto candidate = JoinLabels(labels, i);
+			suffix(i);
 			const auto candidate_count = labels.size() - i;
 			for (const auto section : {&data.icann, &data.private_domains}) {
 				if (section->exact.find(candidate) != section->exact.end() &&
@@ -158,17 +191,7 @@ static PslResult ResolvePsl(const string &input) {
 			}
 		}
 	}
-	if (public_label_count == 0 || public_label_count > labels.size()) {
-		return result;
-	}
-	result.public_suffix = JoinLabels(labels, labels.size() - public_label_count);
-	if (labels.size() > public_label_count) {
-		const auto registrable_begin = labels.size() - public_label_count - 1;
-		result.registrable_domain = JoinLabels(labels, registrable_begin);
-		for (idx_t i = 0; i < registrable_begin; ++i) {
-			result.left_payload += labels[i];
-		}
-	}
+	FillPslNames(labels, public_label_count, result);
 	return result;
 }
 
@@ -198,6 +221,9 @@ static void NormalizedEntropy(DataChunk &args, ExpressionState &, Vector &result
 			const auto probability = static_cast<double>(count) / static_cast<double>(value.size());
 			entropy -= probability * std::log2(probability);
 		}
+		// Six bits per byte is the entropy of a uniform 64-symbol alphabet, as in
+		// base64, the densest encoding a DNS label commonly carries; anything at or
+		// above it scores 1 (TRAFFIC_ANALYTICS.md).
 		return std::min(1.0, entropy / 6.0);
 	});
 }

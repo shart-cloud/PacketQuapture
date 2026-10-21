@@ -1,137 +1,34 @@
 #include "tls_handshake.hpp"
 
+#include "pq_assert.hpp"
+#include "tls_reader.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <initializer_list>
 #include <iterator>
+#include <limits>
 #include <string>
 
 namespace packetquapture {
 namespace {
 
-const uint8_t RECORD_CHANGE_CIPHER_SPEC = 20;
-const uint8_t RECORD_HANDSHAKE = 22;
-const uint8_t HANDSHAKE_CLIENT_HELLO = 1;
-const uint8_t HANDSHAKE_SERVER_HELLO = 2;
-const uint8_t HANDSHAKE_CERTIFICATE = 11;
-const uint16_t EXTENSION_SERVER_NAME = 0;
-const uint16_t EXTENSION_SUPPORTED_VERSIONS = 43;
-const uint16_t TLS_1_3 = 0x0304;
-const uint32_t MAX_RECORD_LENGTH = 16384 + 2048;
-const size_t RECORD_HEADER_LENGTH = 5;
-
-// The version and length checks every record header must pass: an SSL 3.0 to
-// TLS 1.3 version, and a non-empty body within the RFC 8446 ceiling.
-bool RecordHeaderValid(const uint8_t *header) {
-	const uint32_t length = static_cast<uint32_t>((header[3] << 8U) | header[4]);
-	return header[1] == 0x03 && header[2] <= 0x04 && length != 0 && length <= MAX_RECORD_LENGTH;
-}
-
-// Bounds-checked reader over one buffer. After a read runs past the end the
-// reader stays overrun and every later read fails, so malformed input unwinds
-// without a check at each step.
-class Reader {
-public:
-	Reader(const uint8_t *data_p, size_t size_p) : data(data_p), size(size_p) {
-	}
-	bool Overrun() const {
-		return overrun;
-	}
-	size_t Remaining() const {
-		return overrun ? 0 : size - offset;
-	}
-	uint8_t U8() {
-		if (Remaining() < 1) {
-			overrun = true;
-			return 0;
-		}
-		return data[offset++];
-	}
-	uint16_t U16() {
-		const uint16_t high = U8();
-		const uint16_t low = U8();
-		return static_cast<uint16_t>((high << 8U) | low);
-	}
-	uint32_t U24() {
-		const uint32_t high = U8();
-		const uint32_t mid = U8();
-		const uint32_t low = U8();
-		return (high << 16U) | (mid << 8U) | low;
-	}
-	bool Skip(size_t count) {
-		if (Remaining() < count) {
-			overrun = true;
-			return false;
-		}
-		offset += count;
-		return true;
-	}
-	bool SkipVector(size_t length_bytes) {
-		const size_t length = length_bytes == 1 ? U8() : U16();
-		return !overrun && Skip(length);
-	}
-	bool Take(size_t count, std::string &out) {
-		if (Remaining() < count) {
-			overrun = true;
-			return false;
-		}
-		out.assign(reinterpret_cast<const char *>(data + offset), count);
-		offset += count;
-		return true;
-	}
-	// The next count bytes as a reader of their own, without copying them.
-	bool Sub(size_t count, Reader &out) {
-		if (Remaining() < count) {
-			overrun = true;
-			return false;
-		}
-		out = Reader(data + offset, count);
-		offset += count;
-		return true;
-	}
-	bool TakeBytes(size_t count, std::vector<uint8_t> &out) {
-		if (Remaining() < count) {
-			overrun = true;
-			return false;
-		}
-		out.assign(data + offset, data + offset + count);
-		offset += count;
-		return true;
-	}
-
-private:
-	const uint8_t *data;
-	size_t size;
-	size_t offset = 0;
-	bool overrun = false;
-};
-
-void ParseServerName(Reader &reader, TlsHandshake &handshake) {
-	const uint16_t list_length = reader.U16();
-	if (reader.Overrun() || reader.Remaining() < list_length) {
+// A second server_name extension is forbidden (RFC 8446 4.2), as is a list that
+// does not parse; either leaves tls_sni NULL with client_list_malformed, rather
+// than letting the last copy win.
+void ReadServerName(TlsReader &reader, TlsHandshake &handshake) {
+	if (handshake.sni_seen) {
+		handshake.has_sni = false;
+		handshake.sni.clear();
+		handshake.sni_malformed = true;
 		return;
 	}
-	size_t consumed = 0;
-	while (consumed + 3 <= list_length) {
-		const uint8_t name_type = reader.U8();
-		const uint16_t name_length = reader.U16();
-		consumed += 3;
-		if (reader.Overrun() || name_length > list_length - consumed) {
-			return;
-		}
-		if (name_type == 0) {
-			std::string name;
-			if (reader.Take(name_length, name)) {
-				handshake.has_sni = true;
-				handshake.sni = EscapeTlsText(name);
-			}
-			return;
-		}
-		if (!reader.Skip(name_length)) {
-			return;
-		}
-		consumed += name_length;
+	handshake.sni_seen = true;
+	if (!ParseTlsServerName(reader, handshake.has_sni, handshake.sni)) {
+		handshake.has_sni = false;
+		handshake.sni.clear();
+		handshake.sni_malformed = true;
 	}
 }
 
@@ -143,61 +40,67 @@ const uint16_t EXTENSION_ALPN = 16;
 // Set when a parsed list is longer than the per-list limit. The hello is then
 // reported with status limit rather than with a list silently cut short.
 struct ListBudget {
-	explicit ListBudget(size_t cap_p) : cap(cap_p), exceeded(false) {
+	explicit ListBudget(size_t cap_entries_p) : cap_entries(cap_entries_p), exceeded(false) {
 	}
-	size_t cap;
+	size_t cap_entries;
 	bool exceeded;
 };
 
 // Reads a length-prefixed vector of 16-bit code points. With exact set, the
 // vector must fill the rest of the reader, as it does in an extension body.
 // Returns false only when the reader itself overran; a vector that is
-// well-framed but internally wrong is marked malformed instead.
-bool ReadCodes(Reader &reader, size_t length_bytes, bool exact, ListBudget &budget, TlsList<uint16_t> &out) {
+// well-framed but internally wrong is marked malformed instead. The cap is
+// checked from the length before anything is allocated.
+bool ReadCodes(TlsReader &reader, size_t length_bytes, bool exact, ListBudget &budget, TlsList<uint16_t> &out) {
+	out = TlsList<uint16_t>();
 	const size_t length = length_bytes == 1 ? reader.U8() : reader.U16();
-	std::vector<uint8_t> bytes;
-	if (reader.Overrun() || !reader.TakeBytes(length, bytes)) {
-		out = TlsList<uint16_t>();
+	TlsReader codes(nullptr, 0);
+	if (reader.Overrun() || !reader.Sub(length, codes)) {
 		out.malformed = true;
 		return false;
 	}
-	out = TlsList<uint16_t>();
 	if (length % 2 != 0 || (exact && reader.Remaining() != 0)) {
 		out.malformed = true;
 		return true;
 	}
-	if (length / 2 > budget.cap) {
+	if (length / 2 > budget.cap_entries) {
 		budget.exceeded = true;
 		out.over_limit = true;
 		return true;
 	}
 	out.present = true;
-	for (size_t i = 0; i < length; i += 2) {
-		out.values.push_back(static_cast<uint16_t>((bytes[i] << 8U) | bytes[i + 1]));
+	out.values.reserve(length / 2);
+	while (codes.Remaining() > 0) {
+		out.values.push_back(codes.U16());
 	}
+	PQ_ASSERT(!codes.Overrun());
+	PQ_ASSERT(out.values.size() <= budget.cap_entries);
 	return true;
 }
 
-void ReadPointFormats(Reader &reader, ListBudget &budget, TlsList<uint8_t> &out) {
-	const size_t length = reader.U8();
-	std::vector<uint8_t> bytes;
+void ReadPointFormats(TlsReader &reader, ListBudget &budget, TlsList<uint8_t> &out) {
 	out = TlsList<uint8_t>();
-	if (reader.Overrun() || !reader.TakeBytes(length, bytes) || reader.Remaining() != 0) {
+	const size_t length = reader.U8();
+	if (reader.Overrun() || reader.Remaining() != length) {
 		out.malformed = true;
 		return;
 	}
-	if (length > budget.cap) {
+	if (length > budget.cap_entries) {
 		budget.exceeded = true;
 		out.over_limit = true;
 		return;
 	}
 	out.present = true;
-	out.values = bytes;
+	const bool taken = reader.TakeBytes(length, out.values); // fits: Remaining() == length
+	PQ_ASSERT(taken);
+	PQ_ASSERT(out.values.size() <= budget.cap_entries);
 }
 
 // RFC 7301: a vector of non-empty protocol names, each a one-byte length and
-// raw bytes. A server must select exactly one.
-void ReadAlpn(Reader &reader, bool client, ListBudget &budget, TlsList<std::string> &out) {
+// raw bytes. A server must select exactly one. The cap is checked as names are
+// read, so a list of thousands of one-byte names is refused before they are
+// all allocated; the rest are still walked, since a malformed list wins.
+void ReadAlpn(TlsReader &reader, bool client, ListBudget &budget, TlsList<std::string> &out) {
 	out = TlsList<std::string>();
 	const uint16_t list_length = reader.U16();
 	if (reader.Overrun() || reader.Remaining() != list_length) {
@@ -205,26 +108,38 @@ void ReadAlpn(Reader &reader, bool client, ListBudget &budget, TlsList<std::stri
 		return;
 	}
 	std::vector<std::string> protocols;
+	size_t count = 0;
 	while (reader.Remaining() > 0) {
 		const size_t length = reader.U8();
-		std::string protocol;
-		if (reader.Overrun() || length == 0 || !reader.Take(length, protocol)) {
+		if (reader.Overrun() || length == 0 || reader.Remaining() < length) {
 			out.malformed = true;
 			return;
 		}
-		protocols.push_back(protocol);
+		// Both reads fit: length was checked against Remaining() above.
+		++count;
+		if (count > budget.cap_entries) {
+			const bool skipped = reader.Skip(length);
+			PQ_ASSERT(skipped);
+			continue;
+		}
+		std::string protocol;
+		const bool taken = reader.Take(length, protocol);
+		PQ_ASSERT(taken);
+		protocols.push_back(std::move(protocol));
 	}
-	if (protocols.empty() || (!client && protocols.size() != 1)) {
+	PQ_ASSERT(!reader.Overrun());
+	if (count == 0 || (!client && count != 1)) {
 		out.malformed = true;
 		return;
 	}
-	if (protocols.size() > budget.cap) {
+	if (count > budget.cap_entries) {
 		budget.exceeded = true;
 		out.over_limit = true;
 		return;
 	}
+	PQ_ASSERT(protocols.size() == count);
 	out.present = true;
-	out.values = protocols;
+	out.values = std::move(protocols);
 }
 
 // A second copy of an extension is forbidden (RFC 8446 4.2), so its list is
@@ -240,7 +155,7 @@ bool Duplicate(TlsList<T> &list) {
 }
 
 // A ClientHello offers a list of versions; a ServerHello names the one chosen.
-void ParseSupportedVersions(Reader &reader, bool client, ListBudget &budget, TlsHandshake &handshake) {
+void ParseSupportedVersions(TlsReader &reader, bool client, ListBudget &budget, TlsHandshake &handshake) {
 	if (client) {
 		if (!Duplicate(handshake.client_supported_versions)) {
 			ReadCodes(reader, 1, true, budget, handshake.client_supported_versions);
@@ -266,7 +181,7 @@ void ParseSupportedVersions(Reader &reader, bool client, ListBudget &budget, Tls
 
 // Walks the extension list, recording every type in order and reading the
 // bodies this layer reports.
-bool ParseExtensions(Reader &reader, bool client, const TlsHandshakeLimits &limits, ListBudget &budget,
+bool ParseExtensions(TlsReader &reader, bool client, const TlsHandshakeLimits &limits, ListBudget &budget,
                      TlsHandshake &handshake) {
 	const uint16_t extensions_length = reader.U16();
 	if (reader.Overrun()) {
@@ -281,18 +196,24 @@ bool ParseExtensions(Reader &reader, bool client, const TlsHandshakeLimits &limi
 		if (reader.Overrun() || length > extensions_length - consumed) {
 			return false;
 		}
+		// Too many extensions is a limit, not a malformed hello: reporting it as
+		// invalid would let a peer hide every field by padding its hello. The
+		// walk stops here, and the extension list is withheld rather than cut short.
 		if (++count > limits.max_extensions) {
-			return false;
+			budget.exceeded = true;
+			types = TlsList<uint16_t>();
+			types.over_limit = true;
+			return true;
 		}
-		Reader inner(nullptr, 0);
+		TlsReader inner(nullptr, 0);
 		if (!reader.Sub(length, inner)) {
 			return false;
 		}
 		consumed += length;
 		types.values.push_back(type);
-		if (type == EXTENSION_SERVER_NAME && client) {
-			ParseServerName(inner, handshake);
-		} else if (type == EXTENSION_SUPPORTED_VERSIONS) {
+		if (type == TLS_EXTENSION_SERVER_NAME && client) {
+			ReadServerName(inner, handshake);
+		} else if (type == TLS_EXTENSION_SUPPORTED_VERSIONS) {
 			ParseSupportedVersions(inner, client, budget, handshake);
 		} else if (client && type == EXTENSION_SUPPORTED_GROUPS) {
 			if (!Duplicate(handshake.client_supported_groups)) {
@@ -313,6 +234,7 @@ bool ParseExtensions(Reader &reader, bool client, const TlsHandshakeLimits &limi
 			}
 		}
 	}
+	PQ_ASSERT(types.values.size() <= limits.max_extensions);
 	return !reader.Overrun();
 }
 
@@ -320,7 +242,7 @@ bool ParseExtensions(Reader &reader, bool client, const TlsHandshakeLimits &limi
 // only in how the session id and cipher suites are encoded.
 bool ParseHello(const uint8_t *body, size_t size, bool client, const TlsHandshakeLimits &limits,
                 TlsHandshake &handshake, std::vector<uint8_t> &session_id) {
-	Reader reader(body, size);
+	TlsReader reader(body, size);
 	const uint16_t legacy_version = reader.U16();
 	if (reader.Overrun()) {
 		return false;
@@ -369,23 +291,39 @@ bool ParseHello(const uint8_t *body, size_t size, bool client, const TlsHandshak
 		return false;
 	}
 	if (budget.exceeded) {
-		handshake.status = "limit";
+		handshake.status = TlsStatus::LIMIT;
 		handshake.error = "TLS hello list exceeds the per-list limit";
 	}
 	return true;
+}
+
+// The certificate text a chain charged against its direction's budget.
+size_t ChainTextBytes(const TlsList<TlsCertificate> &chain) {
+	size_t text = 0;
+	for (const auto &certificate : chain.values) {
+		text += certificate.budget_bytes;
+	}
+	return text;
 }
 
 // RFC 5246 7.4.2: a three-byte vector of certificates, each a three-byte length
 // and its DER encoding. A second Certificate message is malformed, as a repeated
 // extension is. A certificate that does not parse keeps its place in the chain.
 // held counts the certificate text this direction already holds; a chain that
-// would take it past max_direction_certificate_bytes is over the limit.
+// would take it past max_direction_certificate_bytes is over the limit. A chain
+// that is dropped, as malformed, over the limit or duplicated, gives its bytes back.
 void ParseCertificates(const uint8_t *body, size_t size, const TlsHandshakeLimits &limits, size_t &held,
                        TlsList<TlsCertificate> &chain, TlsHandshake &handshake) {
+	PQ_ASSERT(held <= limits.max_direction_certificate_bytes);
+	if (chain.present) {
+		const size_t dropped = ChainTextBytes(chain);
+		PQ_ASSERT(dropped <= held);
+		held -= dropped;
+	}
 	if (Duplicate(chain)) {
 		return;
 	}
-	Reader reader(body, size);
+	TlsReader reader(body, size);
 	const uint32_t list_length = reader.U24();
 	if (reader.Overrun() || reader.Remaining() != list_length) {
 		chain.malformed = true;
@@ -395,15 +333,16 @@ void ParseCertificates(const uint8_t *body, size_t size, const TlsHandshakeLimit
 	const size_t held_before = held;
 	while (reader.Remaining() > 0) {
 		const uint32_t length = reader.U24();
-		std::vector<uint8_t> der;
-		if (reader.Overrun() || !reader.TakeBytes(length, der)) {
+		const uint8_t *der = nullptr;
+		if (reader.Overrun() || !reader.TakeSpan(length, der)) {
+			held = held_before; // the chain is dropped, so it holds nothing
 			chain.malformed = true;
 			return;
 		}
 		TlsCertificate certificate;
 		auto result = X509Result::OVER_LIMIT;
 		if (certificates.size() < limits.max_certificates && length <= limits.max_certificate_bytes) {
-			result = ParseX509Certificate(der.data(), der.size(), limits.max_list_entries, certificate.fields);
+			result = ParseX509Certificate(der, length, limits.max_list_entries, certificate.fields);
 			// The hashes are hex SHA-1 and SHA-256, charged before they are made
 			// so a chain dropped for its size is not hashed.
 			const size_t text = certificate.fields.TextBytes() + (limits.certificate_digest != nullptr ? 40 + 64 : 0);
@@ -412,16 +351,17 @@ void ParseCertificates(const uint8_t *body, size_t size, const TlsHandshakeLimit
 			}
 			if (result == X509Result::OK) {
 				held += text;
+				certificate.budget_bytes = text;
 				if (limits.certificate_digest != nullptr) {
-					limits.certificate_digest(der.data(), der.size(), certificate.fields);
+					limits.certificate_digest(der, length, certificate.fields);
 				}
 			}
 		}
 		if (result == X509Result::OVER_LIMIT) {
 			held = held_before; // the chain is dropped, so it holds nothing
 			chain.over_limit = true;
-			if (handshake.status.empty()) {
-				handshake.status = "limit";
+			if (handshake.status == TlsStatus::UNSET) {
+				handshake.status = TlsStatus::LIMIT;
 				handshake.error = "TLS certificate chain exceeds the certificate limits";
 			}
 			return;
@@ -431,6 +371,8 @@ void ParseCertificates(const uint8_t *body, size_t size, const TlsHandshakeLimit
 	}
 	chain.present = true;
 	chain.values = std::move(certificates);
+	PQ_ASSERT(held <= limits.max_direction_certificate_bytes);
+	PQ_ASSERT(ChainTextBytes(chain) == held - held_before);
 }
 
 // Whether a Certificate message was malformed or holds a certificate that did
@@ -448,6 +390,8 @@ bool Unparsed(const TlsList<TlsCertificate> &chain) {
 void ClearHello(TlsHandshake &handshake) {
 	handshake.has_sni = false;
 	handshake.sni.clear();
+	handshake.sni_seen = false;
+	handshake.sni_malformed = false;
 	handshake.client_cipher_suites = TlsList<uint16_t>();
 	handshake.client_extensions = TlsList<uint16_t>();
 	handshake.client_supported_groups = TlsList<uint16_t>();
@@ -466,19 +410,19 @@ void ClearHello(TlsHandshake &handshake) {
 // the whole hello inside the first record. Parsing one record bounds the cost
 // of each candidate offset.
 int HelloAt(const std::vector<uint8_t> &data, size_t offset, const TlsHandshakeLimits &limits) {
-	if (data.size() < offset || data.size() - offset < RECORD_HEADER_LENGTH + 4) {
+	if (data.size() < offset || data.size() - offset < TLS_RECORD_HEADER_LENGTH + 4) {
 		return 0;
 	}
 	const uint8_t *header = data.data() + offset;
 	const size_t length = static_cast<size_t>((header[3] << 8U) | header[4]);
-	if (header[0] != RECORD_HANDSHAKE || !RecordHeaderValid(header) ||
-	    length > data.size() - offset - RECORD_HEADER_LENGTH) {
+	if (header[0] != TLS_RECORD_HANDSHAKE || !TlsRecordHeaderValid(header) ||
+	    length > data.size() - offset - TLS_RECORD_HEADER_LENGTH) {
 		return 0;
 	}
-	const uint8_t *message = header + RECORD_HEADER_LENGTH;
+	const uint8_t *message = header + TLS_RECORD_HEADER_LENGTH;
 	const uint8_t type = message[0];
 	const size_t message_length = (static_cast<size_t>(message[1]) << 16U) | (message[2] << 8U) | message[3];
-	if ((type != HANDSHAKE_CLIENT_HELLO && type != HANDSHAKE_SERVER_HELLO) || length < 4 ||
+	if ((type != TLS_HANDSHAKE_CLIENT_HELLO && type != TLS_HANDSHAKE_SERVER_HELLO) || length < 4 ||
 	    message_length > length - 4 || message_length > limits.max_message_bytes) {
 		return 0;
 	}
@@ -486,13 +430,13 @@ int HelloAt(const std::vector<uint8_t> &data, size_t offset, const TlsHandshakeL
 	// max_message_bytes for each would make the search quadratic.
 	TlsHandshake hello;
 	std::vector<uint8_t> session_id;
-	const bool client = type == HANDSHAKE_CLIENT_HELLO;
+	const bool client = type == TLS_HANDSHAKE_CLIENT_HELLO;
 	return ParseHello(message + 4, message_length, client, limits, hello, session_id) ? (client ? 1 : 2) : 0;
 }
 
 // Reads a SOCKS address of the given type and the port after it as host:port.
 // Names are peer-supplied bytes, escaped as server names are.
-bool SocksAddress(Reader &reader, uint8_t type, std::string &out) {
+bool SocksAddress(TlsReader &reader, uint8_t type, std::string &out) {
 	std::string host;
 	if (type == 1 || type == 4) {
 		std::vector<uint8_t> address;
@@ -518,18 +462,16 @@ bool SocksAddress(Reader &reader, uint8_t type, std::string &out) {
 }
 
 // A NUL-terminated SOCKS4 field. The terminator is consumed.
-bool SocksString(Reader &reader, std::string &out) {
+bool SocksString(TlsReader &reader, std::string &out) {
 	out.clear();
-	while (true) {
+	while (reader.Remaining() > 0) {
 		const uint8_t byte = reader.U8();
-		if (reader.Overrun()) {
-			return false;
-		}
 		if (byte == 0) {
 			return true;
 		}
 		out.push_back(static_cast<char>(byte));
 	}
+	return false;
 }
 
 // One HTTP/1.x message head from pos, which moves past its blank line. The
@@ -694,17 +636,19 @@ bool ReplyCodes(const std::vector<std::string> &lines, bool smtp, std::vector<in
 		}
 		const std::string code = lines[i].substr(0, 3);
 		if (lines[i].size() > 3 && lines[i][3] == '-') {
-			while (true) {
-				if (++i == lines.size()) {
-					return false;
-				}
+			bool closed = false;
+			for (++i; i < lines.size(); ++i) {
 				const std::string &line = lines[i];
 				if (line.compare(0, 3, code) == 0 && (line.size() == 3 || line[3] == ' ')) {
+					closed = true;
 					break;
 				}
 				if (smtp && (line.compare(0, 3, code) != 0 || line.size() < 4 || line[3] != '-')) {
 					return false;
 				}
+			}
+			if (!closed) {
+				return false;
 			}
 		}
 		codes.push_back(std::stoi(code));
@@ -811,8 +755,11 @@ std::string StartTlsServer(const std::string &text) {
 			}
 			// A +OK followed by a line that is no status begins a multi-line reply.
 			if (ok && !PopStatus(lines[i + 1], "+OK") && !PopStatus(lines[i + 1], "-ERR")) {
-				while (++i + 1 < lines.size() && lines[i] != ".") {
-				}
+				// Skip its body to the lone dot that ends it (RFC 1939 3), which
+				// must come before the final +OK line.
+				do {
+					++i;
+				} while (i + 1 < lines.size() && lines[i] != ".");
 				if (lines[i] != ".") {
 					return std::string();
 				}
@@ -842,7 +789,7 @@ std::string StartTlsServer(const std::string &text) {
 // GSSAPI is not read: its requests may be encapsulated after the login.
 void ClassifyClientPrefix(const uint8_t *data, size_t size, std::string &tunnel, std::string &destination) {
 	if (size >= 2 && data[0] == 5) {
-		Reader reader(data, size);
+		TlsReader reader(data, size);
 		reader.U8();
 		const size_t count = reader.U8();
 		std::vector<uint8_t> methods;
@@ -872,7 +819,7 @@ void ClassifyClientPrefix(const uint8_t *data, size_t size, std::string &tunnel,
 		return;
 	}
 	if (size >= 9 && data[0] == 4 && data[1] == 1) {
-		Reader reader(data + 2, size - 2);
+		TlsReader reader(data + 2, size - 2);
 		const uint16_t port = reader.U16();
 		std::vector<uint8_t> ip;
 		std::string user, host;
@@ -907,7 +854,7 @@ void ClassifyClientPrefix(const uint8_t *data, size_t size, std::string &tunnel,
 // from 4a, so it is reported as socks4.
 void ClassifyServerPrefix(const uint8_t *data, size_t size, std::string &tunnel) {
 	if (size >= 2 && data[0] == 5) {
-		Reader reader(data, size);
+		TlsReader reader(data, size);
 		reader.U8();
 		const uint8_t method = reader.U8();
 		if (method != 0 && method != 2) {
@@ -936,6 +883,23 @@ void ClassifyServerPrefix(const uint8_t *data, size_t size, std::string &tunnel)
 	tunnel = StartTlsServer(text);
 }
 
+// The direction status of a stream the transport could not reconstruct.
+TlsStatus FailedStreamStatus(TcpStreamStatus status) {
+	switch (status) {
+	case TcpStreamStatus::CONFLICT:
+		return TlsStatus::CONFLICT;
+	case TcpStreamStatus::LIMIT:
+		return TlsStatus::LIMIT;
+	case TcpStreamStatus::UNSET:
+	case TcpStreamStatus::CONTIGUOUS:
+	case TcpStreamStatus::GAPPED:
+	case TcpStreamStatus::UNANCHORED:
+		break;
+	}
+	PQ_ASSERT(false);
+	return TlsStatus::UNSET;
+}
+
 } // namespace
 
 TlsHandshakeAssembler::TlsHandshakeAssembler(TlsHandshakeLimits limits_p) : limits(limits_p) {
@@ -958,8 +922,8 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 
 	// A direction the transport could not reconstruct tells us nothing about
 	// whether it carried TLS, so it is reported only if a peer identifies it.
-	if (stream.status == "conflict" || stream.status == "limit") {
-		direction.status = stream.status;
+	if (stream.status == TcpStreamStatus::CONFLICT || stream.status == TcpStreamStatus::LIMIT) {
+		direction.status = FailedStreamStatus(stream.status);
 		direction.error = stream.error;
 		return direction;
 	}
@@ -970,7 +934,8 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 	// A stream that begins with a handshake record is TLS from its first byte,
 	// and is read as it stands.
 	const auto &data = chunk->data;
-	if (data.size() >= RECORD_HEADER_LENGTH && data[0] == RECORD_HANDSHAKE && RecordHeaderValid(data.data())) {
+	if (data.size() >= TLS_RECORD_HEADER_LENGTH && data[0] == TLS_RECORD_HANDSHAKE &&
+	    TlsRecordHeaderValid(data.data())) {
 		ParseRecords(stream, *chunk, 0, limits, direction);
 		return direction;
 	}
@@ -984,7 +949,7 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 	direction.needs_confirmation = !stream.syn_seen;
 	const size_t end = std::min(limits.max_tunnel_prefix_bytes + 1, data.size());
 	for (size_t start = 1; start < end; ++start) {
-		const void *found = std::memchr(data.data() + start, RECORD_HANDSHAKE, end - start);
+		const void *found = std::memchr(data.data() + start, TLS_RECORD_HANDSHAKE, end - start);
 		if (found == nullptr) {
 			break;
 		}
@@ -994,6 +959,7 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 			continue;
 		}
 		ParseRecords(stream, *chunk, start, limits, direction);
+		PQ_ASSERT(start <= std::numeric_limits<uint32_t>::max());
 		direction.prefix_bytes = static_cast<uint32_t>(start);
 		if (hello == 1) {
 			ClassifyClientPrefix(data.data(), start, direction.tunnel, direction.tunnel_destination);
@@ -1005,88 +971,138 @@ TlsHandshakeAssembler::Direction TlsHandshakeAssembler::Parse(const TcpStream &s
 	return direction;
 }
 
+namespace {
+
+// Maps a range of the concatenated handshake bytes back to the chunk, so
+// provenance comes from the packets that actually carried the message. Spans are
+// in stream order, so the first one a range touches is found by binary search and
+// a lookup costs only the spans it covers; a linear scan per message was
+// quadratic in a stream of many tiny records.
+class RecordLocator {
+public:
+	explicit RecordLocator(const std::vector<std::pair<size_t, size_t>> &spans_p) : spans(spans_p) {
+		size_t total = 0;
+		starts.reserve(spans.size());
+		for (const auto &span : spans) {
+			starts.push_back(total);
+			total += span.second;
+		}
+	}
+	// The chunk offset and length covering [begin, begin + length) of the handshake bytes.
+	std::pair<size_t, size_t> Locate(size_t begin, size_t length) const {
+		PQ_ASSERT(length > 0);
+		auto index = static_cast<size_t>(std::upper_bound(starts.begin(), starts.end(), begin) - starts.begin());
+		PQ_ASSERT(index > 0);
+		--index;
+		const size_t first = spans[index].first + (begin - starts[index]);
+		size_t last = first;
+		for (; index < spans.size() && starts[index] < begin + length; ++index) {
+			const size_t covered = std::min(spans[index].second, begin + length - starts[index]);
+			last = spans[index].first + covered;
+		}
+		PQ_ASSERT(last > first);
+		return std::make_pair(first, last - first);
+	}
+
+private:
+	const std::vector<std::pair<size_t, size_t>> &spans;
+	std::vector<size_t> starts; // offset of each span in the handshake bytes
+};
+
+// Copies the body of every handshake record from start, where the first record
+// begins, into handshake_bytes, noting where each came from in record_spans.
+// Returns whether a record runs past the captured bytes.
+bool CollectHandshakeBytes(const TcpStreamChunk &chunk, size_t start, std::vector<uint8_t> &handshake_bytes,
+                           std::vector<std::pair<size_t, size_t>> &record_spans) {
+	size_t offset = start;
+	bool truncated = false;
+	PQ_ASSERT(offset <= chunk.data.size());
+	// Each pass consumes a whole record, header and body, or stops.
+	while (chunk.data.size() - offset >= TLS_RECORD_HEADER_LENGTH) {
+		const uint8_t *header = chunk.data.data() + offset;
+		const uint8_t type = header[0];
+		const uint32_t length = static_cast<uint32_t>((header[3] << 8U) | header[4]);
+		if (!TlsRecordHeaderValid(header)) {
+			break;
+		}
+		if (type == TLS_RECORD_CHANGE_CIPHER_SPEC) {
+			// Everything after this is encrypted; stop rather than parse noise.
+			break;
+		}
+		if (length > chunk.data.size() - offset - TLS_RECORD_HEADER_LENGTH) {
+			truncated = true;
+			break;
+		}
+		if (type != TLS_RECORD_HANDSHAKE) {
+			offset += TLS_RECORD_HEADER_LENGTH + length;
+			continue;
+		}
+		const size_t begin = offset + TLS_RECORD_HEADER_LENGTH;
+		handshake_bytes.insert(handshake_bytes.end(), chunk.data.begin() + static_cast<long>(begin),
+		                       chunk.data.begin() + static_cast<long>(begin + length));
+		record_spans.push_back(std::make_pair(begin, static_cast<size_t>(length)));
+		offset += TLS_RECORD_HEADER_LENGTH + length;
+	}
+	PQ_ASSERT(offset <= chunk.data.size());
+	return truncated;
+}
+
+} // namespace
+
 // Reads the TLS records of one direction from start, where the first record
 // begins, collecting its hellos and the server's certificates.
 void TlsHandshakeAssembler::ParseRecords(const TcpStream &stream, const TcpStreamChunk &chunk, size_t start,
                                          const TlsHandshakeLimits &limits, Direction &direction) {
 	std::vector<uint8_t> handshake_bytes;
 	std::vector<std::pair<size_t, size_t>> record_spans; // offset in chunk, length contributed
-	size_t offset = start;
-	bool truncated = false;
-	while (chunk.data.size() - offset >= RECORD_HEADER_LENGTH) {
-		const uint8_t *header = chunk.data.data() + offset;
-		const uint8_t type = header[0];
-		const uint32_t length = static_cast<uint32_t>((header[3] << 8U) | header[4]);
-		if (!RecordHeaderValid(header)) {
-			break;
-		}
-		if (type == RECORD_CHANGE_CIPHER_SPEC) {
-			// Everything after this is encrypted; stop rather than parse noise.
-			break;
-		}
-		if (length > chunk.data.size() - offset - RECORD_HEADER_LENGTH) {
-			truncated = true;
-			break;
-		}
-		if (type != RECORD_HANDSHAKE) {
-			offset += RECORD_HEADER_LENGTH + length;
-			continue;
-		}
-		const size_t begin = offset + RECORD_HEADER_LENGTH;
-		handshake_bytes.insert(handshake_bytes.end(), chunk.data.begin() + static_cast<long>(begin),
-		                       chunk.data.begin() + static_cast<long>(begin + length));
-		record_spans.push_back(std::make_pair(begin, static_cast<size_t>(length)));
-		offset += RECORD_HEADER_LENGTH + length;
-	}
+	bool truncated = CollectHandshakeBytes(chunk, start, handshake_bytes, record_spans);
 	if (handshake_bytes.empty()) {
 		return;
 	}
+	if (ParseMessages(chunk, handshake_bytes, record_spans, limits, direction)) {
+		truncated = true;
+	}
+	if (truncated && direction.status == TlsStatus::UNSET) {
+		direction.status = TlsStatus::INCOMPLETE;
+		direction.error = !stream.gaps.empty() ? "missing TCP bytes leave a sequence gap"
+		                                       : "TLS handshake continues past the captured bytes";
+	}
+	if (direction.status == TlsStatus::UNSET && stream.status == TcpStreamStatus::UNANCHORED) {
+		direction.status = TlsStatus::UNANCHORED;
+		direction.error = stream.error;
+	}
+	if (!direction.client && !direction.handshakes.empty()) {
+		// Only a ServerHello was seen, so this direction runs server to client.
+		direction.oriented_key = stream.key.Reverse();
+	}
+}
 
-	// Map an offset in the concatenated handshake bytes back to the chunk, so
-	// provenance comes from the packets that actually carried the message.
-	struct Locator {
-		const std::vector<std::pair<size_t, size_t>> *spans;
-		std::pair<size_t, size_t> Locate(size_t begin, size_t length) const {
-			size_t seen = 0, first = 0, last = 0;
-			bool found = false;
-			for (size_t i = 0; i < spans->size(); ++i) {
-				const size_t span_begin = seen;
-				const size_t span_end = seen + (*spans)[i].second;
-				seen = span_end;
-				if (span_end <= begin || span_begin >= begin + length) {
-					continue;
-				}
-				const size_t local = begin > span_begin ? begin - span_begin : 0;
-				const size_t chunk_begin = (*spans)[i].first + local;
-				if (!found) {
-					first = chunk_begin;
-					found = true;
-				}
-				last = (*spans)[i].first + std::min((*spans)[i].second, begin + length - span_begin);
-			}
-			return found ? std::make_pair(first, last - first) : std::make_pair(size_t(0), size_t(0));
-		}
-	};
-	const Locator locator = {&record_spans};
-
+// Frames the handshake messages in the concatenated record bodies, collecting
+// the hellos and certificates. Returns whether a message runs past the bytes.
+bool TlsHandshakeAssembler::ParseMessages(const TcpStreamChunk &chunk, const std::vector<uint8_t> &handshake_bytes,
+                                          const std::vector<std::pair<size_t, size_t>> &record_spans,
+                                          const TlsHandshakeLimits &limits, Direction &direction) {
+	PQ_ASSERT(!handshake_bytes.empty());
+	const RecordLocator locator(record_spans);
 	size_t message_offset = 0, certificate_bytes = 0;
+	// Each pass consumes a whole message, header and body, or stops.
 	while (handshake_bytes.size() - message_offset >= 4) {
-		Reader reader(handshake_bytes.data() + message_offset, handshake_bytes.size() - message_offset);
+		PQ_ASSERT(message_offset <= handshake_bytes.size());
+		TlsReader reader(handshake_bytes.data() + message_offset, handshake_bytes.size() - message_offset);
 		const uint8_t type = reader.U8();
 		const uint32_t length = reader.U24();
 		if (length > limits.max_message_bytes) {
-			direction.status = "limit";
+			direction.status = TlsStatus::LIMIT;
 			direction.error = "TLS handshake message exceeds the per-message limit";
 			break;
 		}
 		if (length > handshake_bytes.size() - message_offset - 4) {
-			truncated = true;
-			break;
+			return true;
 		}
-		if (type == HANDSHAKE_CLIENT_HELLO || type == HANDSHAKE_SERVER_HELLO) {
-			const bool client = type == HANDSHAKE_CLIENT_HELLO;
+		if (type == TLS_HANDSHAKE_CLIENT_HELLO || type == TLS_HANDSHAKE_SERVER_HELLO) {
+			const bool client = type == TLS_HANDSHAKE_CLIENT_HELLO;
 			if (direction.handshakes.size() >= limits.max_handshakes) {
-				direction.status = "limit";
+				direction.status = TlsStatus::LIMIT;
 				direction.error = "TLS handshake count exceeds the per-direction limit";
 				break;
 			}
@@ -1096,21 +1112,20 @@ void TlsHandshakeAssembler::ParseRecords(const TcpStream &stream, const TcpStrea
 			std::vector<uint8_t> session_id;
 			if (!ParseHello(handshake_bytes.data() + message_offset + 4, length, client, limits, handshake,
 			                session_id)) {
-				handshake.status = "invalid";
+				handshake.status = TlsStatus::INVALID;
 				handshake.error = client ? "ClientHello is malformed" : "ServerHello is malformed";
 				ClearHello(handshake);
 			}
+			// The message is within handshake_bytes (checked above), so it has a span.
 			const auto span = locator.Locate(message_offset, length + 4);
-			if (span.second > 0) {
-				const auto provenance = chunk.Provenance(span.first, span.second);
-				handshake.first = provenance.first;
-				handshake.last = provenance.second;
-			}
+			const auto provenance = chunk.Provenance(span.first, span.second);
+			handshake.first = provenance.first;
+			handshake.last = provenance.second;
 			direction.client = direction.client || client;
-			direction.handshakes.push_back(handshake);
-			direction.session_ids.push_back(session_id);
-		} else if (type == HANDSHAKE_CERTIFICATE && !direction.handshakes.empty() &&
-		           direction.handshakes.back().status != "invalid") {
+			direction.handshakes.push_back(std::move(handshake));
+			direction.session_ids.push_back(std::move(session_id));
+		} else if (type == TLS_HANDSHAKE_CERTIFICATE && !direction.handshakes.empty() &&
+		           direction.handshakes.back().status != TlsStatus::INVALID) {
 			// Each side's Certificate follows its own hello in its own direction: the
 			// server's after the ServerHello, the client's, when asked for, after
 			// the ClientHello. One with no hello before it is not reported.
@@ -1119,92 +1134,156 @@ void TlsHandshakeAssembler::ParseRecords(const TcpStream &stream, const TcpStrea
 			ParseCertificates(handshake_bytes.data() + message_offset + 4, length, limits, certificate_bytes, chain,
 			                  handshake);
 			const auto span = locator.Locate(message_offset, length + 4);
-			if (span.second > 0) {
-				const auto provenance = chunk.Provenance(span.first, span.second);
-				if (provenance.second.number > handshake.last.number) {
-					handshake.last = provenance.second;
-				}
+			const auto provenance = chunk.Provenance(span.first, span.second);
+			if (provenance.second.number > handshake.last.number) {
+				handshake.last = provenance.second;
 			}
 		}
 		message_offset += 4 + length;
 	}
-	if (truncated && direction.status.empty()) {
-		direction.status = "incomplete";
-		direction.error = !stream.gaps.empty() ? "missing TCP bytes leave a sequence gap"
-		                                       : "TLS handshake continues past the captured bytes";
+	return false;
+}
+
+// Moves the client's hello fields onto the merged row, with the tunnel that
+// carried the client's direction.
+void TlsHandshakeAssembler::MergeClient(const Direction &client, TlsHandshake &from_client, TlsHandshake &handshake) {
+	handshake.has_client_hello = true;
+	handshake.has_sni = from_client.has_sni;
+	handshake.sni = std::move(from_client.sni);
+	handshake.has_client_version = from_client.has_client_version;
+	handshake.client_version = from_client.client_version;
+	handshake.client_cipher_suites = std::move(from_client.client_cipher_suites);
+	handshake.client_extensions = std::move(from_client.client_extensions);
+	handshake.client_supported_groups = std::move(from_client.client_supported_groups);
+	handshake.client_signature_algorithms = std::move(from_client.client_signature_algorithms);
+	handshake.client_supported_versions = std::move(from_client.client_supported_versions);
+	handshake.client_ec_point_formats = std::move(from_client.client_ec_point_formats);
+	handshake.client_alpn = std::move(from_client.client_alpn);
+	handshake.client_certificates = std::move(from_client.client_certificates);
+	handshake.first = from_client.first;
+	handshake.last = from_client.last;
+	handshake.status = from_client.status;
+	handshake.error = from_client.error;
+	// The tunnel carried the whole connection, so every handshake on it
+	// reports it: a HelloRetryRequest's second ClientHello, or a
+	// renegotiation. The prefix is what came before the first record.
+	handshake.client_prefix_bytes = client.prefix_bytes;
+	handshake.client_tunnel = client.tunnel;
+	handshake.tunnel_destination = client.tunnel_destination;
+}
+
+// Moves the server's hello fields onto the merged row. The packet span widens
+// to cover the server's packets, and the server's status applies only when the
+// client's hello left none.
+void TlsHandshakeAssembler::MergeServer(const Direction &server, TlsHandshake &from_server, bool has_client,
+                                        TlsHandshake &handshake) {
+	handshake.has_server_hello = true;
+	handshake.has_negotiated_version = from_server.has_negotiated_version;
+	handshake.negotiated_version = from_server.negotiated_version;
+	handshake.has_server_legacy_version = from_server.has_server_legacy_version;
+	handshake.server_legacy_version = from_server.server_legacy_version;
+	handshake.has_cipher_suite = from_server.has_cipher_suite;
+	handshake.cipher_suite = from_server.cipher_suite;
+	handshake.server_extensions = std::move(from_server.server_extensions);
+	handshake.server_alpn = std::move(from_server.server_alpn);
+	handshake.server_supported_versions = std::move(from_server.server_supported_versions);
+	handshake.server_certificates = std::move(from_server.server_certificates);
+	handshake.server_prefix_bytes = server.prefix_bytes;
+	handshake.server_tunnel = server.tunnel;
+	if (!has_client) {
+		handshake.first = from_server.first;
+		handshake.last = from_server.last;
+	} else if (from_server.last.number > handshake.last.number) {
+		handshake.last = from_server.last;
 	}
-	if (direction.status.empty() && stream.status == "unanchored") {
-		direction.status = "unanchored";
-		direction.error = stream.error;
+	if (handshake.status == TlsStatus::UNSET) {
+		handshake.status = from_server.status;
+		handshake.error = from_server.error;
 	}
-	if (!direction.client && !direction.handshakes.empty()) {
-		// Only a ServerHello was seen, so this direction runs server to client.
-		direction.oriented_key = stream.key.Reverse();
+}
+
+// Appends the warning codes of a merged row, in their fixed order. The hellos
+// have been moved from, so only their flags, which a move keeps, are read; the
+// certificate chains are read from the merged row.
+void TlsHandshakeAssembler::MergeWarnings(const Direction &client, const Direction *server,
+                                          const TlsHandshake *from_client, const TlsHandshake *from_server,
+                                          TlsHandshake &handshake) {
+	// reassembly_status holds one value and a more specific one wins, so an
+	// uncaptured side is also stated here, where no other status can hide it.
+	if (from_client == nullptr) {
+		handshake.warnings.push_back("client_hello_missing");
+	}
+	if (from_server == nullptr) {
+		handshake.warnings.push_back("server_hello_missing");
+	}
+	if (from_client != nullptr && from_client->status == TlsStatus::INVALID) {
+		handshake.warnings.push_back("client_hello_invalid");
+	}
+	if (from_server != nullptr && from_server->status == TlsStatus::INVALID) {
+		handshake.warnings.push_back("server_hello_invalid");
+	}
+	if (from_client != nullptr &&
+	    (from_client->sni_malformed || from_client->client_cipher_suites.malformed ||
+	     from_client->client_supported_groups.malformed || from_client->client_signature_algorithms.malformed ||
+	     from_client->client_supported_versions.malformed || from_client->client_ec_point_formats.malformed ||
+	     from_client->client_alpn.malformed)) {
+		handshake.warnings.push_back("client_list_malformed");
+	}
+	if (from_server != nullptr &&
+	    (from_server->server_alpn.malformed || from_server->server_supported_versions.malformed)) {
+		handshake.warnings.push_back("server_list_malformed");
+	}
+	if (from_server != nullptr && Unparsed(handshake.server_certificates)) {
+		handshake.warnings.push_back("server_certificate_malformed");
+	}
+	if (from_client != nullptr && Unparsed(handshake.client_certificates)) {
+		handshake.warnings.push_back("client_certificate_malformed");
+	}
+	// Bytes before TLS that parsed as no known tunnel. The row is still
+	// reported: its hello parsed in full, so the TLS fields are sound.
+	if (handshake.client_prefix_bytes > 0 && handshake.client_tunnel.empty()) {
+		handshake.warnings.push_back("client_tunnel_unrecognized");
+	}
+	if (handshake.server_prefix_bytes > 0 && handshake.server_tunnel.empty()) {
+		handshake.warnings.push_back("server_tunnel_unrecognized");
+	}
+	// A prefix counted from the first captured byte, not the connection's
+	// first: the SYN was missed, so the other direction had to confirm it.
+	if (from_client != nullptr && client.needs_confirmation) {
+		handshake.warnings.push_back("client_prefix_unanchored");
+	}
+	if (from_server != nullptr && server->needs_confirmation) {
+		handshake.warnings.push_back("server_prefix_unanchored");
+	}
+	// Both sides recognised, as different tunnels. A SOCKS4 reply is the same
+	// for 4a, so that pair agrees.
+	const auto &said = handshake.client_tunnel, &answered = handshake.server_tunnel;
+	if (!said.empty() && !answered.empty() && said != answered && !(said == "socks4a" && answered == "socks4")) {
+		handshake.warnings.push_back("tunnel_mismatch");
 	}
 }
 
 // Joins the two directions by position: the nth ClientHello of a connection is
 // answered by its nth ServerHello. A direction that arrived without its peer is
 // reported alone, with the absent side's columns left unset.
-std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, const Direction *server) {
+// Both directions are released right after, so their lists and certificate
+// chains are moved, not copied; checks below read only flags, which a move keeps,
+// or the merged handshake itself.
+std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(Direction &client, Direction *server) {
 	std::vector<TlsHandshake> result;
 	const size_t count = std::max(client.handshakes.size(), server != nullptr ? server->handshakes.size() : size_t(0));
 	for (size_t index = 0; index < count; ++index) {
-		const TlsHandshake *from_client = index < client.handshakes.size() ? &client.handshakes[index] : nullptr;
-		const TlsHandshake *from_server =
+		TlsHandshake *from_client = index < client.handshakes.size() ? &client.handshakes[index] : nullptr;
+		TlsHandshake *from_server =
 		    server != nullptr && index < server->handshakes.size() ? &server->handshakes[index] : nullptr;
 		TlsHandshake handshake;
 		handshake.key = client.handshakes.empty() && server != nullptr ? server->oriented_key : client.oriented_key;
 		handshake.handshake_number = index + 1;
 		if (from_client != nullptr) {
-			handshake.has_client_hello = true;
-			handshake.has_sni = from_client->has_sni;
-			handshake.sni = from_client->sni;
-			handshake.has_client_version = from_client->has_client_version;
-			handshake.client_version = from_client->client_version;
-			handshake.client_cipher_suites = from_client->client_cipher_suites;
-			handshake.client_extensions = from_client->client_extensions;
-			handshake.client_supported_groups = from_client->client_supported_groups;
-			handshake.client_signature_algorithms = from_client->client_signature_algorithms;
-			handshake.client_supported_versions = from_client->client_supported_versions;
-			handshake.client_ec_point_formats = from_client->client_ec_point_formats;
-			handshake.client_alpn = from_client->client_alpn;
-			handshake.client_certificates = from_client->client_certificates;
-			handshake.first = from_client->first;
-			handshake.last = from_client->last;
-			handshake.status = from_client->status;
-			handshake.error = from_client->error;
-			// The tunnel carried the whole connection, so every handshake on it
-			// reports it: a HelloRetryRequest's second ClientHello, or a
-			// renegotiation. The prefix is what came before the first record.
-			handshake.client_prefix_bytes = client.prefix_bytes;
-			handshake.client_tunnel = client.tunnel;
-			handshake.tunnel_destination = client.tunnel_destination;
+			MergeClient(client, *from_client, handshake);
 		}
 		if (from_server != nullptr) {
-			handshake.has_server_hello = true;
-			handshake.has_negotiated_version = from_server->has_negotiated_version;
-			handshake.negotiated_version = from_server->negotiated_version;
-			handshake.has_server_legacy_version = from_server->has_server_legacy_version;
-			handshake.server_legacy_version = from_server->server_legacy_version;
-			handshake.has_cipher_suite = from_server->has_cipher_suite;
-			handshake.cipher_suite = from_server->cipher_suite;
-			handshake.server_extensions = from_server->server_extensions;
-			handshake.server_alpn = from_server->server_alpn;
-			handshake.server_supported_versions = from_server->server_supported_versions;
-			handshake.server_certificates = from_server->server_certificates;
-			handshake.server_prefix_bytes = server->prefix_bytes;
-			handshake.server_tunnel = server->tunnel;
-			if (from_client == nullptr) {
-				handshake.first = from_server->first;
-				handshake.last = from_server->last;
-			} else if (from_server->last.number > handshake.last.number) {
-				handshake.last = from_server->last;
-			}
-			if (handshake.status.empty()) {
-				handshake.status = from_server->status;
-				handshake.error = from_server->error;
-			}
+			MergeServer(*server, *from_server, from_client != nullptr, handshake);
 		}
 		if (!client.handshakes.empty()) {
 			handshake.has_client_stream = true;
@@ -1219,7 +1298,7 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 		// and without a known version it cannot be asked.
 		if (from_client != nullptr && from_server != nullptr && index < client.session_ids.size() &&
 		    index < server->session_ids.size() && handshake.has_negotiated_version &&
-		    handshake.negotiated_version != TLS_1_3) {
+		    handshake.negotiated_version != TLS_VERSION_1_3) {
 			const auto &offered = client.session_ids[index];
 			const auto &echoed = server->session_ids[index];
 			handshake.has_resumed = true;
@@ -1229,82 +1308,38 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Merge(const Direction &client, 
 		// most specific. Next comes a status covering the whole direction, such as
 		// a limit or a truncated stream. Only then is the row judged on whether
 		// both sides were captured.
-		if (handshake.status.empty() && from_client != nullptr && !client.status.empty()) {
+		if (handshake.status == TlsStatus::UNSET && from_client != nullptr && client.status != TlsStatus::UNSET) {
 			handshake.status = client.status;
 			handshake.error = client.error;
 		}
-		if (handshake.status.empty() && from_server != nullptr && server != nullptr && !server->status.empty()) {
+		if (handshake.status == TlsStatus::UNSET && from_server != nullptr && server != nullptr &&
+		    server->status != TlsStatus::UNSET) {
 			handshake.status = server->status;
 			handshake.error = server->error;
 		}
 		// A direction whose peer never arrived is not an error: one side of a
 		// connection is often all that was captured.
-		if (handshake.status.empty()) {
-			handshake.status = from_client == nullptr || from_server == nullptr ? "one-sided" : "complete";
+		if (handshake.status == TlsStatus::UNSET) {
+			handshake.status =
+			    from_client == nullptr || from_server == nullptr ? TlsStatus::ONE_SIDED : TlsStatus::COMPLETE;
 		}
-		// reassembly_status holds one value and a more specific one wins, so an
-		// uncaptured side is also stated here, where no other status can hide it.
-		if (from_client == nullptr) {
-			handshake.warnings.push_back("client_hello_missing");
-		}
-		if (from_server == nullptr) {
-			handshake.warnings.push_back("server_hello_missing");
-		}
-		if (from_client != nullptr && from_client->status == "invalid") {
-			handshake.warnings.push_back("client_hello_invalid");
-		}
-		if (from_server != nullptr && from_server->status == "invalid") {
-			handshake.warnings.push_back("server_hello_invalid");
-		}
-		if (from_client != nullptr &&
-		    (from_client->client_cipher_suites.malformed || from_client->client_supported_groups.malformed ||
-		     from_client->client_signature_algorithms.malformed || from_client->client_supported_versions.malformed ||
-		     from_client->client_ec_point_formats.malformed || from_client->client_alpn.malformed)) {
-			handshake.warnings.push_back("client_list_malformed");
-		}
-		if (from_server != nullptr &&
-		    (from_server->server_alpn.malformed || from_server->server_supported_versions.malformed)) {
-			handshake.warnings.push_back("server_list_malformed");
-		}
-		if (from_server != nullptr && Unparsed(from_server->server_certificates)) {
-			handshake.warnings.push_back("server_certificate_malformed");
-		}
-		if (from_client != nullptr && Unparsed(from_client->client_certificates)) {
-			handshake.warnings.push_back("client_certificate_malformed");
-		}
-		// Bytes before TLS that parsed as no known tunnel. The row is still
-		// reported: its hello parsed in full, so the TLS fields are sound.
-		if (handshake.client_prefix_bytes > 0 && handshake.client_tunnel.empty()) {
-			handshake.warnings.push_back("client_tunnel_unrecognized");
-		}
-		if (handshake.server_prefix_bytes > 0 && handshake.server_tunnel.empty()) {
-			handshake.warnings.push_back("server_tunnel_unrecognized");
-		}
-		// A prefix counted from the first captured byte, not the connection's
-		// first: the SYN was missed, so the other direction had to confirm it.
-		if (from_client != nullptr && client.needs_confirmation) {
-			handshake.warnings.push_back("client_prefix_unanchored");
-		}
-		if (from_server != nullptr && server->needs_confirmation) {
-			handshake.warnings.push_back("server_prefix_unanchored");
-		}
-		// Both sides recognised, as different tunnels. A SOCKS4 reply is the same
-		// for 4a, so that pair agrees.
-		const auto &said = handshake.client_tunnel, &answered = handshake.server_tunnel;
-		if (!said.empty() && !answered.empty() && said != answered && !(said == "socks4a" && answered == "socks4")) {
-			handshake.warnings.push_back("tunnel_mismatch");
-		}
-		result.push_back(handshake);
+		MergeWarnings(client, server, from_client, from_server, handshake);
+		result.push_back(std::move(handshake));
 	}
 	return result;
 }
 
 // A direction reported without a peer. One that needs confirmation never is.
-std::vector<TlsHandshake> TlsHandshakeAssembler::ReportAlone(const Direction &direction) {
+// Every caller releases the direction afterwards, so Merge may move from it.
+std::vector<TlsHandshake> TlsHandshakeAssembler::ReportAlone(Direction &direction) {
 	if (direction.needs_confirmation) {
 		return std::vector<TlsHandshake>();
 	}
-	return direction.client ? Merge(direction, nullptr) : Merge(Direction(), &direction);
+	if (direction.client) {
+		return Merge(direction, nullptr);
+	}
+	Direction none;
+	return Merge(none, &direction);
 }
 
 namespace {
@@ -1321,14 +1356,14 @@ bool Overlaps(const PacketStamp &first, const PacketStamp &last, const PacketSta
 // which does not begin a TLS record header. A failed or truncated stream, or
 // one beginning with any record, says nothing either way.
 bool PlainlyNotTls(const TcpStream &stream) {
-	if (stream.status == "conflict" || stream.status == "limit" || stream.chunks.empty() ||
-	    stream.chunks.front().offset != 0 || stream.chunks.front().data.empty()) {
+	if (stream.status == TcpStreamStatus::CONFLICT || stream.status == TcpStreamStatus::LIMIT ||
+	    stream.chunks.empty() || stream.chunks.front().offset != 0 || stream.chunks.front().data.empty()) {
 		return false;
 	}
 	const auto &data = stream.chunks.front().data;
 	const bool record =
-	    data.size() >= RECORD_HEADER_LENGTH && data[0] >= 20 && data[0] <= 24 && RecordHeaderValid(data.data());
-	return !record && !(data.size() < RECORD_HEADER_LENGTH && data[0] >= 20 && data[0] <= 24);
+	    data.size() >= TLS_RECORD_HEADER_LENGTH && data[0] >= 20 && data[0] <= 24 && TlsRecordHeaderValid(data.data());
+	return !record && !(data.size() < TLS_RECORD_HEADER_LENGTH && data[0] >= 20 && data[0] <= 24);
 }
 
 } // namespace
@@ -1339,11 +1374,16 @@ bool PlainlyNotTls(const TcpStream &stream) {
 // streams could each hold a hello-shaped run in data, in either role.
 bool TlsHandshakeAssembler::Confirms(const Direction &peer, const Direction &found) {
 	return peer.client != found.client && !peer.needs_confirmation && !peer.handshakes.empty() &&
-	       peer.handshakes.front().status != "invalid" && Overlaps(peer.first, peer.last, found.first, found.last);
+	       peer.handshakes.front().status != TlsStatus::INVALID &&
+	       Overlaps(peer.first, peer.last, found.first, found.last);
 }
 
 void TlsHandshakeAssembler::Release(std::map<TcpFlowKey, Direction>::iterator it) {
-	unconfirmed -= it->second.needs_confirmation ? 1 : 0;
+	PQ_ASSERT(it != pending.end());
+	if (it->second.needs_confirmation) {
+		PQ_ASSERT(unconfirmed > 0);
+		--unconfirmed;
+	}
 	pending.erase(it);
 }
 
@@ -1412,8 +1452,13 @@ bool TlsHandshakeAssembler::Hold(Direction &direction) {
 			unconfirmed_order.swap(live);
 		}
 	}
+	// A full table released an unconfirmed find above: unconfirmed > 0 means one
+	// is held, and its key is in unconfirmed_order.
+	PQ_ASSERT(pending.size() < limits.max_pending);
 	const auto key = direction.oriented_key;
-	pending.insert(std::make_pair(key, std::move(direction)));
+	const bool inserted = pending.insert(std::make_pair(key, std::move(direction))).second;
+	PQ_ASSERT(inserted);
+	PQ_ASSERT(unconfirmed <= pending.size());
 	return true;
 }
 
@@ -1448,7 +1493,7 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Add(const TcpStream &stream) {
 		existing = pending.end();
 	}
 	if (existing != pending.end()) {
-		const Direction &held = existing->second;
+		Direction &held = existing->second;
 		const bool unconfirmed_pair = (direction.needs_confirmation && !Confirms(held, direction)) ||
 		                              (held.needs_confirmation && !Confirms(direction, held));
 		if (unconfirmed_pair) {
@@ -1475,8 +1520,8 @@ std::vector<TlsHandshake> TlsHandshakeAssembler::Add(const TcpStream &stream) {
 		}
 		return result;
 	}
-	const Direction &client = direction.client ? direction : existing->second;
-	const Direction &server = direction.client ? existing->second : direction;
+	Direction &client = direction.client ? direction : existing->second;
+	Direction &server = direction.client ? existing->second : direction;
 	auto merged = Merge(client, &server);
 	result.insert(result.end(), std::make_move_iterator(merged.begin()), std::make_move_iterator(merged.end()));
 	Release(existing);

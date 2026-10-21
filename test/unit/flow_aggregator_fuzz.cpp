@@ -8,6 +8,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 		return 0;
 	FlowLimits limits;
 	limits.tcp_idle_us = limits.udp_idle_us = size ? data[0] : 0;
+	// A small table makes eviction at capacity part of every run; packets must
+	// still be conserved across the sessions it gives up.
+	limits.max_flows = size > 1 ? 1 + data[1] % 8 : 16384;
 	FlowAggregator a(limits);
 	uint64_t expected = 0, packets = 0, captured = 0, reported = 0, payload = 0;
 	uint32_t section = 1;
